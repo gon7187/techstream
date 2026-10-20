@@ -1,0 +1,52 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests (synthetic fixtures only)
+        run: python -m unittest discover -s tests -v
+      - name: Offline session replay
+        run: python -m scripts.session_cli replay examples/diagnostic-session.json --output "$RUNNER_TEMP/session.json"
+      - name: Generate demo resources without GTK
+        run: python -m scripts.demo --output "$RUNNER_TEMP/demo"
+
+  static:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install ruff==0.16.7
+      - run: ruff check scripts tests techstream.py
+      - run: ruff format --check scripts tests techstream.py
+      - run: shellcheck techstream
+
+  desktop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 libusb-1.0-0 gir1.2-gdkpixbuf-2.0 librsvg2-common xvfb dbus-x11
+      - name: Render and exercise synthetic demo
+        env:
+          GSK_RENDERER: cairo
+          GTK_A11Y: none
+        run: xvfb-run -a dbus-run-session -- /usr/bin/python3 techstream.py --demo --smoke-test

@@ -1,0 +1,150 @@
+{
+  "schema": "techstream-native-replay-v1",
+  "source": "authored_synthetic",
+  "ecus": [
+    "engine",
+    "transmission"
+  ],
+  "transactions": [
+    {
+      "ecu": "engine",
+      "request": "0902",
+      "response": "49020153594e5448455431433030303030303030"
+    },
+    {
+      "ecu": "engine",
+      "request": "03",
+      "response": "430201330420"
+    },
+    {
+      "ecu": "engine",
+      "request": "07",
+      "response": "47010171"
+    },
+    {
+      "ecu": "engine",
+      "request": "0a",
+      "response": "4a010420"
+    },
+    {
+      "ecu": "engine",
+      "request": "0100",
+      "response": "4100c8188000"
+    },
+    {
+      "ecu": "engine",
+      "request": "0101",
+      "response": "410182076501"
+    },
+    {
+      "ecu": "engine",
+      "request": "0105",
+      "response": "41057b"
+    },
+    {
+      "ecu": "engine",
+      "request": "010c",
+      "response": "410c0c80"
+    },
+    {
+      "ecu": "engine",
+      "request": "010d",
+      "response": "410d00"
+    },
+    {
+      "ecu": "engine",
+      "request": "0111",
+      "response": "411120"
+    },
+    {
+      "ecu": "engine",
+      "request": "020000",
+      "response": "420000c8188000"
+    },
+    {
+      "ecu": "engine",
+      "request": "020200",
+      "response": "4202000133"
+    },
+    {
+      "ecu": "engine",
+      "request": "020500",
+      "response": "42050072"
+    },
+    {
+      "ecu": "engine",
+      "request": "020c00",
+      "response": "420c002328"
+    },
+    {
+      "ecu": "engine",
+      "request": "020d00",
+      "response": "420d0032"
+    },
+    {
+      "ecu": "engine",
+      "request": "021100",
+      "response": "42110080"
+    },
+    {
+      "ecu": "transmission",
+      "request": "0902",
+      "response": "49020153594e5448455431433030303030303030"
+    },
+    {
+      "ecu": "transmission",
+      "request": "03",
+      "response": "4300"
+    },
+    {
+      "ecu": "transmission",
+      "request": "07",
+      "response": "4700"
+    },
+    {
+      "ecu": "transmission",
+      "request": "0a",
+      "response": "4a00"
+    },
+    {
+      "ecu": "transmission",
+      "request": "0100",
+      "response": "4100c8188000"
+    },
+    {
+      "ecu": "transmission",
+      "request": "0101",
+      "response": "410100076500"
+    },
+    {
+      "ecu": "transmission",
+      "request": "0105",
+      "response": "41057b"
+    },
+    {
+      "ecu": "transmission",
+      "request": "010c",
+      "response": "410c0c80"
+    },
+    {
+      "ecu": "transmission",
+      "request": "010d",
+      "response": "410d00"
+    },
+    {
+      "ecu": "transmission",
+      "request": "0111",
+      "response": "411120"
+    },
+    {
+      "ecu": "transmission",
+      "request": "020000",
+      "response": "420000c8188000"
+    },
+    {
+      "ecu": "transmission",
+      "request": "020200",
+      "response": "4202000000"
+    }
+  ]
+}

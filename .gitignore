@@ -1,0 +1,14 @@
+artifacts/
+runtime/
+analysis/
+docs/source/
+.unlazy/
+.swarm/
+__pycache__/
+.ruff_cache/
+.pytest_cache/
+*.partial
+.env
+.env.*
+*.pem
+*.key

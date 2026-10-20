@@ -1,0 +1,24 @@
+{
+  "schema": "techstream-native-replay-v1",
+  "source": "authored_synthetic",
+  "ecus": [
+    "engine"
+  ],
+  "transactions": [
+    {
+      "ecu": "engine",
+      "request": "0900",
+      "response": "490014000000"
+    },
+    {
+      "ecu": "engine",
+      "request": "0904",
+      "response": "49040144454d4f2d43414c2d30303031000000"
+    },
+    {
+      "ecu": "engine",
+      "request": "0906",
+      "response": "490601deadbeef"
+    }
+  ]
+}
