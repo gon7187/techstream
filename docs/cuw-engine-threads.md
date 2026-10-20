@@ -1,0 +1,50 @@
+# CUW2026 native worker threads
+
+`CUWEngine2026.bind_thread_job(controller)` issues one concrete `EngineThreadJob2026` for the engine's existing controller and worker. `job.start(session)` accepts an actual imported `ProgrammingReplay`; it does not accept a work callback or a successful result from the caller. The phase follows the imported operation (CID, prepare, write or recovery).
+
+The engine reserves its real phase before starting a thread. A source-bound, single-use lease transfers that reservation to the child. A failed outer or child `Thread.start` releases the original phase event and lock. A pending phase rejects source replacement, another phase, and another controller. A reservation retains cancellation requested before adoption.
+
+The outer `3d100`/`3cb90` thread and inner `5ccd0` thread persist across resumes. The child executes actual `ControlCommPhase2026.execute` under the adopted engine phase, including phase-one gateway startup. The outer thread runs concrete retry, next-CPU, logical-CPU and native-tail callbacks while the child waits for their acknowledgement. `thread_callback_execution` temporarily transfers engine mutation ownership to that outer callback and restores the child's identity afterward. Host UI input still enters through `engine.inform_result_of_query_retry`; scheduling does not fabricate an input.
+
+The portable events retain these native producer/consumer relationships:
+
+| Native state | Producer | Consumer |
+| --- | --- | --- |
+| BE54 | A host start/resume or stop | Outer engine loop |
+| BE5C | Outer dispatch or stop | Persistent child |
+| BE64 | Child unwind and parking | Outer loop |
+| BE74 | Child's concrete source callback request | Outer callback dispatcher |
+| BE6C | Outer callback return or exact exception | Waiting child |
+| Worker +1C | Child parking before BE64 | Outer `41e60` acknowledgement barrier |
+
+`+1C` is a child-owned parked state, **not a host acknowledgement**. A caught prepare fault publishes the actual handshake transition and requests the outer barrier; the barrier checks the child-owned event with the native 500 ms polling interval and a finite host cleanup deadline. A host cannot set the parked flag.
+
+After actual child work unwinds, the outer loop releases the retired selected source through the issued cleanup owner, consumes the worker's actual continuation, and publishes completion before waiting for another BE54. The continuation is an observation, not permission to invent a new capture or a successful export. The next start must supply an actual fresh imported session for the engine's selected source.
+
+`result(timeout)` waits for that unwind and propagates the original failure object. `stop(timeout)` interrupts host waits through the scoped host cancellation boundary, wakes both native loops and joins them with a finite deadline. Calling a join from either native thread is rejected. The runtime keeps its original cancellation callback identity; a concrete scoped job boundary observes host stop separately. A standalone stop does not invent a native retry input, clear native retry globals, or perform whole-engine cleanup; explicit `40580` cleanup remains owned by `EngineCleanup2026`.
+
+`state` exposes native handle presence, child liveness, native `STILL_ACTIVE` (`0x103`) exit observations, stop/resume state and completed sequence. Native-domain failures and host exceptions retain their existing distinction. These checks establish software scheduling and lifecycle behavior; they do not establish adapter or vehicle compatibility.
+
+The loader prelude has a separate native exception scope: `5a813` catches `CPassThruException` only around `5b970` followed by `5bf80` or `59710`. The `5a835` entry leaves that scope. An exception escaping raw controller execution therefore does not manufacture a fatal `+80` input. The normal outer tail copies only the worker-owned input through the existing publisher.
+
+`stop_native(timeout)` is the separate join path for an actual engine `StopReceivingCID` or `40580` cancellation producer. It requires the engine's native cancellation flag to have already been set, requests native-loop exit, and joins without manufacturing a host interruption. After a successful native join it releases the native handle references while retaining diagnostic exit codes; host interruption alone retains those handles for the actual native cleanup entry. Standalone `stop` observes a distinct host-stop flag. This keeps native callback12, host cancellation, and retry UI input independent.
+
+The external `5e950`/`5d830` connection-check path can also reach `41e60`. Its acknowledgement entry validates the exact issued retry controller, existing native job and actual handshake transition, then waits on the same child-owned parked event. It does not require the external UI thread to own the engine's mutation lease. Host deadlines remain distinct from a native connection fault.
+
+Retry's native stopped observation is published at the outer BE54 idle checkpoint, after retired-source cleanup. A child controller context ending by itself does not publish that later native checkpoint.
+
+A phase-one startup failure with native AL false and output flag true skips raw controller Execute and enters the worker's actual `5b810` query. Its worker+40 function calls CUW retry directly, unlike raw Control's `58240` event handoff. A real retry decision reconnects the engine interface; a declined decision sets the worker's local fatal state. Typed reconnect faults publish error kind 3 and re-enter the actual query. The engine's `5c520` protocol selector and Control's `4886` selector retain their different CAN FD contact rules.
+
+`start` returns the scheduled sequence, or `None` for the native `36800` prepare reentry that only changes an existing handshake from 1 to 3. That reentry creates no new reservation, thread, export or completion publication. Source36800 runs its prefix resets and timestamp before the handshake branch, using a prefix-only capability issued by the engine. This capability cannot mutate general active-phase state or change the child ownership identity. It retains the existing sequence/result/events. A continuation session on the exact already-bound shared timeline may resume the persistent thread after earlier events have been consumed; an unrelated consumed trace is rejected.
+
+After the actual native CID-stop entry joins and deletes both handles, a new `bind_thread_job` allocates a fresh worker and job through the engine's transaction. Engine-owned FILE sources, received-CID projections, selected metadata, cleanup resources, progress and timing survive; worker-local handshake/error flags reset. Dependent cleanup/retry/startup/online owners rebind atomically. A dependent-owner failure restores the previous worker/job and all owners before propagating the original error.
+
+`native_work_pending` observes the actual phase reservation from synchronous scheduling through the outer's late CFE2 checkpoint. The retry UI uses this observation to avoid treating a preserved stopped event from an earlier native worker as completion of newly reserved work. It does not publish a query or change native retry flags.
+
+The loader prelude now runs before per-export parameter selection. `P5-Unified`, `Phase6` and `Ethernet` select Control directly. Other contacts inspect the admitted kind/contact/first-CPU parameter filename; if absent, the actual global `FlagToUseCIDGetterAndFlashWriterDLL` selects the native missing-profile error or consolidated loader. Control module presence and its four required exports are checked within the `5a813` CPass exception scope. A caught loader fault copies its error enum to local `+60`, sets `+80`, skips raw Execute and publishes the real outer tail. An integer parameter-lookup fault escapes that CPass scope. A phase with no raw export reports `native_return: None`; startup rejection also retains `startup_return: False`.
+
+The consolidated controller's successful module-load branch still requires its distinct engine ownership bridge. It is rejected explicitly while that bridge is absent; it cannot run through the Control controller by alias.
+
+Verification currently covers actual scheduling, lease transfer, native loader-fault tails, typed event handoffs, native stop/reissue and cleanup. Complete ordinary controller execution and the consolidated controller bridge remain integration work; the lifecycle tests do not substitute a successful controller callback for those missing consumers.
+
+Phase admission remains exclusive through that late outer checkpoint, including the interval after the child's phase context releases its lock but before retired-source cleanup completes. New reservations and ordinary phase contexts reject the actual pending native job during this interval. The existing exact lease may still be adopted, and ordinary standalone phases become available again after the checkpoint.

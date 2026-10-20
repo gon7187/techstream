@@ -1,0 +1,582 @@
+{
+  "schema": "techstream-no-car-coverage-v1",
+  "operations": [
+    {
+      "id": "application.active_replay",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Native active Init and actual replay are implemented; final reviewed caller/argument/instruction-resource integration remains open"
+    },
+    {
+      "id": "application.export_preservation",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "application.integration",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "application.programming_replay",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Complete imported CUW family/controller composition and2026 routes remain in progress"
+    },
+    {
+      "id": "application.recorder_replay",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Native chronological DRS capture/export is implemented; selected VIN/series/protocol producer and full reader/controller reconciliation remain open"
+    },
+    {
+      "id": "application.service_replay",
+      "status": "implemented",
+      "implementation": [
+        {
+          "path": "scripts/service_replay.py",
+          "symbol": "ServiceReplay.from_bytes"
+        },
+        {
+          "path": "scripts/service_replay.py",
+          "symbol": "ServiceReplay.run"
+        }
+      ],
+      "tests": [
+        "test_service_replay.ServiceReplayTests.test_every_authored_family_and_redacted_json",
+        "test_service_replay.ServiceReplayTests.test_actual_service_12_structure_and_exact_port_identity",
+        "test_service_replay.ServiceReplayTests.test_strict_chronology_including_unconsumed_and_void",
+        "test_service_replay.ServiceReplayTests.test_fault_at_every_primitive_and_cleanup_stage",
+        "test_service_replay.ServiceReplayTests.test_cancel_and_aggregate_deadline",
+        "test_service_replay.ServiceReplayTests.test_native_xml_http_and_rks_negatives",
+        "test_service_replay.ServiceReplayTests.test_browser_readback_foreign_window_and_notice_foreign_event",
+        "test_service_replay.ServiceReplayTests.test_alias_isolation_and_report_copy",
+        "test_service_replay.ServiceReplayTests.test_bounded_regular_load_and_atomic_export_preservation",
+        "test_service_replay.ServiceReplayTests.test_captured_watch_approval_is_separate_from_shape_import",
+        "test_service_replay.ServiceReplayTests.test_notice_cursor_boundary_and_rks_polling",
+        "test_service_replay.ServiceReplayTests.test_reentrant_callbacks_reject_without_deadlock",
+        "test_service_replay.ServiceReplayTests.test_initial_clock_fault_always_finalizes_redacted_report",
+        "test_service_replay.ServiceReplayTests.test_timed_notice_alternates_and_respects_primitive_budget",
+        "test_service_replay.ServiceReplayTests.test_recorded_elapsed_bounds_and_outer_deadline",
+        "test_service_replay.ServiceReplayTests.test_dom_and_calibration_budgets_precede_object_allocation",
+        "test_service_replay.ServiceReplayTests.test_timed_browser_wait_and_cleanup_budget",
+        "test_service_replay.ServiceReplayTests.test_schema_duplicate_budget_identity_and_malformed"
+      ],
+      "evidence": [
+        "docs/service-replay.md",
+        "docs/cuw-services.md"
+      ],
+      "remaining": ""
+    },
+    {
+      "id": "application.source_only",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "calibration.compatibility",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Exact source identity and native selectors are implemented; complete all-build/family joins remain under review"
+    },
+    {
+      "id": "calibration.containers",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Ordinary and large2026 CUW parsing/metadata are implemented; exact all-format/caller closure remains under independent source review"
+    },
+    {
+      "id": "calibration.module_recovery",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "132 protected module pairs are statically reconstructed; final decoder and complete computed-call source handoff parent gates await verification"
+    },
+    {
+      "id": "hardware.bus_timing",
+      "status": "PHYSICAL_UNCONFIRMED",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Requires actual hardware observation"
+    },
+    {
+      "id": "hardware.programming_recovery",
+      "status": "PHYSICAL_UNCONFIRMED",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Requires actual hardware observation"
+    },
+    {
+      "id": "hardware.usb_identity",
+      "status": "PHYSICAL_UNCONFIRMED",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Requires actual hardware observation"
+    },
+    {
+      "id": "hardware.vehicle_compatibility",
+      "status": "PHYSICAL_UNCONFIRMED",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Requires actual hardware observation"
+    },
+    {
+      "id": "obd.compound_values",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "obd.enhanced_readiness",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Original definition-driven readiness engine under static recovery; standard OBD bitmask is a separate service"
+    },
+    {
+      "id": "obd.monitors",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "obd.support",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "obd.vehicle_information",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "programming.native_plan",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Known legacy and2026 exported and internal executable programming controllers are still being reconciled and implemented"
+    },
+    {
+      "id": "programming.recovery",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Native phase and persisted state reducers are implemented; complete executable controller and imported replay recovery composition remains open"
+    },
+    {
+      "id": "recorder.commands",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "recorder.lifecycle",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Native lifecycle and fault cleanup are implemented; selected VIN/series/protocol producers remain open"
+    },
+    {
+      "id": "recorder.native_records",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Native wire records and ring policies are implemented; complete caller/version/record-series reconciliation remains under review"
+    },
+    {
+      "id": "session.communication_logs",
+      "status": "implemented",
+      "implementation": [
+        {
+          "path": "scripts/communication_log.py",
+          "symbol": "parse"
+        },
+        {
+          "path": "scripts/communication_log.py",
+          "symbol": "dumps"
+        },
+        {
+          "path": "scripts/communication_log.py",
+          "symbol": "CommunicationLog.export"
+        }
+      ],
+      "tests": [
+        "test_communication_log.CommunicationLogTests.test_independent_native_vector_and_unknown_roundtrip",
+        "test_communication_log.CommunicationLogTests.test_all_truncations_and_lengths",
+        "test_communication_log.CommunicationLogTests.test_native_unknown_revision_and_duplicate_order_preserved",
+        "test_communication_log.CommunicationLogTests.test_known_time_wrong_shape_rejected",
+        "test_communication_log.CommunicationLogTests.test_clear_end_and_update_preserve_raw_systemtime_and_call_order",
+        "test_communication_log.CommunicationLogTests.test_queue_and_file_memory_caps_atomic_replacement",
+        "test_communication_log.CommunicationLogTests.test_native_protocol4_and_status_record_vectors",
+        "test_communication_log.CommunicationLogTests.test_can_single_and_long_native_pci_padding_tick_reset",
+        "test_communication_log.CommunicationLogTests.test_can_native_u16_sequence_wrap",
+        "test_communication_log.CommunicationLogTests.test_export_rejects_before_expanding_remaining_messages",
+        "test_communication_log.CommunicationLogTests.test_dlog_is_dm_not_communication_or_vlg"
+      ],
+      "evidence": [
+        "docs/communication-log.md"
+      ],
+      "remaining": ""
+    },
+    {
+      "id": "snapshot.native_read",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "snapshot.native_write",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "snapshot.playback",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "snapshot.report_views",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Binary TSE report field semantics and ordinary/native AllDTC XML query parity remain under independent recovery"
+    },
+    {
+      "id": "toyota.active_tests",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "toyota.dtc",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "toyota.freeze",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "toyota.health",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "toyota.live",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "toyota.monitor_runtime",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Normal P3/P4/P5/PSA/DK/DLC12/Dual/instrument lifecycles, support and concrete native lower receive composition remain under source and integration review"
+    },
+    {
+      "id": "transport.firmware_iso",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "transport.firmware_maintenance",
+      "status": "implemented",
+      "implementation": [
+        {
+          "path": "scripts/jlr_firmware.py",
+          "symbol": "FirmwareUpdater.run"
+        },
+        {
+          "path": "scripts/jlr_firmware.py",
+          "symbol": "plan"
+        }
+      ],
+      "tests": [
+        "test_jlr_firmware.FirmwareTests.test_native_header_and_byte_preservation",
+        "test_jlr_firmware.FirmwareTests.test_native_plan_presence_fingerprint_roles_and_slots",
+        "test_jlr_firmware.FirmwareTests.test_exact_native_command_vectors",
+        "test_jlr_firmware.FirmwareTests.test_full_wire_execution_and_terminal_state",
+        "test_jlr_firmware.FirmwareTests.test_host_bounded_8192_chunk_fits_jlr_framing",
+        "test_jlr_firmware.FirmwareTests.test_every_uncertain_write_boundary_fails_and_closes",
+        "test_jlr_firmware.FirmwareTests.test_cancel_before_first_command_and_between_chunks",
+        "test_jlr_firmware.FirmwareTests.test_cancel_predicate_interrupts_a_missing_reply_inside_client",
+        "test_jlr_firmware.FirmwareTests.test_cancellation_at_final_ack_is_not_reported_as_verified",
+        "test_jlr_firmware.FirmwareTests.test_no_progress_overrun_and_early_finish",
+        "test_jlr_firmware.FirmwareTests.test_post_transfer_mismatch_is_not_success",
+        "test_jlr_firmware.FirmwareTests.test_owner_and_master_reopen_requirement",
+        "test_jlr_firmware.FirmwareTests.test_master_reconnect_and_application_mode_switch",
+        "test_jlr_firmware.FirmwareTests.test_reopened_board_identity_change_prevents_transfer",
+        "test_jlr_firmware.FirmwareTests.test_native_current_master_application_enters_boot_even_with_empty_plan",
+        "test_jlr_firmware.FirmwareTests.test_second_native_pass_updates_newly_exposed_board",
+        "test_jlr_firmware.FirmwareTests.test_native_boot_reset_accepts_status_seven",
+        "test_jlr_firmware.FirmwareTests.test_reopen_provider_cannot_close_another_owners_client",
+        "test_jlr_firmware.FirmwareTests.test_cleanup_failure_never_success",
+        "test_jlr_firmware.FirmwareTests.test_malformed_reply_and_status_fail_closed",
+        "test_jlr_firmware.FirmwareTests.test_reopen_fault_and_primary_exception_survive_cleanup",
+        "test_jlr_firmware.FirmwareTests.test_whole_operation_deadline_and_invalid_limits",
+        "test_jlr_firmware.FirmwareTests.test_constructor_does_no_io",
+        "test_jlr_firmware.FirmwareTests.test_synthetic_pe_resource_extraction",
+        "test_jlr_firmware.FirmwareTests.test_pe_parser_rejects_malformed_input"
+      ],
+      "evidence": [
+        "docs/jlr-firmware.md"
+      ],
+      "remaining": ""
+    },
+    {
+      "id": "transport.host_iso",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "transport.kline",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "transport.raw_can",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "utility.bindings",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Selected utility providers are implemented; final all-caller native association review remains open"
+    },
+    {
+      "id": "utility.csdf",
+      "status": "implemented",
+      "implementation": [
+        {
+          "path": "scripts/script_vm.py",
+          "symbol": "parse_object"
+        },
+        {
+          "path": "scripts/script_vm.py",
+          "symbol": "evaluate"
+        }
+      ],
+      "tests": [
+        "test_script_vm.ScriptVMTests.test_library_dispatch_uses_high_library_byte_and_low_function_id",
+        "test_script_vm.ScriptVMTests.test_library_references_initial_variables_and_mutable_program_counter",
+        "test_script_vm.ScriptVMTests.test_library_failures_cancellation_and_budgets",
+        "test_script_vm.ScriptVMTests.test_aggregate_budget_counts_retained_concatenations_and_variables",
+        "test_script_vm.ScriptVMTests.test_synthetic_encrypted_xml_and_csv_need_no_vendor_key_or_payload",
+        "test_script_vm.ScriptVMTests.test_utility_xml_rejects_entities_bounds_and_unrecognized_key_library",
+        "test_script_vm.ScriptVMTests.test_byte_arithmetic_unsigned_comparisons_and_x86_shifts",
+        "test_script_vm.ScriptVMTests.test_equality_compares_whole_payload_and_preserves_mismatch_rule",
+        "test_script_vm.ScriptVMTests.test_conditional_jump_uses_first_byte_zero_without_numeric_conversion",
+        "test_script_vm.ScriptVMTests.test_variable_store_array_reference_and_zero_for_missing_element",
+        "test_script_vm.ScriptVMTests.test_object_tables_and_instruction_operands",
+        "test_script_vm.ScriptVMTests.test_only_recovered_stack_and_call_flow_are_evaluated",
+        "test_script_vm.ScriptVMTests.test_malformed_unsupported_and_unbounded_programs_fail"
+      ],
+      "evidence": [
+        "docs/script-vm.md",
+        "docs/script-libraries.md"
+      ],
+      "remaining": ""
+    },
+    {
+      "id": "utility.libraries",
+      "status": "implemented",
+      "implementation": [
+        {
+          "path": "scripts/script_libraries.py",
+          "symbol": "ScriptLibraries._communication"
+        },
+        {
+          "path": "scripts/script_libraries.py",
+          "symbol": "ScriptLibraries._language"
+        },
+        {
+          "path": "scripts/script_libraries.py",
+          "symbol": "ScriptLibraries._record"
+        }
+      ],
+      "tests": [
+        "test_script_libraries.LibraryTests.test_all_observed_identifiers_are_bound",
+        "test_script_libraries.LibraryTests.test_send_error_mapping_and_cleared_storage",
+        "test_script_libraries.LibraryTests.test_native_exchange_receives_exact_options_and_timeout_is_checked",
+        "test_script_libraries.LibraryTests.test_plural_reply_framing_and_zero_based_extract",
+        "test_script_libraries.LibraryTests.test_support_tlvs_and_fillzero_cache",
+        "test_script_libraries.LibraryTests.test_did_ranges_respect_zero_low_byte_wildcard",
+        "test_script_libraries.LibraryTests.test_record_reader_uses_one_based_length_prefixed_records",
+        "test_script_libraries.LibraryTests.test_cpu_scans_observe_cancellation",
+        "test_script_libraries.LibraryTests.test_retained_state_is_bounded_before_hex_allocation",
+        "test_script_libraries.LibraryTests.test_debug_and_post_message_deliver_host_events",
+        "test_script_libraries.LibraryTests.test_vm_dispatch_authored_program"
+      ],
+      "evidence": [
+        "docs/script-libraries.md"
+      ],
+      "remaining": ""
+    },
+    {
+      "id": "utility.xml",
+      "status": "implemented",
+      "implementation": [
+        {
+          "path": "scripts/script_vm.py",
+          "symbol": "parse_utility_xml"
+        },
+        {
+          "path": "scripts/utility.py",
+          "symbol": "UtilityRuntime.run"
+        }
+      ],
+      "tests": [
+        "test_utility.UtilityTests.test_schema_rejects_wrong_parent_missing_attribute_and_deep_language",
+        "test_utility.UtilityTests.test_display_selection_reenables_key_and_rejects_undeclared_choice",
+        "test_utility.UtilityTests.test_send_deadline_pending_without_receive_and_negative_repeat_limit",
+        "test_utility.UtilityTests.test_receive_one_based_and_explicit_endian",
+        "test_utility.UtilityTests.test_action_library_byref_branch_comm_receive_and_end",
+        "test_utility.UtilityTests.test_popup_restore_and_back",
+        "test_utility.UtilityTests.test_radio_key_state_and_progress",
+        "test_utility.UtilityTests.test_retry_and_pending_never_resend_pending_request",
+        "test_utility.UtilityTests.test_noresponse_retry_and_transport_timeout",
+        "test_utility.UtilityTests.test_unknown_tags_attributes_modes_functions_fail",
+        "test_utility.UtilityTests.test_loop_and_callback_cancellation",
+        "test_utility.UtilityTests.test_deadline_and_wait_bound",
+        "test_utility.UtilityTests.test_memory_and_library_storage_validation",
+        "test_utility.UtilityTests.test_calc_bitwise_and_receive_bounds",
+        "test_utility.UtilityTests.test_dialog_execution_and_init_per_entry",
+        "test_utility.UtilityTests.test_dialog_display_updates_radio_without_key_and_screen_instances",
+        "test_utility.UtilityTests.test_progress_elapsed_and_same_block_reentry_gets_new_instance"
+      ],
+      "evidence": [
+        "docs/utility-runtime.md",
+        "docs/native-procedures.md"
+      ],
+      "remaining": ""
+    },
+    {
+      "id": "vehicle.catalog",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "vehicle.command_selection",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Selected metadata schemas are implemented; final consumer reviews and native source-claim binding remain open"
+    },
+    {
+      "id": "vehicle.exceptions",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "vehicle.options",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    },
+    {
+      "id": "vehicle.pid_support",
+      "status": "open",
+      "implementation": [],
+      "tests": [],
+      "evidence": [],
+      "remaining": "Implementation and independent native-contract verification in progress"
+    }
+  ],
+  "unresolved_software": [
+    "The canonical native artifact/export/business inventory must pass in addition to this coarse workflow registry",
+    "Remaining legacy executable and2026 programming operations and complete imported controller/recovery routes",
+    "Native monitor constructor, support/cache, LSB and direct lower send/receive plus full Dual/recorder producer integration",
+    "DDR/ADS/saved-log acquisition and timeline materialization, native TSE field semantics and XML query parity",
+    "Final rendered desktop integration, original corpus/version review, fresh-clone checks and public Git delivery"
+  ]
+}
