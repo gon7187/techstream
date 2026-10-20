@@ -1,0 +1,67 @@
+# Platform and ABI replacement audit
+
+The canonical source inventory contains **2454 distinct PE identities, 3407 source aliases and 146,011 nonzero export slots**. Of these slots, 132,513 reside in executable sections and 13,498 are data exports. Exact source SHA-256 identities, ordinals and addresses are listed in [native-operations.json](native-operations.json).
+
+The Linux functionality contract uses native GTK presentation and typed host operations; it does not reproduce the Windows binary ABI. Each original operation still needs a functional disposition: an implemented domain contract, a proved platform replacement, a proved unused application path, or an explicit assigned business gap. This audit identifies those boundaries and existing reviewed subsets; original export completion is retained by the separate native coverage ledger. Static names, resource metadata, C++ symbol syntax and framework membership provide provenance and investigation routes. Semantic completion requires the original reachable contract, its host implementation, executable regression evidence and independent review.
+
+## Large module boundaries
+
+| Original identity | Resource FileVersion | Code / all exports | Established role and remaining boundary |
+|---|---|---:|---|
+| `og903as.dll` (`8282054e9f8d55bc6de99fdbdfc93c27d74a2d78404d6087181f5b79885f2143`) | 9.0.300 | 7918 / 8539 | Objective Grid UI framework; GTK covers reviewed presentation roles, while unreviewed application grid interactions remain open. |
+| `sfl203as.dll` (`15f282d336bab2a90bfd87a058817dc176e0879b1f659a7edefb460134781dc2`) | 2.0.300 | 2182 / 2300 | Stingray Foundation UI framework, imported by Objective Grid; implemented presentation roles use GTK, while remaining application UI behavior requires review. |
+| `CommandDataLib.dll` (`9ad2a99f528211910b22faa8be23448e3d3426ffa1c50df15cf132b3b9afa964`) | 49, 0, 12, 0 | 6779 / 7559 | Diagnostic command records, buffers, lists and serialization; reviewed wire subsets do not establish full object behavior. |
+| `CommandDataLibLegacy.dll` (`53e7fe2352e3002e4758cef49ea8155d63e6536bd2eeecae23ea3f468835d15b`) | 1, 0, 10, 0 | 5053 / 5636 | Legacy diagnostic records consumed by the TSE converter; layouts and conversion paths require individual coverage. |
+| `KgpDataCtrl.dll` (`e5235bc0c241c6a450fe461031eed0915675032b1db994bd54d98818fac88aa9`) | 61, 0, 10, 0 | 3363 / 3722 | Diagnostic database loading, typed record factories, exception overlays and selection logic. |
+| `CommandCommon.dll` (`07547a9e47378d37c3ef7d96c2f33f6c62c4151626d98d3f3ff03b7c74909de7`) | 59, 0, 12, 0 | 2166 / 2341 | Shared diagnostic records, security, communication and value-processing operations. |
+| `CommandAPI.dll` (`43913a3baeef678b70dd3f7a533575824d9d88e2acb61acb23702983e5b337f3`) | 18, 0, 0, 3 | 1685 / 2017 | Diagnostic API request/reply objects and command packing; selected recorder primitives cover a subset. |
+| `UtilityExNK2.dll` (`8d9623f028f23876f69cb02baa10e1881c01fa01a4f906013bd36266f7e0fb33`) | 1, 56, 12, 0 | 1204 / 1204 | Utility initialization, keep-alive and diagnostic business operations. |
+| `UtilityEx2TY.dll` (`79fc495c68eb099a7ebc0d1eefe0eafd80101ac0bc09a58d3f603ed556c84762`) | 1, 138, 12, 0 | 931 / 931 | Utility message, connection-history and diagnostic business operations. |
+| `DataListIF.dll` (`2eae9194b5de02f76a672b6a59cf345473c478e44a7a5e119c58a02c89bf5f49`) | 55, 0, 12, 0 | 781 / 846 | Monitor/active-test interfaces, dynamic DID configuration and protocol lifecycle. |
+| `KgpDataMonitorCtrl.dll` (`62a083b22693e60c94665644cf1bd5cda64376f0b1d388cc76d9c4fafef2e71f`) | 62, 0, 10, 0 | 721 / 1078 | Diagnostic monitor command dispatch and lifecycle. |
+| `Cuw.exe` (`474115b7362dca112671f9eca45500fb80b70c07adaa73868dc40bed1ac7e687`) | 8.35.0 | 0 / 0 | Installer bootstrap |
+| `Cuw.exe` (`97f7b9302a6090e2715ca6c9713aecc73404d6c0f75aede2dd52f09bd201074b`) | 8.35.0.1 | 642 / 688 | CUW application caller; original versioned dispatch, recovery and integration contracts remain open. |
+| `Cuw.exe` (`9a5d508691edb697b7d5fd42dc4495b4ad9e4ffc64eccf518da2e5ff2c47476d`) | 8.24.0.0 | 769 / 816 | CUW application caller; original versioned dispatch, recovery and integration contracts remain open. |
+
+The three distinct `Cuw.exe` identities include an InstallShield bootstrap and two CUW application callers. Module identity is selected by its exact source hash and path provenance. A shared basename provides no build or behavior equivalence.
+
+The original assigned fourteen identities account for 37,677 export slots, including 34,194 executable slots. Their original 833-image cohort contains 18,500 import slots to the eleven focus DLLs and 4996 decoded direct caller instructions to import thunks. The audit also retains 78 compact call samples. Static import use is concrete evidence; indirect callbacks, virtual dispatch, dynamic lookup and other callers remain separate obligations. An export lacking a static importer is not automatically unreachable. The expanded CUW12 corpus is independently reconciled and retained separately.
+
+## Existing host replacements
+
+- GTK4/libadwaita uses `Gtk.ColumnView`, `Gio.ListStore`, `Gtk.SingleSelection` and explicit application callbacks. Existing mapped-window, navigation and resize evidence covers the implemented desktop interactions. Original application grid interactions outside the exercised views remain open; Windows method/ordinal compatibility is outside the host functionality contract.
+- Typed Python database records and ordered overlay functions implement selected native table contracts. Independently rerun cases cover first-match duplicate deletion, preserved default order and version-specific overlays. The remaining database factories, getters and consumers retain their business obligations.
+- Explicit recorder wire records implement selected buffer/list, DMCI and DRS field layouts. Independently rerun cases cover a literal envelope, aggregate buffer bounds and selected command IDs. Raw wire preservation has a distinct contract from native C++ object construction, shared state and `Read` normalization.
+- Existing programming, utility and monitor implementations are assessed by their individual source-bound family reviews. Their presence does not close the large DLLs listed above.
+
+The complete expanded syntax inventory records 21,100 constructors, 9,865 destructors, 10,870 operators, 1,577 generated C++ symbols, 53,152 other C++ methods, 16,206 ordinal-only code exports, 19,743 other named entries and 13,498 data exports. These categories identify native representation; they do not multiply the application functionality into thousands of required Python ABI stubs. Actual consumed behavior, ownership, version handling and cleanup remain the functional obligations.
+
+## Functional coverage
+
+Objective Grid is imported only by the supplied MainMenu and Techstream applications; Stingray Foundation is imported only by Objective Grid. Their presentation role has a concrete GTK replacement for the implemented application screens. The original cohort references 520 Objective Grid slots and ten Stingray slots. Other exported SDK methods have no supplied static import in that cohort; this observation does not certify dynamic unreachability or full original application UI coverage.
+
+CommandAPI has 182 unmangled API entries, with 162 statically imported. Selected active-test numeric conversion and formatting have exact native branch evidence and six independently rerun host tests. Existing domain APIs replace other operations only where their actual inputs, outputs, state and failure behavior are established. Remaining API/result families require operation-level implementation and validation.
+
+CommandDataLib and its legacy variant carry real diagnostic data. Reviewed DRS/DMCI wire records are one implemented subset. The legacy library has a concrete ConverterTSE consumer using fourteen named classes and 38 import slots. Existing TSE envelope, monitor and report inspection does not implement that converter: its actual input-to-output field transformations remain an open business obligation. Remaining ADS image/operation, behavior/custom/RAM and shared command-helper families remain explicit business gaps.
+
+The supplied CUW12 and CUW18 ConverterTSE binaries and their Legacy dependencies are individually byte-identical across those builds. Their dynamic dependency still differs: the converter requests `CommandAPI.dll!_ConvertData@20`, available in supplied CUW12 CommandAPI, whereas the supplied CUW18 CommandAPI exports `_ConvertData@28`. The actual lookup failure and selected dependency lane must be preserved; byte-identical caller code does not establish full behavior equality.
+
+KgpDataCtrl requires versioned database and selection behavior. DataListIF and KgpDataMonitorCtrl require protocol-specific monitor/controller behavior. Explicit host lifecycles replace their worker/provider ABI; the state machines and consumed metadata retain their functional contracts.
+
+UtilityExNK2 and UtilityEx2TY are separate Ex2 business engines. Their original CUW18 callers import thirteen and 63 slots respectively, including keep-alive, message and connection-history operations. The expanded CUW12 tree also contains three ImmoON callers with 727, 54 and 472 imports. All four engine versions and six caller identities are retained separately; ordinal equality across builds does not establish matching operations. The existing NeoNK callback and five-provider ScriptLib ports do not establish these engine or dynamic-resolver contracts. Those engine and resolver operations remain assigned functional gaps.
+
+The complete supplied 12/18/2026 application trees contain 2570 PE source paths. An independent parser rebuilds their union with the original source cohort, checking every alias, nonzero EAT entry, name/ordinal mapping, storage class and reconstruction carrier against the canonical manifest (SHA-256 `9baf36c9aa71df6f24b504b82d5a3e004b07f83059882dd6018fa82ef25b09c6`). The 69,480 null EAT slots encountered across checked source paths are holes, not operations. Named null holes do not require dereferencing their invalid name pointers. Nonnull named ordinal duplicates, out-of-range ordinals, truncated mappings and unbounded names are rejected. Both supplied 12/18 `USB_Driver_XP_x86/wdreg16.exe` paths identify the same 25,591-byte NE16 artifact (`e7172a25848f1b2e710e4b226fbe34cf0e733cc9eb3d8f76802f1a1e5a86add8`); these remain a separate installer obligation, with no fabricated PE identity. See the private `all-applications-independent-review.json` and its reproducible `verify_all_applications.py` check.
+
+## Expanded application and managed-runtime boundary
+
+The fourteen-identity review above remains scoped to its original cohort. It does not certify newly supplied application paths or treat all other modules as operating-system boilerplate. Native import tables and version resources were reparsed for all 2454 identities without parse exemptions. Managed modules may expose only the CLR entry thunk, or no PE exports: their application methods and resources remain functional obligations even when the export ledger is empty.
+
+For example, exact supplied `GTSPlusCommon.dll` and `GtsPlus-CM.dll` identities include application-specific managed/native bundles. Their `mscoree.dll`, Win32 and CRT imports establish hosting dependencies, not a replacement of their diagnostic, communication, persistence or error-reporting behavior. Their caller-consumed business contracts remain OPEN pending source-bound owner implementation and integration. Conversely, InstallShield version resources on `dotnetinstaller.exe` and `ISBEW64.exe` establish installer roles. Linux installation and dependency distribution can replace those roles without porting their Windows runtime, but OEM custom actions, payload selection and failure handling require their own reviewed contract. Existing static distribution evidence does not certify all new installer identities.
+
+Supplied `System.Runtime.CompilerServices.Unsafe.dll` identifies a .NET framework dependency and `MahApps.Metro.dll` a managed presentation dependency through their exact resource metadata. Reproducing those frameworks wholesale is outside the Linux host contract. Proving the actual consumed application behavior is still required: neither a framework basename nor a CLR flag closes an application target. Existing GTK presentation covers its exercised host screens only; managed application navigation, settings, resources and error flows outside those screens remain OPEN.
+
+Existing host whole-file evidence pins intentionally remain at their reviewed checkpoints when shared sources drift. A fresh passing authored test alone cannot bless unrelated changed functions or transitive dependencies; complete host integration claims need renewed bounded review. The independent full source-union check passes separately from this still-open semantic gate.
+
+## Verification boundary
+
+All supplied PE import tables and version-resource metadata were inspected statically. No original executable, DLL, installer, Wine process, adapter, vehicle or remote service was run for this audit. The host subset checks use authored inputs. Existing GUI evidence is inspected evidence from its owning desktop review; this static audit does not replace a live GUI review. Physical behavior remains `PHYSICAL_UNCONFIRMED`.
