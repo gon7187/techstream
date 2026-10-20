@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from scripts.diagnostics import Session
@@ -20,10 +20,18 @@ def replay_session(
     operation: str = "replay",
     ecu: str | None = None,
     samples: int = 1,
+    service: int = 1,
+    sensor: int = 1,
+    pids: Sequence[int] | None = None,
+    freeze: bool = False,
 ) -> dict:
+    if not path.is_file():
+        raise ValueError("Choose an ordinary local recording file")
     replay = Replay.load(path)
     session = Session(replay.exchange, cancelled=cancelled)
     selected = ecu or replay.ecus[0]
+    if selected not in replay.ecus:
+        raise ValueError("Selected ECU is not present in this recording")
     if operation == "replay":
         report = session.health_check(replay.ecus)
     elif operation == "calibration":
@@ -36,17 +44,52 @@ def replay_session(
             "ecu": selected,
             "samples": session.poll(selected, samples=samples),
         }
+    elif operation == "monitors":
+        report = session.monitors(selected)
+    elif operation == "support":
+        report = {
+            "ecu": selected,
+            "physical_status": "PHYSICAL_UNCONFIRMED",
+            "service": service,
+            "sensor": sensor if service == 5 else None,
+            "supported_pids": session.support(selected, service, sensor=sensor),
+        }
+    elif operation == "parameters":
+        report = session.parameters(selected, pids=pids, freeze=freeze)
+    elif operation == "vehicle_info":
+        report = session.information(selected)
     else:
         raise ValueError("Unknown recording operation")
     replay.assert_complete()
     return {"source": replay.source, **report}
 
 
-def save_report(path: Path, report: dict, *, source: Path | None = None) -> None:
-    if source is not None and (
-        path.resolve() == source.resolve() or (path.exists() and source.samefile(path))
-    ):
-        raise ValueError("Report destination must differ from the source recording")
+def parse_pids(text: str) -> list[int] | None:
+    """A shared hexadecimal PID list for CLI and desktop, empty means advertised."""
+    try:
+        pids = [int(item, 16) for item in text.replace(",", " ").split()]
+    except ValueError as exc:
+        raise ValueError(
+            "PIDs must be hexadecimal bytes separated by commas or spaces"
+        ) from exc
+    if any(not 0 <= pid <= 255 for pid in pids) or len(set(pids)) != len(pids):
+        raise ValueError("PIDs must be unique hexadecimal bytes")
+    return pids or None
+
+
+def save_report(
+    path: Path,
+    report: dict,
+    *,
+    source: Path | None = None,
+    sources: Sequence[Path] = (),
+) -> None:
+    for original in (*sources, *((source,) if source is not None else ())):
+        original.stat()
+        if path.resolve() == original.resolve() or (
+            path.exists() and original.samefile(path)
+        ):
+            raise ValueError("Report destination must differ from every source file")
     _atomic_text(path, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
 
@@ -56,7 +99,14 @@ def main() -> int:
     replay = commands.add_parser("replay", help="Decode a complete read-only session")
     replay.add_argument("path", type=Path)
     replay.add_argument("--output", type=Path)
-    for name in ("calibration", "poll"):
+    for name in (
+        "calibration",
+        "poll",
+        "monitors",
+        "support",
+        "parameters",
+        "vehicle_info",
+    ):
         command = commands.add_parser(name, help=f"Decode a {name} recording")
         command.add_argument("path", type=Path)
         command.add_argument(
@@ -65,6 +115,25 @@ def main() -> int:
         command.add_argument("--output", type=Path)
         if name == "poll":
             command.add_argument("--samples", type=int, default=1)
+        if name == "support":
+            command.add_argument(
+                "--service", type=int, choices=(1, 2, 5, 6, 9), default=1
+            )
+            command.add_argument(
+                "--sensor",
+                type=int,
+                default=1,
+                help="Legacy service 05 one-bit sensor mask",
+            )
+        if name == "parameters":
+            command.add_argument(
+                "--pids",
+                default="",
+                help="Hex PID list, e.g. '0C,0D'; default: all advertised defined PIDs",
+            )
+            command.add_argument(
+                "--freeze", action="store_true", help="Read service 02 frame zero"
+            )
     args = parser.parse_args()
     try:
         report = replay_session(
@@ -72,6 +141,10 @@ def main() -> int:
             operation=args.command,
             ecu=getattr(args, "ecu", None),
             samples=getattr(args, "samples", 1),
+            service=getattr(args, "service", 1),
+            sensor=getattr(args, "sensor", 1),
+            pids=parse_pids(getattr(args, "pids", "")),
+            freeze=getattr(args, "freeze", False),
         )
         if args.output:
             save_report(args.output, report, source=args.path)

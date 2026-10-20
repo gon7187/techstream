@@ -1,7 +1,7 @@
-"""Strict CSDF object inspector and bounded, side-effect-free VM subset.
+"""Strict CSDF object inspector and bounded VM with explicit host callbacks.
 
-Typed byte operations, variables and bounded control flow are evaluated.
-No script library, diagnostic command or original binary is loaded.
+Typed byte operations, variables, control flow and injected libraries execute.
+No original binary or device transport is loaded.
 """
 
 from __future__ import annotations
@@ -16,8 +16,11 @@ import json
 import struct
 import xml.etree.ElementTree as ET
 from collections import Counter
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+from scripts.local_files import read_regular
 
 MAX_SIZE = 16 * 1024 * 1024
 UTILITY_LIBRARY_SHA256 = (
@@ -290,8 +293,8 @@ def parse_steps(data: bytes) -> tuple[Step, ...]:
 def _variable_index(payload: bytes, variables: list) -> int:
     if len(payload) < 2:
         raise ValueError("Truncated CSDF variable reference")
-    index = int.from_bytes(payload[:2], "little")
-    if index >= len(variables):
+    index = int.from_bytes(payload[:2], "little") - 0x8000
+    if not 0 <= index < len(variables):
         raise ValueError("CSDF variable outside declared table")
     return index
 
@@ -396,9 +399,16 @@ def _operator(
 
 
 def evaluate(
-    script: ScriptObject, *, max_steps: int = 10000, max_bytes: int = MAX_SIZE
+    script: ScriptObject,
+    *,
+    max_steps: int = 10000,
+    max_bytes: int = MAX_SIZE,
+    libraries: Mapping[bytes, Mapping[int, Callable[[LibraryContext, int], None]]]
+    | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    initial_variables: Mapping[int, tuple[int, bytes]] | None = None,
 ) -> tuple[tuple[int, bytes], ...]:
-    """Evaluate recovered byte/variable/control operations; reject all others."""
+    """Execute recovered instructions with explicit, bounded library bindings."""
     if type(max_steps) is not int or max_steps < 1:
         raise ValueError("max_steps must be a positive integer")
     if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_SIZE:
@@ -411,8 +421,16 @@ def evaluate(
     stack: list[tuple[int, bytes]] = []
     calls: list[int] = []
     variables: list[tuple[int, bytes] | None] = [None] * script.variable_count
+    for variable_id, value in (initial_variables or {}).items():
+        if type(variable_id) is not int or not 0x8000 <= variable_id <= 65535:
+            raise ValueError("Invalid CSDF initial variable ID")
+        index = _variable_index(variable_id.to_bytes(2, "little"), variables)
+        variables[index] = value
+    LibraryContext(stack, variables, 0, max_bytes).check()
     pc = 0
     for _ in range(max_steps):
+        if cancelled is not None and cancelled():
+            raise InterruptedError("CSDF execution cancelled")
         if not 0 <= pc < len(script.steps):
             raise ValueError("CSDF program counter outside steps")
         step = script.steps[pc]
@@ -429,6 +447,24 @@ def evaluate(
                 stack.pop()
             elif opcode == 0x30:
                 _operator(step.payload[0], stack, variables, max_bytes)
+            elif opcode == 0x40:
+                operand = int.from_bytes(step.payload[:2], "little")
+                library_index, function_id = operand >> 8, operand & 255
+                if library_index >= len(script.libraries):
+                    raise ValueError("CSDF library index outside declared table")
+                name = script.libraries[library_index]
+                function = (libraries or {}).get(name, {}).get(function_id)
+                if function is None:
+                    raise ValueError(
+                        f"Unavailable CSDF library function {name!r}:{function_id}"
+                    )
+                context = LibraryContext(stack, variables, (pc + 1) & 65535, max_bytes)
+                function(context, step.payload[2])
+                context.check()
+                if cancelled is not None and cancelled():
+                    raise InterruptedError("CSDF execution cancelled")
+                pc = context.next_step
+                continue
             elif opcode == 0x45:
                 if not stack:
                     raise ValueError("CSDF data stack underflow")
@@ -454,11 +490,68 @@ def evaluate(
                 raise ValueError(f"Unsupported CSDF evaluation opcode 0x{opcode:02x}")
             pc = (pc + 1) & 0xFFFF
         finally:
-            if _retained_bytes(stack, variables) > max_bytes:
-                raise ValueError("CSDF aggregate byte budget exceeded")
-            if len(stack) > 4096 or len(calls) > 4096:
+            LibraryContext(stack, variables, 0, max_bytes).check()
+            if len(calls) > 4096:
                 raise ValueError("CSDF stack entry budget exceeded")
     raise ValueError("CSDF instruction budget exceeded")
+
+
+class LibraryContext:
+    """Explicit host replacement for a native CScriptFunction's VM access.
+
+    Functions own their stack convention and may change the already advanced PC,
+    as native CtrlFunc does. No DLL is loaded and no argument order is guessed.
+    """
+
+    def __init__(
+        self,
+        stack: list[tuple[int, bytes]],
+        variables: list,
+        next_step: int,
+        max_bytes: int,
+    ):
+        self.stack, self.variables = stack, variables
+        self.next_step, self.max_bytes = next_step, max_bytes
+
+    def pop(self, *, resolve: bool = True) -> tuple[int, bytes]:
+        if not self.stack:
+            raise ValueError("CSDF data stack underflow")
+        value = self.stack.pop()
+        return _resolve(value, self.variables) if resolve else value
+
+    def push(self, tag: int, payload: bytes) -> None:
+        if (
+            type(tag) is not int
+            or tag not in (1, 2, 3, 4, 5)
+            or type(payload) is not bytes
+        ):
+            raise ValueError("Invalid CSDF library value")
+        if len(payload) > self.max_bytes - _retained_bytes(self.stack, self.variables):
+            raise ValueError("CSDF aggregate byte budget exceeded")
+        self.stack.append((tag, payload))
+        self.check()
+
+    def store(self, reference: tuple[int, bytes], value: tuple[int, bytes]) -> None:
+        self.stack.extend((reference, value))
+        _operator(1, self.stack, self.variables, self.max_bytes)
+        self.check()
+
+    def check(self) -> None:
+        if type(self.next_step) is not int or not 0 <= self.next_step <= 65535:
+            raise ValueError("Invalid CSDF library program counter")
+        for value in [*self.stack, *(v for v in self.variables if v is not None)]:
+            if (
+                not isinstance(value, tuple)
+                or len(value) != 2
+                or type(value[0]) is not int
+                or value[0] not in (1, 2, 3, 4, 5)
+                or type(value[1]) is not bytes
+            ):
+                raise ValueError("Invalid CSDF library value")
+        if len(self.stack) > 4096:
+            raise ValueError("CSDF stack entry budget exceeded")
+        if _retained_bytes(self.stack, self.variables) > self.max_bytes:
+            raise ValueError("CSDF aggregate byte budget exceeded")
 
 
 if __name__ == "__main__":
@@ -479,13 +572,13 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     try:
-        with args.path.open("rb") as source:
-            data = source.read(MAX_SIZE + 1)
+        data = read_regular(args.path, limit=MAX_SIZE)
         if args.utility_library:
             if args.steps:
                 raise ValueError("Choose either utility XML or bare steps")
-            with args.utility_library.open("rb") as source:
-                key = utility_resource_key(source.read(MAX_SIZE + 1))
+            key = utility_resource_key(
+                read_regular(args.utility_library, limit=MAX_SIZE)
+            )
             result = (
                 decode_utility_list(data, key)
                 if args.utility_list

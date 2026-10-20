@@ -24,6 +24,8 @@ jobs:
         run: python -m scripts.session_cli replay examples/diagnostic-session.json --output "$RUNNER_TEMP/session.json"
       - name: Generate demo resources without GTK
         run: python -m scripts.demo --output "$RUNNER_TEMP/demo"
+      - name: Execute native offline workflows and preserve native files
+        run: python -m scripts.offline_verify workflows
 
   static:
     runs-on: ubuntu-24.04

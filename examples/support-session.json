@@ -1,0 +1,14 @@
+{
+  "schema": "techstream-native-replay-v1",
+  "source": "authored_synthetic",
+  "ecus": [
+    "synthetic-ECU"
+  ],
+  "transactions": [
+    {
+      "ecu": "synthetic-ECU",
+      "request": "0100",
+      "response": "410000080000"
+    }
+  ]
+}

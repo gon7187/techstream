@@ -14,10 +14,100 @@ from scripts.script_vm import (
 
 
 class ScriptVMTests(unittest.TestCase):
+    def test_library_dispatch_uses_high_library_byte_and_low_function_id(self):
+        data = b"\x11\x01a\x40\x03\x07\x01\x01\x44\0"
+        script = ScriptObject(0, (), (b"unused", b"Demo"), parse_steps(data))
+        called = []
+
+        def function(context, argc):
+            called.append((argc, context.next_step))
+            tag, value = context.pop()
+            context.push(tag, value + b"b")
+
+        self.assertEqual(
+            evaluate(script, libraries={b"Demo": {7: function}}), ((1, b"ab"),)
+        )
+        self.assertEqual(called, [(1, 2)])
+        with self.assertRaisesRegex(ValueError, "Unavailable"):
+            evaluate(script)
+
+    def test_library_references_initial_variables_and_mutable_program_counter(self):
+        script = ScriptObject(
+            1,
+            (),
+            (b"Demo",),
+            parse_steps(b"\x15\x02\0\x80\x40\x03\x01\0\x01\xff\0\x44\0"),
+        )
+
+        def function(context, argc):
+            ref = context.pop(resolve=False)
+            context.store(ref, (3, b"changed"))
+            context.push(*context.variables[0])
+            context.next_step = 3
+
+        self.assertEqual(
+            evaluate(
+                script,
+                libraries={b"Demo": {1: function}},
+                initial_variables={0x8000: (3, b"before")},
+            ),
+            ((3, b"changed"),),
+        )
+        for variable_id in (0, 0x7FFF, 0x8001, True):
+            with self.subTest(variable_id=variable_id), self.assertRaises(ValueError):
+                evaluate(script, initial_variables={variable_id: (3, b"x")})
+        invalid_low_ref = ScriptObject(
+            1, (), (), parse_steps(b"\x15\x02\0\0\x11\x01x\x30\x01\x01\x44\0")
+        )
+        with self.assertRaisesRegex(ValueError, "outside declared"):
+            evaluate(invalid_low_ref)
+
+    def test_library_failures_cancellation_and_budgets(self):
+        script = ScriptObject(0, (), (b"Demo",), parse_steps(b"\x40\x03\x01\0\0\x44\0"))
+
+        def too_large(context, argc):
+            context.push(3, b"x" * 9)
+
+        with self.assertRaisesRegex(ValueError, "byte budget"):
+            evaluate(script, libraries={b"Demo": {1: too_large}}, max_bytes=8)
+
+        def invalid(context, argc):
+            context.stack.append((99, b"x"))
+
+        with self.assertRaisesRegex(ValueError, "library value"):
+            evaluate(script, libraries={b"Demo": {1: invalid}})
+
+        def bad_pc(context, argc):
+            context.next_step = -1
+
+        with self.assertRaisesRegex(ValueError, "program counter"):
+            evaluate(script, libraries={b"Demo": {1: bad_pc}})
+
+        def recurse(context, argc):
+            context.next_step = 0
+
+        with self.assertRaisesRegex(ValueError, "instruction budget"):
+            evaluate(script, libraries={b"Demo": {1: recurse}}, max_steps=5)
+        state = [False]
+
+        def cancel(context, argc):
+            state[0] = True
+
+        with self.assertRaises(InterruptedError):
+            evaluate(
+                script, libraries={b"Demo": {1: cancel}}, cancelled=lambda: state[0]
+            )
+
+        def fail(context, argc):
+            raise OSError("fake library failed")
+
+        with self.assertRaisesRegex(OSError, "fake library"):
+            evaluate(script, libraries={b"Demo": {1: fail}})
+
     def test_aggregate_budget_counts_retained_concatenations_and_variables(self):
         # v0='abcd'; loop leaves a fresh copy of v0+'x' on the stack.
-        data = b"\x15\x02\0\0\x12\x04abcd\x30\x01\x01"
-        data += b"\x15\x02\0\0\x11\x01x\x30\x01\x31\x41\x02\x03\0"
+        data = b"\x15\x02\0\x80\x12\x04abcd\x30\x01\x01"
+        data += b"\x15\x02\0\x80\x11\x01x\x30\x01\x31\x41\x02\x03\0"
         script = ScriptObject(1, (), (), parse_steps(data))
         with self.assertRaisesRegex(ValueError, "byte budget"):
             evaluate(script, max_steps=100, max_bytes=20)
@@ -130,9 +220,9 @@ class ScriptVMTests(unittest.TestCase):
 
     def test_variable_store_array_reference_and_zero_for_missing_element(self):
         # v0=type2('ab'); v0[1]=type1('x'); compare v0 to 'ax'.
-        data = b"\x15\x02\0\0\x12\x02ab\x30\x01\x01"
-        data += b"\x15\x02\0\0\x11\x01\x01\x30\x01\x32\x11\x01x\x30\x01\x01"
-        data += b"\x15\x02\0\0\x12\x02ax\x30\x01\x41\x44\0"
+        data = b"\x15\x02\0\x80\x12\x02ab\x30\x01\x01"
+        data += b"\x15\x02\0\x80\x11\x01\x01\x30\x01\x32\x11\x01x\x30\x01\x01"
+        data += b"\x15\x02\0\x80\x12\x02ax\x30\x01\x41\x44\0"
         self.assertEqual(
             evaluate(ScriptObject(1, (), (), parse_steps(data))), ((1, b"\x01"),)
         )
@@ -141,20 +231,20 @@ class ScriptVMTests(unittest.TestCase):
         self.assertEqual(
             evaluate(ScriptObject(0, (), (), parse_steps(data))), ((3, b"abc"),)
         )
-        data = b"\x15\x02\0\0\x12\x01a\x30\x01\x01"
-        data += b"\x15\x02\0\0\x11\x01\x03\x30\x01\x32\x11\x01z\x30\x01\x01"
-        data += b"\x15\x02\0\0\x12\x04a\0\0z\x30\x01\x41\x44\0"
+        data = b"\x15\x02\0\x80\x12\x01a\x30\x01\x01"
+        data += b"\x15\x02\0\x80\x11\x01\x03\x30\x01\x32\x11\x01z\x30\x01\x01"
+        data += b"\x15\x02\0\x80\x12\x04a\0\0z\x30\x01\x41\x44\0"
         self.assertEqual(
             evaluate(ScriptObject(1, (), (), parse_steps(data))), ((1, b"\x01"),)
         )
-        data = b"\x15\x02\0\0\x12\x02ab\x30\x01\x01"
-        data += b"\x15\x02\0\0\x11\x01\xff\x30\x01\x32\x11\x01\0\x30\x01\x41\x44\0"
+        data = b"\x15\x02\0\x80\x12\x02ab\x30\x01\x01"
+        data += b"\x15\x02\0\x80\x11\x01\xff\x30\x01\x32\x11\x01\0\x30\x01\x41\x44\0"
         self.assertEqual(
             evaluate(ScriptObject(1, (), (), parse_steps(data))), ((1, b"\x01"),)
         )
         for data in (
-            b"\x15\x02\x01\0\x11\x01\0\x30\x01\x41",
-            b"\x15\x02\0\0\x11\x01\0\x30\x01\x41",
+            b"\x15\x02\x01\x80\x11\x01\0\x30\x01\x41",
+            b"\x15\x02\0\x80\x11\x01\0\x30\x01\x41",
             b"\x12\x01x\x11\x01\0\x30\x01\x11",
         ):
             with self.subTest(data=data), self.assertRaises(ValueError):

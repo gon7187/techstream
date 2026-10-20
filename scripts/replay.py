@@ -11,36 +11,22 @@ try:
         DiagnosticError,
         Exchange,
         NegativeResponse,
-        correlate,
-        decode_calibration_ids,
-        decode_cvns,
-        decode_dtc,
-        decode_dtcs,
-        decode_pid,
-        decode_readiness,
-        decode_vin,
-        supported_pids,
+        decode_response,
         validate_ecu,
         validate_request,
     )
+    from .local_files import read_regular
 except ImportError:
     from diagnostics import (
         MAX_PDU,
         DiagnosticError,
         Exchange,
         NegativeResponse,
-        correlate,
-        decode_calibration_ids,
-        decode_cvns,
-        decode_dtc,
-        decode_dtcs,
-        decode_pid,
-        decode_readiness,
-        decode_vin,
-        supported_pids,
+        decode_response,
         validate_ecu,
         validate_request,
     )
+    from local_files import read_regular
 
 MAX_TRANSACTIONS = 100000
 MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -72,26 +58,7 @@ def _hex(value: Any) -> bytes:
 
 def _validate_response(request: bytes, response: bytes) -> None:
     try:
-        data = correlate(request, response)
-        if request[0] in (3, 7, 10):
-            decode_dtcs(data)
-        elif request[0] == 9:
-            if request[1] == 0:
-                supported_pids(data)
-            elif request[1] == 2:
-                decode_vin(data)
-            elif request[1] == 4:
-                decode_calibration_ids(data)
-            else:
-                decode_cvns(data)
-        elif request[1] == 0:
-            supported_pids(data)
-        elif request[1] == 1:
-            decode_readiness(data)
-        elif request[1] == 2:
-            decode_dtc(data)
-        else:
-            decode_pid(request[1], data)
+        decode_response(request, response)
     except NegativeResponse:
         # Negative ECU replies are valid evidence; Session reports the failure.
         return
@@ -154,10 +121,10 @@ class Replay:
 
     @classmethod
     def load(cls, path: str | Path) -> "Replay":
-        with Path(path).open("rb") as stream:
-            raw = stream.read(MAX_FILE_BYTES + 1)
-        if len(raw) > MAX_FILE_BYTES:
-            raise ReplayError("replay file exceeds 16 MiB")
+        try:
+            raw = read_regular(path, limit=MAX_FILE_BYTES)
+        except ValueError as error:
+            raise ReplayError(str(error)) from error
         try:
             document = json.loads(raw, object_pairs_hook=_object)
         except (ValueError, UnicodeError, RecursionError) as exc:

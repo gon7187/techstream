@@ -6,6 +6,8 @@ from pathlib import Path
 
 from scripts.demo import create_demo
 from scripts.diagnostic_db import DiagnosticCatalog
+from scripts.profiles import VehicleCatalog
+from scripts.support import check_pid_support
 from scripts.workbench import CatalogIndex, catalog_roots
 
 
@@ -32,6 +34,49 @@ class DemoTests(unittest.TestCase):
                     db.named_records(5, catalog.language)[0]["code"], "P0300"
                 )
                 self.assertEqual(db.signal_variants(0)[0]["divisor"], 4)
+                vehicles = VehicleCatalog(root / f"Techstream_DB_{code}")
+                self.assertEqual(
+                    [
+                        definition["categories"][2]["name"]
+                        for definition in vehicles.vehicle_definitions
+                    ],
+                    ["2024", "2025"],
+                )
+                pending = vehicles.resolve_vehicle(0)
+                self.assertEqual(pending["status"], "needs_option")
+                self.assertEqual(
+                    [choice["name"] for choice in pending["choices"]],
+                    ["Automatic", "Manual"],
+                )
+                selected = vehicles.resolve_vehicle(0, (1,))
+                self.assertEqual(selected["vehicle_name_key"], 10001)
+                systems = vehicles.vehicle_systems(selected["vehicle_name_key"])
+                self.assertEqual(systems[0]["file"], "DemoEngine.ddb")
+                profile = vehicles.build_profile(
+                    systems[0]["category"],
+                    vehicle_name_key=selected["vehicle_name_key"],
+                )
+                self.assertEqual(profile.command_frames(0x10)[0].request, b"\x21\0")
+                self.assertEqual(profile.command_frames(0x6B)[0].request, b"\x01\x00")
+                freeze = profile.records(10)[0]
+                self.assertTrue(freeze[78] & 0x20)
+                self.assertEqual(freeze[76], 2)
+                requests = []
+
+                def exchange(request, requests=requests):
+                    requests.append(request)
+                    return b"\x61\x0c\x80"
+
+                self.assertTrue(
+                    check_pid_support(
+                        freeze,
+                        {12: 2},
+                        profile.pid_bits(),
+                        profile.command_frames,
+                        exchange,
+                    )
+                )
+                self.assertEqual(requests, [b"\x21\x0c"])
             before = (root / "demo-manifest.json").read_bytes()
             with self.assertRaises(FileExistsError):
                 create_demo(root)

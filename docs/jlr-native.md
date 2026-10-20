@@ -21,7 +21,9 @@
 
 ## Протокол и точные опоры
 
-SLP: `<HH>(payload_len, payload_len XOR 0x51e6)` + payload, длина 1..0x1800. Потоковый декодер собирает фрагменты и при плохом заголовке сдвигается на байт. Заголовок payload: шесть LE u16 — destination, source, opcode, sequence, flags, alignment. Sequence 1..255 с переходом к 1; alignment обнуляется, оригинал оставлял его неинициализированным.
+SLP: `<HH>(payload_len, payload_len XOR 0x51e6)` + payload. JLR-кодек принимает длину 1..65535 — границу поля uint16, а не подтверждённую ёмкость устройства. Прежний общий лимит 6144 относился к защитной host policy Toyota/MFC и ошибочно обрезал firmware-пакеты JLR; Toyota-кодек сохраняет свой лимит. Потоковый декодер собирает фрагменты, принимает не более 65539 байт за один вызов и при плохом заголовке сдвигается на байт. Заголовок payload: шесть LE u16 — destination, source, opcode, sequence, flags, alignment. Sequence 1..255 с переходом к 1; alignment обнуляется, оригинал оставлял его неинициализированным.
+
+Синтетический firmware-пакет с 8192 байтами данных и 28 байтами заголовка проходит этот кодек. Сам размер firmware-чанка 8192 — отдельная защитная host policy updater, а не установленный максимум оригинальной прошивки или реального USB-устройства.
 
 Обычный ответ минимум 20 байт, status u32+12; echo допускает header-only 12 байт без status. Порт сверяет destination/source/opcode/sequence; сохраняет несвязанные события в ограниченной очереди, использует monotonic timeout и отклоняет короткую запись USB. Firmware raw значения показываются без догадки о номере версии.
 
@@ -31,7 +33,7 @@ DLL VA: framing `0x1006e180`, receive `0x1006b1c0`, waiter `0x1006d9b0`, enumera
 
 ## Что требуется для диагностики
 
-USB-проверка не подтверждает совместимость с автомобилем. Board capabilities определяют адрес канала, например CAN slot1 → `0x0501`, ISO15765 → `0x0601`; это не номера 5/6. CAN/K-line RX разобраны, а ISO15765 требует host segmentation, flow control, filters, allocation и lifecycle. Эти пути ещё не подключены к GUI как готовая диагностика.
+USB-проверка не подтверждает совместимость с автомобилем. Board capabilities определяют адрес канала, например CAN slot1 → `0x0501`, ISO15765 → `0x0601`; это не номера 5/6. Raw CAN/host ISO-TP, firmware ISO и K-line lifecycle/filters/init/periodic/repeat теперь реализованы через явно внедрённый transport; API и границы описаны в [jlr-channels.md](jlr-channels.md). Firmware ISO передаёт целую PDU и поручает TX segmentation/FC прошивке; host собирает RX segments, не отправляя второй FC. Это синтетически проверенные пути, а не подтверждённая работа с физическим автомобилем.
 
 В `scripts/isotp.py` реализованы I/O-free state machines для host ISO-TP поверх raw CAN: Classical CAN, PDU 1..4095, один точный peer, 11-/29-bit ID с обязательной проверкой формата входящего кадра, normal/extended addressing, SF/FF/CF/FC, BS, STmin, WAIT limit и monotonic timeouts. Код не отправляет кадры сам. При включении в транспорт caller должен маршрутизировать flow-control отдельно, вызывать `tick()` без входящих данных и отменять передачу при сбое подачи кадра. Проверены 210 roundtrip-вариантов и malformed/таймерные сценарии, включая допустимую длинную STmin при коротком no-progress timeout.
 

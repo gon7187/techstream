@@ -8,15 +8,26 @@ flowchart TD
     Local[User-supplied local resources] --> Catalog
     Catalog --> UI[GTK4 / libadwaita workbench]
     Catalog --> Conversion[Signal conversion]
+    Catalog --> Profiles[Vehicle / options / selected commands]
+    Profiles --> Toyota[Toyota session engines]
     Fixture[Synthetic diagnostic session] --> Replay[Replay transport]
     Replay --> Diagnostics[Diagnostic session / response decoding]
     Diagnostics --> Report[JSON report]
     Diagnostics --> UI
     Diagnostics --> Chart[Selectable sample chart]
     Chart --> UI
+    NativeFiles[DM / TSE / DRS / CUW] --> Files[Native format readers / writers]
+    Files --> Chart
+    Files --> UI
+    XML[Utility XML / CSDF] --> Scripts[Bounded runtime + native libraries]
+    Scripts --> Toyota
     USB[System libusb] --> JLR[JLR identity / channel codecs]
-    JLR --> ISO[Raw CAN + host ISO-TP exchange]
+    JLR --> ISO[CAN / host ISO-TP / firmware ISO / K-line]
     ISO --> Diagnostics
+    ISO --> Toyota
+    Fakes[Authored injected backends] --> Toyota
+    Fakes --> Programming[Programming / recorder engines]
+    Programming --> Report
 ```
 
 The diagram shows implemented modules and data paths, not a claim that every path is wired into a complete live diagnostic engine.
@@ -32,12 +43,20 @@ The diagram shows implemented modules and data paths, not a claim that every pat
 | `scripts.workbench` | Catalog search, local favorites, CSV and passive USB inventory |
 | `scripts.pid_catalog` | Parse CT parameter groups |
 | `scripts.diagnostic_db` | Decode DDB containers and diagnostic definitions |
+| `scripts.profiles`, `scripts.support` | Vehicle and option joins, selected communication frames, exception overlays and PID support |
 | `scripts.signal_conversion` | Bounded bit extraction and numeric conversion |
 | `scripts.mongoose_protocol` | Frame encoding/decoding and protocol inspection |
 | `scripts.jlr`, `scripts.jlr_channels` | JLR USB lifecycle, identity and channel message structures |
 | `scripts.isotp` | Host-side ISO-TP sender/receiver state machines |
 | `scripts.diagnostics`, `scripts.replay` | Diagnostic response interpretation and deterministic replay |
 | `scripts.script_vm` | CSDF objects/operators, bounded execution and optional SRP/SRPLST inspection |
+| `scripts.toyota_session` | Selected Toyota commands, native DTC/freeze/active-test and routine behavior |
+| `scripts.utility`, `scripts.utility_bindings`, `scripts.script_libraries` | XML execution and native callback contracts with explicit host services |
+| `scripts.snapshot` | Native monitor buffers, signal conversion, TSE sections and recording playback |
+| `scripts.calibration`, `scripts.programming` | Calibration validation, recovered native protocol fragments and distinct host simulation |
+| `scripts.drive_recorder` | Native DRS commands, VIM logical packets and storage operations |
+| `scripts.offline_tools` | Executable authored workflows, file inspection and source-preserving native copying |
+| `scripts.offline_verify` | Reviewed software-coverage ledger and fail-closed completion checks |
 
 ## Evidence boundaries
 
@@ -45,7 +64,13 @@ Resource formats are recovered from local static research and checked against sy
 
 Replay makes request/response behavior deterministic and testable without a device. Mock USB tests exercise failure paths and cleanup. Neither proves that a particular adapter implements those messages correctly or that an ECU accepts them. Physical validation remains `PHYSICAL_UNCONFIRMED`; see the [validation plan](hardware-validation.md).
 
-The desktop browses resources and replays diagnostic records. Reference rows remain separate from decoded recording values; neither is presented as a live vehicle measurement. A complete diagnostic engine still needs validated vehicle selection, ECU sessions, polling, support gating, cancellation and hardware testing. Active tests, customization and programming require additional evidence and safety behavior; see the [feature matrix](full-port.md).
+The desktop selects vehicle definitions, browses resources, inspects native files
+and executes replay or authored workflows. Reference rows remain separate from
+decoded recording values; neither is presented as a live vehicle measurement.
+The executable engines use injected exchange and lifecycle providers, bounded
+budgets, cancellation and explicit native error states. Family-specific gaps
+remain software work in the [feature matrix](full-port.md) and coverage ledger;
+they are not reclassified as physical observations.
 
 ## Data and trust boundaries
 

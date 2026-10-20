@@ -738,3 +738,878 @@ class ISOExchangeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProtocolTransport(FakeTransport):
+    """Original-format replies and unsolicited RX, entirely synthetic USB."""
+
+    def __init__(
+        self, *, iso_response=None, bad_init=False, disconnected=False, **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.iso_response = iso_response
+        self.bad_init = bad_init
+        self.disconnected = disconnected
+
+    def write(self, frame):
+        payload = decode_frames(frame)[0]
+        target, _, opcode, _sequence = struct.unpack_from("<4H", payload)
+        super().write(frame)
+        with self.lock:
+            if opcode == 0x0C:
+                base = decode_frames(self.chunks.pop())[0]
+                self.chunks.append(
+                    encode_frame(base + bytes(4) + struct.pack("<I", 12345))
+                )
+            elif opcode == 0x11:
+                base = decode_frames(self.chunks.pop())[0]
+                mode = struct.unpack_from("<I", payload, 12)[0]
+                if mode == 0:
+                    data = b"\x33\x55\x08\x08"
+                    base += struct.pack("<I", 1 if self.bad_init else len(data)) + data
+                elif mode == 1:
+                    data = b"\x83\xf1\x10\xc1\xe9\x8f"
+                    base += (
+                        struct.pack("<IIHH", 0, 88, len(data) + 1, len(data))
+                        + data
+                        + bytes([sum(data) & 0xFF])
+                    )
+                self.chunks.append(encode_frame(base))
+            elif opcode == 8 and self.iso_response is not None:
+                peer = Peer(tx_id=0x7E8, rx_id=0x7E0)
+                sender = Sender(peer)
+                packets = [sender.start(self.iso_response, time.monotonic())]
+                if sender.state != "idle":
+                    sender.flow(0x7E0, b"\x30\0\0", time.monotonic())
+                    while sender.state != "idle":
+                        packet = sender.poll(time.monotonic())
+                        if packet is not None:
+                            packets.append(packet)
+                for packet in packets:
+                    self.chunks.append(encode_frame(rx(target=target, data=packet)))
+
+    def read(self, timeout_ms):
+        if self.disconnected:
+            raise OSError("Synthetic USB hot unplug")
+        return super().read(timeout_ms)
+
+
+class NativeProtocolTests(unittest.TestCase):
+    def kline(self, protocol=3, transport=None):
+        from scripts.jlr_channels import KLineSession, protocol_routes
+
+        transport = transport or ProtocolTransport()
+        boards = board_reply()
+        session = KLineSession(
+            JLRClient(transport), boards, protocol_routes(boards, protocol)[0]
+        )
+        return session, transport
+
+    def iso(self, data=b"\x62\xf1\x90VIN"):
+        from scripts.jlr_channels import (
+            FirmwareISOExchange,
+            FirmwareISOSession,
+            protocol_routes,
+        )
+
+        boards = board_reply()
+        transport = ProtocolTransport(iso_response=data)
+        session = FirmwareISOSession(
+            JLRClient(transport),
+            boards,
+            protocol_routes(boards, 6)[0],
+            500000,
+            Peer(tx_id=0x7E0, rx_id=0x7E8),
+        )
+        return session, transport, FirmwareISOExchange({"engine": session})
+
+    def test_routes_are_board_and_slot_derived(self):
+        from scripts.jlr_channels import protocol_routes
+
+        for protocol in (3, 4, 6):
+            route = protocol_routes(board_reply(1, 7), protocol)[0]
+            self.assertEqual(route.target, protocol << 8 | 128)
+        self.assertFalse(protocol_routes(board_reply(2), 3))
+        self.assertEqual(protocol_routes(board_reply(8), 4)[0].resource, 4)
+        with self.assertRaises(ValueError):
+            protocol_routes(bytes(180), 6)
+
+    def test_kline_lifecycle_values_init_and_bytes(self):
+        from scripts.jlr_channels import DataFrame
+
+        session, transport = self.kline()
+        session.open()
+        try:
+            self.assertEqual(session.five_baud_init(), b"\x08\x08")
+            session.set_value(4, 10400)
+            self.assertEqual(session.get_value(4), 12345)
+            submission = session.submit_data(b"\x68\x6a\xf1\x01\x00")
+            self.assertEqual(submission.target, 0x301)
+            data = b"\x48\x6b\x10\x41\x00"
+            packet = (
+                struct.pack(
+                    "<6HIIHH", 0, 0x301, 9, 0, 0, 0, 0, 9, len(data) + 1, len(data)
+                )
+                + data
+                + bytes([sum(data) & 0xFF])
+            )
+            transport.inject(packet)
+            events = wait_events(
+                session, lambda e: any(isinstance(x, DataFrame) for x in e)
+            )
+            self.assertIn(DataFrame(0, 9, data, bytes([sum(data) & 0xFF])), events)
+        finally:
+            session.close()
+        pin = [p for p in transport.sent if struct.unpack_from("<H", p, 4)[0] == 0x12]
+        self.assertEqual(pin[0][12:], struct.pack("<III", 1, 7, 15))
+        self.assertEqual(pin[-1][12:], struct.pack("<III", 0, 7, 15))
+
+    def test_fast_init_exact_body_and_protocol_rejection(self):
+        session, transport = self.kline(4)
+        session.open()
+        try:
+            event = session.fast_init(b"\xc1\x33\xf1\x81")
+            self.assertIsNotNone(event)
+            packet = next(p for p in transport.sent if p[4:6] == b"\x11\0")
+            self.assertEqual(
+                packet[12:],
+                struct.pack("<IIIIHH", 1, 1, 0, 8000, 4, 0) + b"\xc1\x33\xf1\x81",
+            )
+        finally:
+            session.close()
+        session, _ = self.kline(3)
+        session.open()
+        try:
+            self.assertIsNotNone(session.fast_init(b"x"))
+        finally:
+            session.close()
+
+    def test_malformed_five_baud_reply_rejected(self):
+        session, _ = self.kline(transport=ProtocolTransport(bad_init=True))
+        session.open()
+        try:
+            with self.assertRaises(ValueError):
+                session.five_baud_init()
+        finally:
+            session.close()
+
+    def test_periodic_wire_and_ambiguous_cleanup(self):
+        session, transport = self.kline()
+        session.open()
+        try:
+            hardware_id = session.start_periodic(b"\x3e", 1000)
+            self.assertEqual(hardware_id, 0)
+            start = transport.sent[-1]
+            self.assertEqual(start[12:], struct.pack("<IIIB", 4, 1000, 0, 1) + b"\x3e")
+            with self.assertRaises(ProtocolError):
+                session.start_periodic(b"\x3e", 1000)
+            session.stop_periodic(0)
+            with self.assertRaises(ValueError):
+                session.stop_periodic(0)
+        finally:
+            session.close()
+        self.assertIn(
+            struct.pack("<I", 4),
+            [p[12:] for p in transport.sent if p[4:6] == b"\x10\0"],
+        )
+
+    def test_firmware_iso_single_whole_pdu_and_no_double_fc(self):
+        for size in (3, 50, 4095):
+            with self.subTest(size=size):
+                data = bytes(i % 256 for i in range(size))
+                session, transport, exchange = self.iso(data)
+                session.open()
+                try:
+                    self.assertEqual(exchange.exchange("engine", b"\x22\xf1\x90"), data)
+                finally:
+                    session.close()
+                writes = [p for p in transport.sent if p[4:6] == b"\x08\0"]
+                self.assertEqual(len(writes), 1)
+                self.assertEqual(writes[0][24:], b"\0\0\x07\xe0\x22\xf1\x90")
+                stop = next(p for p in transport.sent if p[4:6] == b"\x0e\0")
+                self.assertEqual(stop[12:], struct.pack("<II", 2, 0))
+
+    def test_firmware_iso_filter_literal_packing_and_long_write(self):
+        session, transport, _ = self.iso()
+        session.open()
+        try:
+            packet = next(p for p in transport.sent if p[4:6] == b"\x0d\0")
+            self.assertEqual(
+                packet[12:],
+                struct.pack("<II", 2, 0) + b"\xff" + b"\0\0\x07\xe8\0\0\0\x07\xe0\0",
+            )
+            data = b"\x22" * 4095
+            session.submit_pdu(data)
+            self.assertEqual(transport.sent[-1][24:], b"\0\0\x07\xe0" + data)
+            with self.assertRaises(TypeError):
+                session.submit_frame(0x7E0, b"\x30\0\0")
+        finally:
+            session.close()
+
+    def test_firmware_cancel_closes_and_releases(self):
+        from scripts.jlr_channels import FirmwareISOExchange
+
+        session, transport, _ = self.iso()
+        session.open()
+        exchange = FirmwareISOExchange({"engine": session}, cancelled=lambda: True)
+        with self.assertRaises(InterruptedError):
+            exchange.exchange("engine", b"\x22\xf1\x90")
+        self.assertIsNone(session.client.channel_owner)
+        self.assertFalse(any(p[4:6] == b"\x08\0" for p in transport.sent))
+
+    def test_kline_and_iso_partial_open_failure_cleanup(self):
+        for protocol in (3, 4, 6):
+            for fail_at in range(1, 5):
+                with self.subTest(protocol=protocol, fail_at=fail_at):
+                    transport = ProtocolTransport(fail_at=fail_at)
+                    if protocol in (3, 4):
+                        session, _ = self.kline(protocol, transport)
+                    else:
+                        from scripts.jlr_channels import (
+                            FirmwareISOSession,
+                            protocol_routes,
+                        )
+
+                        boards = board_reply()
+                        session = FirmwareISOSession(
+                            JLRClient(transport),
+                            boards,
+                            protocol_routes(boards, 6)[0],
+                            500000,
+                            Peer(tx_id=0x7E0, rx_id=0x7E8),
+                        )
+                    with self.assertRaises(TimeoutError):
+                        session.open()
+                    self.assertIsNone(session.client.channel_owner)
+                    self.assertEqual(transport.sent[-1][4:6], b"\x05\0")
+
+    def test_decode_data_event_rejects_size_and_preserves_status(self):
+        from scripts.jlr_channels import decode_data_event
+
+        packet = (
+            struct.pack("<6HIIHH", 0, 0x301, 9, 0, 0, 0, 0x40000000, 99, 0, 1) + b"x"
+        )
+        self.assertEqual(decode_data_event(packet, 0x301).status, 0x40000000)
+        with self.assertRaises(ValueError):
+            decode_data_event(packet[:-1], 0x301)
+
+
+class NativeFailureTests(unittest.TestCase):
+    kline = NativeProtocolTests.kline
+    iso = NativeProtocolTests.iso
+
+    def test_kline_exchange_injected_framing(self):
+        from scripts.jlr_channels import KLineExchange
+
+        class ReplyTransport(ProtocolTransport):
+            def write(self, frame):
+                payload = decode_frames(frame)[0]
+                super().write(frame)
+                if payload[4:6] == b"\x08\0":
+                    response = b"\x48\x6b\x10\x41\x00"
+                    self.inject(
+                        struct.pack(
+                            "<6HIIHH",
+                            0,
+                            0x301,
+                            9,
+                            0,
+                            0,
+                            0,
+                            0,
+                            99,
+                            len(response) + 1,
+                            len(response),
+                        )
+                        + response
+                        + bytes([sum(response) & 0xFF])
+                    )
+
+        session, transport = self.kline(transport=ReplyTransport())
+        exchange = KLineExchange(
+            {
+                "engine": (
+                    session,
+                    lambda p: b"\x68\x6a\xf1" + p,
+                    lambda p: p[3:] if p[:3] == b"\x48\x6b\x10" else None,
+                )
+            }
+        )
+        session.open()
+        try:
+            self.assertEqual(exchange.exchange("engine", b"\x01\0"), b"\x41\0")
+            self.assertEqual(transport.sent[-1][24:], b"\x68\x6a\xf1\x01\0")
+        finally:
+            session.close()
+
+    def test_firmware_timeout_closes(self):
+        from scripts.jlr_channels import FirmwareISOExchange
+
+        session, transport, _ = self.iso()
+        transport.iso_response = None
+        session.open()
+        with self.assertRaises(TimeoutError):
+            FirmwareISOExchange({"engine": session}, timeout=0.01).exchange(
+                "engine", b"x"
+            )
+        self.assertIsNone(session.client.channel_owner)
+
+    def test_kline_timeout_and_cancel_close(self):
+        from scripts.jlr_channels import KLineExchange
+
+        for cancel in (False, True):
+            session, _ = self.kline()
+            session.open()
+            exchange = KLineExchange(
+                {"engine": (session, lambda x: x, lambda x: x)},
+                timeout=0.01,
+                cancelled=lambda cancel=cancel: cancel,
+            )
+            with self.assertRaises(InterruptedError if cancel else TimeoutError):
+                exchange.exchange("engine", b"x")
+            self.assertIsNone(session.client.channel_owner)
+
+    def test_hotplug_error_stops_worker_and_preserves_cleanup_failure(self):
+        session, transport = self.kline()
+        session.open()
+        transport.disconnected = True
+        deadline = time.monotonic() + 1
+        while session._error is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        with self.assertRaises(RuntimeError):
+            session.submit_data(b"x")
+        with self.assertRaises(RuntimeError):
+            session.events()
+        with self.assertRaises(ExceptionGroup):
+            session.close()
+        self.assertIs(session.client.channel_owner, session)
+
+    def test_partial_bulk_reassembly_new_native_paths(self):
+        class FragmentTransport(ProtocolTransport):
+            def read(self, timeout_ms):
+                chunk = super().read(timeout_ms)
+                if len(chunk) > 3:
+                    with self.lock:
+                        self.chunks.appendleft(chunk[3:])
+                    return chunk[:3]
+                return chunk
+
+        session, _ = self.kline(transport=FragmentTransport())
+        session.open()
+        try:
+            self.assertEqual(session.five_baud_init(), b"\x08\x08")
+        finally:
+            session.close()
+
+
+class NativeControlTests(unittest.TestCase):
+    kline = NativeProtocolTests.kline
+    iso = NativeProtocolTests.iso
+
+    def test_kwp_short_long_and_address_correlation(self):
+        from scripts.jlr_channels import kwp_message, kwp_payload
+
+        for length in (1, 63, 64, 255):
+            data = b"\x22" * length
+            for functional in (False, True):
+                message = kwp_message(0x33, 0xF1, data, functional=functional)
+                self.assertEqual(kwp_payload(message, target=0x33, source=0xF1), data)
+                self.assertIsNone(kwp_payload(message, target=0x10, source=0xF1))
+                with self.assertRaises(ProtocolError):
+                    kwp_payload(message[:-1], target=0x33, source=0xF1)
+        with self.assertRaises(ValueError):
+            kwp_message(256, 0, b"x")
+
+    def test_config_translation_and_host_checksum_mode(self):
+        session, transport = self.kline()
+        session.open()
+        try:
+            session.set_config(0x19, 12)
+            self.assertEqual(transport.sent[-1][12:], struct.pack("<II", 10, 12))
+            self.assertEqual(session.get_config(9), 12345)
+            self.assertEqual(transport.sent[-1][12:], struct.pack("<I", 0x47))
+            session.set_config(0x20, 1)
+            packet = (
+                struct.pack("<6HIIHH", 0, 0x301, 9, 0, 0, 0, 0, 9, 2, 1) + b"\xf0\x70"
+            )
+            self.assertEqual(session._decode_rx(packet).data, b"\xf0")
+            with self.assertRaises(ProtocolError):
+                session._decode_rx(packet[:-1] + b"\xf0")
+            with self.assertRaises(ValueError):
+                session.set_config(3, 1)
+            with self.assertRaises(ValueError):
+                session.set_config(0x20, 2)
+        finally:
+            session.close()
+
+    def test_repeat_literal_offsets_and_bounds(self):
+        from scripts.jlr_channels import repeat_body
+
+        body = repeat_body(b"ABC", b"\xff" * 3, b"XYZ", 100, matches=2)
+        self.assertEqual(
+            body,
+            struct.pack("<IIIBBB", 5, 100, 0, 3, 3, 2) + b"ABC" + b"\xff" * 3 + b"XYZ",
+        )
+        # Unequal TX/filter copies overlap exactly like the observed instructions;
+        # only the declared prefix is sent and no original stack bytes are copied.
+        self.assertEqual(repeat_body(b"ABCDE", b"x", b"y", 100)[15:], b"AxyDE\0\0")
+        self.assertEqual(len(repeat_body(b"A", b"xx", b"yy", 100)), 20)
+        with self.assertRaises(ValueError):
+            repeat_body(b"A", b"x", b"yy", 100)
+
+    def test_repeat_lifecycle_and_query(self):
+        class RepeatTransport(ProtocolTransport):
+            def write(self, frame):
+                payload = decode_frames(frame)[0]
+                super().write(frame)
+                if payload[4:6] == b"\x11\0" and payload[12:16] == struct.pack("<I", 5):
+                    with self.lock:
+                        reply = decode_frames(self.chunks.pop())[0]
+                        self.chunks.append(encode_frame(reply + b"\x01"))
+
+        session, transport = self.kline(transport=RepeatTransport())
+        session.open()
+        try:
+            hardware_id = session.start_repeat(b"ABC", b"\xff" * 3, b"XYZ", 100)
+            self.assertTrue(session.query_repeat(hardware_id))
+            self.assertEqual(
+                transport.sent[-1][12:], struct.pack("<III", 5, 0, hardware_id)
+            )
+            session.stop_repeat(hardware_id)
+            with self.assertRaises(ValueError):
+                session.query_repeat(hardware_id)
+        finally:
+            session.close()
+        self.assertIn(
+            struct.pack("<I", 5),
+            [p[12:] for p in transport.sent if p[4:6] == b"\x10\0"],
+        )
+
+    def test_block_filter_wire_and_cleanup(self):
+        session, transport = self.kline()
+        session.open()
+        try:
+            hardware_id = session.start_message_filter(b"\xff", b"\x10", block=True)
+            self.assertEqual(
+                transport.sent[-1][12:], struct.pack("<IHBB", 1, 0, 2, 1) + b"\xff\x10"
+            )
+            session.stop_message_filter(hardware_id, block=True)
+            with self.assertRaises(ValueError):
+                session.stop_message_filter(hardware_id, block=True)
+        finally:
+            session.close()
+
+    def test_kline_only_and_alternate_iso_pins(self):
+        from scripts.jlr_channels import (
+            FirmwareISOSession,
+            KLineSession,
+            protocol_routes,
+        )
+
+        boards = board_reply(8)
+        routes = protocol_routes(boards, 4)
+        route = next(r for r in routes if (r.pin1, r.pin2) == (13, 0))
+        transport = ProtocolTransport()
+        session = KLineSession(JLRClient(transport), boards, route)
+        session.open()
+        try:
+            self.assertEqual(session.flags, 0x1000)
+            self.assertEqual(transport.sent[1][12:], struct.pack("<II", 0x1000, 10400))
+        finally:
+            session.close()
+        route = next(
+            r for r in protocol_routes(boards, 6) if (r.pin1, r.pin2) == (12, 13)
+        )
+        session = FirmwareISOSession(
+            JLRClient(ProtocolTransport()),
+            boards,
+            route,
+            500000,
+            Peer(tx_id=0x7E0, rx_id=0x7E8),
+        )
+        self.assertEqual(session.route.target, 0x1601)
+
+
+class NativeExtendedTests(unittest.TestCase):
+    kline = NativeProtocolTests.kline
+
+    def test_firmware_iso_29bit_extended_addressing(self):
+        from scripts.jlr_channels import (
+            FirmwareISOExchange,
+            FirmwareISOSession,
+            protocol_routes,
+        )
+
+        tx_id, rx_id = 0x18DA10F1, 0x18DAF110
+        peer = Peer(
+            tx_id=tx_id, rx_id=rx_id, extended_id=True, tx_address=0x10, rx_address=0xF1
+        )
+
+        class ExtendedTransport(ProtocolTransport):
+            def write(self, frame):
+                payload = decode_frames(frame)[0]
+                super().write(frame)
+                if payload[4:6] == b"\x08\0":
+                    data = rx_id.to_bytes(4, "big") + b"\xf1\x03\x62\xf1\x90"
+                    self.inject(
+                        struct.pack(
+                            "<6HIIHH", 0, 0x601, 9, 0, 0, 0, 0x180, 99, 0, len(data)
+                        )
+                        + data
+                    )
+
+        boards = board_reply()
+        transport = ExtendedTransport()
+        session = FirmwareISOSession(
+            JLRClient(transport), boards, protocol_routes(boards, 6)[0], 500000, peer
+        )
+        session.open()
+        try:
+            self.assertEqual(
+                FirmwareISOExchange({"engine": session}).exchange(
+                    "engine", b"\x22\xf1\x90"
+                ),
+                b"\x62\xf1\x90",
+            )
+            write = next(p for p in transport.sent if p[4:6] == b"\x08\0")
+            self.assertEqual(struct.unpack_from("<I", write, 12)[0], 0x180)
+            self.assertEqual(write[24:], tx_id.to_bytes(4, "big") + b"\x10\x22\xf1\x90")
+        finally:
+            session.close()
+
+    def test_ambiguous_scheduled_start_clears_correct_group(self):
+        for group in (4, 5):
+            session, transport = self.kline(transport=ProtocolTransport(fail_at=6))
+            session.open()
+            try:
+                with self.assertRaises(TimeoutError):
+                    if group == 4:
+                        session.start_periodic(b"\x3e", 100)
+                    else:
+                        session.start_repeat(b"A", b"\xff", b"B", 100)
+            finally:
+                session.close()
+            self.assertIn(
+                struct.pack("<I", group),
+                [p[12:] for p in transport.sent if p[4:6] == b"\x10\0"],
+            )
+
+    def test_additional_pass_filter_cleanup_does_not_stop_cleared_primary(self):
+        class FilterTransport(ProtocolTransport):
+            def __init__(self):
+                super().__init__()
+                self.next_filter_id = 0
+
+            def write(self, frame):
+                payload = decode_frames(frame)[0]
+                super().write(frame)
+                if payload[4:6] == b"\x0d\0":
+                    with self.lock:
+                        reply = decode_frames(self.chunks.pop())[0]
+                        self.chunks.append(
+                            encode_frame(
+                                reply[:20] + struct.pack("<I", self.next_filter_id)
+                            )
+                        )
+                        self.next_filter_id += 1
+
+        session, transport = self.kline(transport=FilterTransport())
+        session.open()
+        self.assertEqual(session.start_message_filter(b"\xff", b"\x10"), 1)
+        session.close()
+        self.assertTrue(
+            any(p[4:6] == b"\x10\0" and p[12:] == bytes(4) for p in transport.sent)
+        )
+        self.assertFalse(any(p[4:6] == b"\x0e\0" for p in transport.sent))
+
+
+class KLineFlagTests(unittest.TestCase):
+    def test_disabled_checksum_and_sniff_mode_preserve_native_data(self):
+        from scripts.jlr_channels import KLineSession, protocol_routes
+
+        boards = board_reply()
+        route = protocol_routes(boards, 3)[0]
+        session = KLineSession(
+            JLRClient(ProtocolTransport()), boards, route, connect_flags=0x200
+        )
+        raw = struct.pack("<6HIIHH", 0, route.target, 9, 0, 0, 0, 0, 9, 1, 1) + b"A"
+        self.assertEqual(session._decode_rx(raw).data, b"A")
+        sniff = KLineSession(
+            JLRClient(ProtocolTransport()), boards, route, connect_flags=0x10000000
+        )
+        raw = struct.pack("<6HIIHH", 0, route.target, 9, 0, 0, 0, 0, 9, 2, 1) + b"A\0"
+        self.assertEqual(sniff._decode_rx(raw).status, 0x40000000)
+        with self.assertRaises(ValueError):
+            KLineSession(
+                JLRClient(ProtocolTransport()), boards, route, connect_flags=0x800
+            )
+
+    def test_periodic_native_twelve_byte_bound(self):
+        session, _ = NativeProtocolTests().kline()
+        with self.assertRaises(ValueError):
+            session.start_periodic(b"x" * 13, 100)
+
+
+class RemainingFamilyTests(unittest.TestCase):
+    def byte_session(self, protocol):
+        from scripts.jlr_channels import ByteSession, protocol_routes
+
+        boards = board_reply(3)
+        transport = ProtocolTransport()
+        session = ByteSession(
+            JLRClient(transport),
+            boards,
+            protocol_routes(boards, protocol)[0],
+            41600 if protocol == 2 else 10400,
+        )
+        return session, transport
+
+    def test_pwm_and_uart_echo_native_byte_lifecycle(self):
+        from scripts.jlr_channels import DataFrame
+
+        for protocol in (2, 0x800A):
+            session, transport = self.byte_session(protocol)
+            session.open()
+            try:
+                data = b"\x61\x6a\xf0\x01" if protocol == 2 else b"\x03\x01\x01\0"
+                submission = session.submit_data(data)
+                self.assertEqual(submission.target, 0x201 if protocol == 2 else 0xD01)
+                self.assertEqual(transport.sent[-1][24:], data)
+                payload = (
+                    struct.pack(
+                        "<6HIIHH",
+                        0,
+                        session.route.target,
+                        9,
+                        0,
+                        0,
+                        0,
+                        0,
+                        10,
+                        len(data),
+                        len(data),
+                    )
+                    + data
+                )
+                transport.inject(payload)
+                events = wait_events(
+                    session, lambda e: any(isinstance(v, DataFrame) for v in e)
+                )
+                self.assertIn(DataFrame(0, 10, data), events)
+                if protocol == 2:
+                    session.start_periodic(data, 100)
+                    session.set_node_address(0xF1)
+                    with self.assertRaises(ValueError):
+                        session.submit_data(data)
+                    session.submit_data(data[:2] + b"\xf1" + data[3:])
+                else:
+                    with self.assertRaises(ValueError):
+                        session.start_periodic(data, 100)
+                with self.assertRaises(ValueError):
+                    session.submit_data(b"x")
+            finally:
+                session.close()
+
+    def test_all_supported_protocol_routes_and_aliases(self):
+        from scripts.jlr_channels import protocol_routes
+
+        boards = board_reply(3)
+        for base, alias in (
+            (2, 0x8001),
+            (3, 0x8002),
+            (4, 0x8003),
+            (5, 0x8004),
+            (6, 0x8005),
+        ):
+            self.assertEqual(
+                protocol_routes(boards, base), protocol_routes(boards, alias)
+            )
+        for original_rejected in (
+            1,
+            7,
+            0x8006,
+            0x8007,
+            0x8008,
+            0x8009,
+            0x800C,
+            0x800D,
+            0x8011,
+        ):
+            with self.assertRaises(ValueError):
+                protocol_routes(boards, original_rejected)
+        self.assertFalse(protocol_routes(board_reply(2), 2))
+        self.assertEqual(len(can_routes(board_reply(8))), 3)
+
+    def test_firmware_iso_periodic_is_whole_single_frame_pdu_on_native_route(self):
+        session, transport, _ = NativeProtocolTests().iso()
+        session.open()
+        try:
+            hardware_id = session.start_periodic(b"\x3e\0", 100)
+            packet = transport.sent[-1]
+            self.assertEqual(struct.unpack_from("<H", packet)[0], 0x601)
+            self.assertEqual(
+                packet[12:],
+                struct.pack("<IIIB", 4, 100, 0, 6) + b"\0\0\x07\xe0\x3e\0",
+            )
+            session.stop_periodic(hardware_id)
+            self.assertEqual(struct.unpack_from("<H", transport.sent[-1])[0], 0x601)
+            with self.assertRaises(ValueError):
+                session.start_periodic(bytes(8), 100)
+        finally:
+            session.close()
+
+
+class ControlOrderingTests(unittest.TestCase):
+    def test_clear_rx_preserves_transmit_observations_and_drops_buffered_rx(self):
+        from scripts.jlr_channels import DataFrame
+
+        session, _ = NativeProtocolTests().kline()
+        session.open()
+        try:
+            with session.client.io_lock, session._lock:
+                event = TxEvent(session.route.target, 2, 1, 0x106, 10, b"")
+                session._events.extend((DataFrame(0, 9, b"x"), event))
+                raw_rx = (
+                    struct.pack(
+                        "<6HIIHH", 0, session.route.target, 9, 0, 0, 0, 0, 9, 2, 1
+                    )
+                    + b"x"
+                    + bytes([ord("x")])
+                )
+                session.client.events.append(raw_rx)
+                session.client.events.append(tx(2, target=session.route.target))
+                session.clear_rx()
+                self.assertEqual(tuple(session._events), (event,))
+                self.assertEqual(len(session.client.events), 1)
+                self.assertEqual(session.client.events[0][4:6], b"\x0a\0")
+        finally:
+            session.close()
+
+    def test_failed_control_stops_further_submissions(self):
+        session, _ = NativeProtocolTests().kline(transport=ProtocolTransport(fail_at=6))
+        session.open()
+        try:
+            with self.assertRaises(TimeoutError):
+                session.set_value(4, 10400)
+            with self.assertRaises(RuntimeError):
+                session.submit_data(b"x")
+        finally:
+            session.close()
+
+
+class VoltagePlanTests(unittest.TestCase):
+    def test_output_plans_are_pure_and_capability_bound(self):
+        from scripts.jlr_channels import voltage_commands, voltage_routes
+
+        boards = board_reply(3)
+        route = voltage_routes(boards)[0]
+        self.assertEqual((route.target, route.pin1), (0x8001, 13))
+        on = voltage_commands(boards, route, 12000)
+        self.assertEqual(
+            (on[0].target, on[0].opcode, on[0].body),
+            (1, 0x0B, struct.pack("<II", 1, 12000)),
+        )
+        self.assertEqual(on[1].body, struct.pack("<III", 1, 13, 0))
+        off = voltage_commands(boards, route, None)
+        self.assertEqual(off[0].body, struct.pack("<III", 0, 13, 0))
+        self.assertEqual(off[1].body, struct.pack("<II", 1, 0))
+        with self.assertRaises(ValueError):
+            voltage_commands(boards, route, 20001)
+        with self.assertRaises(ValueError):
+            voltage_commands(board_reply(2), route, 12000)
+        ground = voltage_routes(boards, ground=True)[0]
+        self.assertEqual(
+            voltage_commands(boards, ground, 0, ground=True)[0].body,
+            struct.pack("<III", 1, 15, 0),
+        )
+
+
+class NativeIgnoredStatusTests(unittest.TestCase):
+    def test_original_iso_ignored_status_does_not_abort_valid_response(self):
+        from scripts.jlr_channels import (
+            FirmwareISOExchange,
+            FirmwareISOSession,
+            protocol_routes,
+        )
+
+        class StatusTransport(ProtocolTransport):
+            def write(self, frame):
+                payload = decode_frames(frame)[0]
+                super().write(frame)
+                if payload[4:6] == b"\x08\0":
+                    sequence = struct.unpack_from("<H", payload, 6)[0]
+                    self.inject(tx(sequence, status=0x10C, target=0x601))
+
+        boards = board_reply()
+        transport = StatusTransport(iso_response=b"\x62\xf1\x90")
+        session = FirmwareISOSession(
+            JLRClient(transport),
+            boards,
+            protocol_routes(boards, 6)[0],
+            500000,
+            Peer(tx_id=0x7E0, rx_id=0x7E8),
+        )
+        session.open()
+        try:
+            self.assertEqual(
+                FirmwareISOExchange({"engine": session}).exchange(
+                    "engine", b"\x22\xf1\x90"
+                ),
+                b"\x62\xf1\x90",
+            )
+        finally:
+            session.close()
+
+
+class NativeRouteTrustTests(unittest.TestCase):
+    def test_protocol_tag_cannot_be_swapped_onto_another_advertised_target(self):
+        from dataclasses import replace
+
+        from scripts.jlr_channels import ByteSession, KLineSession, protocol_routes
+
+        boards = board_reply(3)
+        transport = ProtocolTransport()
+        with self.assertRaises(ValueError):
+            ByteSession(
+                JLRClient(transport),
+                boards,
+                replace(protocol_routes(boards, 2)[0], protocol=0x800A),
+                10400,
+            )
+        with self.assertRaises(ValueError):
+            KLineSession(
+                JLRClient(transport),
+                boards,
+                replace(protocol_routes(boards, 3)[0], protocol=4),
+            )
+        self.assertFalse(transport.sent)
+
+
+class PWMFunctionalLookupTests(unittest.TestCase):
+    def test_original_functional_lookup_add_remove_clear_and_failure_cleanup(self):
+        session, transport = RemainingFamilyTests().byte_session(2)
+        session.open()
+        try:
+            session.update_functional_lookup(b"\x10\x20")
+            self.assertEqual(
+                [p[12:] for p in transport.sent[-2:]],
+                [struct.pack("<II", 3, 0x10), struct.pack("<II", 3, 0x20)],
+            )
+            session.update_functional_lookup(b"\x10", remove=True)
+            self.assertEqual(transport.sent[-1][4:6], b"\x0e\0")
+            session.clear_functional_lookup()
+            self.assertEqual(transport.sent[-1][12:], struct.pack("<I", 3))
+        finally:
+            session.close()
+        session, transport = RemainingFamilyTests().byte_session(2)
+        session.open()
+        transport.fail_at = 5
+        try:
+            with self.assertRaises(TimeoutError):
+                session.update_functional_lookup(b"\x10")
+        finally:
+            session.close()
+        self.assertIn(
+            struct.pack("<I", 3),
+            [p[12:] for p in transport.sent if p[4:6] == b"\x10\0"],
+        )

@@ -51,16 +51,28 @@ def signal_metadata(freeze: bytes, physical: bytes) -> dict[str, int]:
 
 def extract_bits(payload: bytes, start: int, end: int, baseline: int = 0) -> int:
     """MSB-first inclusive bit range; caller supplies diagnostic payload boundary."""
-    if not 0 <= start <= end or end >= len(payload) * 8 or end - start >= 32:
-        raise ValueError("invalid or unsupported response bit range")
+    if (
+        type(start) is not int
+        or type(end) is not int
+        or not 0 <= start <= end <= 0xFFFFFFFF
+        or end >= len(payload) * 8
+    ):
+        raise ValueError("invalid response bit range")
     first, last = start // 8, end // 8
-    # shortcut: reject native's five-byte case; its 32-bit shifts need separate proof.
-    if last - first >= 4:
-        raise ValueError("five-byte extraction requires separate native verification")
-    raw = int.from_bytes(payload[first : last + 1], "big")
-    return (
-        ((raw >> (7 - end % 8)) & ((1 << (end - start + 1)) - 1)) - baseline
-    ) & 0xFFFFFFFF
+    tail = 7 - end % 8
+    raw = payload[last] >> tail
+    if first == last:
+        raw &= (1 << (end - start + 1)) - 1
+    else:
+        # Native DWORD OR assembly wraps EACH x86 shift count modulo32,
+        # including fields wider than a DWORD (18:9bfee,12:6d33e).
+        for index in range(last - 1, first, -1):
+            shift = (8 * (last - index) - tail) & 31
+            raw |= (payload[index] << shift) & 0xFFFFFFFF
+        # First byte is shifted in DL before its DWORD shift, losing overflow.
+        head = (payload[first] << (start & 7)) & 0xFF
+        raw |= (head << ((end - start - 7) & 31)) & 0xFFFFFFFF
+    return (raw - baseline) & 0xFFFFFFFF
 
 
 def affine(

@@ -45,6 +45,34 @@ class SignalConversionTests(unittest.TestCase):
         self.assertEqual(convert(raw, 1, 1, 0, 32, 0), -1)
         self.assertEqual(extract_bits(b"\0", 0, 7, 1), 0xFFFFFFFF)
 
+    def test_misaligned_native_dword_and_all_byte_boundaries(self):
+        payload = bytes.fromhex("ff12345680")
+        self.assertEqual(extract_bits(payload, 1, 32), 0xFE2468AD)
+        self.assertEqual(extract_bits(bytes.fromhex("ff80"), 7, 8), 1)
+        serial = "".join(f"{value:08b}" for value in payload)
+        for start in range(8):
+            for width in range(1, 33):
+                end = start + width - 1
+                expected = int(serial[start : end + 1], 2)
+                if start // 8 != end // 8 and width < 8:
+                    expected = payload[end // 8] >> (7 - end % 8)
+                with self.subTest(start=start, width=width):
+                    self.assertEqual(extract_bits(payload, start, end), expected)
+                    self.assertEqual(
+                        extract_bits(payload, start, end, expected + 1), 0xFFFFFFFF
+                    )
+        self.assertEqual(extract_bits(bytes.fromhex("8000000080"), 0, 32), 1)
+        self.assertEqual(
+            extract_bits(bytes.fromhex("0102030405060708"), 0, 63), 0x0506070C
+        )
+        self.assertEqual(
+            extract_bits(bytes.fromhex("010203040506070809"), 0, 71), 0x06070C0D
+        )
+        self.assertEqual(
+            extract_bits(bytes.fromhex("010203040506070809"), 0, 71, 0x06070C0E),
+            0xFFFFFFFF,
+        )
+
     def test_real_field_offsets_and_key_mismatch(self):
         freeze, physical = bytearray(84), bytearray(24)
         struct.pack_into("<HHH", freeze, 60, 42, 0, 15)

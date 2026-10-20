@@ -1,34 +1,46 @@
 # Полный порт: реализованное и остаток
 
-Цель — собственное Linux-приложение с функциональностью Techstream без Wine/Windows. **Полное соответствие оригиналу ещё не достигнуто.** Проверки без оборудования подтверждают кодеки, алгоритмы и сценарии на синтетическом обмене; физическая связь остаётся `PHYSICAL_UNCONFIRMED`.
+Цель — собственное Linux-приложение с функциональностью Techstream. **Финальный гейт без оборудования пока открыт:** остаются известные программные контракты, перечисленные ниже. Проверки на синтетическом обмене, статический разбор оригинала и воспроизведение сохранённых записей подтверждают разные свойства; ни одно из них не подтверждает физическую связь с автомобилем.
 
-| Функция | Реализовано и проверено без оборудования | Остаётся |
+| Область | Уже исполняется без оборудования | Программный остаток |
 | --- | --- | --- |
-| Выбор автомобиля и систем | DDB связи файлов/названий, VehicleName и записи поддержки | Профили модели/года/опций, выбор исключений, обнаружение реальных ЭБУ |
-| Ошибки | DDB справочники, standard OBD stored/pending/permanent, native KWP DTC codec | Полные Toyota current/history/info/status, стирание и физическая проверка |
-| Стоп-кадры | DDB определения/пересчёт, native P3/P5 codecs, standard OBD frame-zero replay | Выбор Toyota descriptors, runtime overrides и реальные ответы |
-| Параметры и снимки | CT identities, числовой evaluator, 15 standard OBD PID, bounded poll/record/replay, переключаемые графики | Toyota enhanced data lists, частота опроса на оборудовании, оригинальные snapshot-форматы, dual ECU |
-| Health Check | Последовательный отчёт по заданным ЭБУ, частичные ошибки, JSON | Автообнаружение систем, поддержка всей машины, Toyota-specific сведения |
-| Active Tests | Структуры ActTest, ключи и исключения | Выбор доступных тестов, аргументы, start/status/stop и отмена |
-| Utility / Customize | Raw CSDF object, 15 операторов, стек/переменные/массивы/переходы; SRP XML и SRPLST decode/inspection | CSDF library calls, исполнение XML actions/COMM, параметры записи/восстановления |
-| Monitor / CARB OBDII | Readiness, VIN, CALID/CVN, числовой subset OBD | Mode 06, составные O2/EVAP и оставшиеся сервисы |
-| MongoosePro JLR | USB identity/version; raw CAN lifecycle/filters/RX/TX; связанный host ISO-TP exchange, ошибки и отмена | Реальное устройство, K-line и firmware ISO paths, физические тайминги и Toyota-покрытие |
-| Программирование ЭБУ | Исходные точки входа исследованы | Calibration containers, engine, совместимость, programming/recovery |
-| Бортовой Drive Recorder | Исходные интерфейсы инвентаризированы | Команды VIM, onboard recording и исходные форматы записей |
+| Автомобиль и системы | Выбор модели, года, опций и ЭБУ; региональные DDB; исключения и PidBit/DidBit; сохранённые наблюдения поддержки | Сквозная сверка потребителей активных тестов и метаданных |
+| Toyota | Семейства DTC KWP/CAN/DK/PSA/Audio/Tesla; команды и параметры выбранного профиля; P3/P4/P5 и Subaru stop-frame codecs; ограниченные опрос, отмена и обработка ошибок | Полная сверка оставшихся экспортов, ассоциаций стоп-кадров, временных данных и Dual scheduler |
+| Active Tests | P3/DK/P4/P5 команды, P5 очередь и Routine; фазовые support gates; List/Init metadata joins и локальный SA provider | Полная корпусная и независимая проверка всех фаз и обычный пользовательский сценарий |
+| Utility / Customize | Исполнение XML actions/COMM и CSDF; 18 native wrappers; библиотечные вызовы; исполнение импортированных процедур по записанным PDU и событиям драйвера | Контекст загрузчика исходных CSDF и завершение GUI диалогов, выбора значений и прогресса |
+| CARB OBDII | Стандартные PID до `0x87`, составные O2/EVAP, Mode 05/06, VIN/CALID/CVN/IUPR; Toyota enhanced readiness по выбранным определениям и явным наблюдениям | Итоговая независимая проверка интеграции |
+| Сохранённые данные | Native DM/DRS и TSE index, DataList/DrvRec/ATest/Dual captures; выбор буфера и воспроизведение; запись без потери неизвестных полей; RMViewer communication log | Остальные TSE report families и их редактирование; GUI выбора записей и отчётов |
+| MongoosePro JLR | Raw CAN, firmware ISO, K-line, PWM и UART echo; фильтры, config, periodic/repeat, сборка USB, таймауты и очистка; обмен через внедрённый транспорт | Итоговая сверка программного покрытия; физические ограничения вынесены ниже |
+| Программирование | CUW/SREC, native каталог и совместимость DLL, recovery metadata; ReproStd/Unified/EachArea; исполняемые подготовка и передача через внедрённые каналы | Полные legacy/vendor/M16C/Ethernet/GetCID семейства, 2026 split modules, совместимость версий, импорт пользовательских файлов в общий сценарий |
+| Drive Recorder | Типизированные DRS/VIM/DMCI команды, файлы и сеансы, trigger comparisons, внешний transfer/ACK/retry автомат | Генератор из выбранных определений, условные контейнеры и полное исполнение monitor/acquisition scheduler |
+| Приложение | Нативный GTK интерфейс, выбор автомобиля, CLI, открытие исходных форматов, учебные сценарии, таблицы и графики, атомарный экспорт с защитой входных файлов | Полная интеграция новых движков, итоговая проверка обычного и компактного окна |
+
+Точная машинно проверяемая матрица находится в [offline-coverage.json](offline-coverage.json). Статус `open` означает незакрытый контракт. Само наличие функции, документа или положительного теста не переводит его в завершённые.
 
 ## Воспроизводимые проверки
 
-- `python -m unittest discover -s tests -v` не требует ресурсов производителя.
-- `./techstream --demo --smoke-test` проверяет настоящее GTK-окно: поиск, избранное, CSV, базы, USB-инвентарь без открытия устройств, обзор двух ЭБУ, JSON, график и CALID/CVN.
-- `python -m scripts.session_cli replay examples/diagnostic-session.json` разбирает строго упорядоченные байтовые ответы.
-- Транспортный integration test соединяет настоящий `Session → ISOTPExchange → CANSession → JLRClient → SLP` с синтетическим USB-транспортом. Это доказательство связности программных слоёв, а не наблюдение физического обмена.
+```bash
+python -m unittest discover -s tests -v
+python -m scripts.offline_verify workflows
+python -m scripts.offline_verify coverage
+./techstream --demo --smoke-test
+```
 
-## Статическое исследование
+`workflows` исполняет настоящие программные слои с авторскими входными данными и обменом в памяти. `coverage` завершается ошибкой, пока есть незакрытые программные строки, неподтверждённые символы, отсутствующие тесты или unresolved dependencies. Запуск устройства не входит в эти команды.
 
-Исходный контракт исследован по 424 PE, RT_MENU/RT_DIALOG и экспортам/вызовам. Основная GUI использует CommandAPI; найдено 332 семейства Snd/Rcv. Число имён не равно числу перенесённых команд.
+Создание исходных файлов для изучения и проверка конкретного буфера:
 
-Корпусные проверки: 3946 CT / 290394 записи и 1422 DDB / 25655 секций. Дополнительные схемы читают 13719 ActTest и 384242 ExceptionProcess записей; это определения, а не запущенные процедуры. Проверены 18 SRP XML и один SRPLST со списком из 19 строк. Оригинальные ресурсы и расшифрованные тексты не публикуются.
+```bash
+python -m scripts.offline_tools create-examples /tmp/techstream-examples
+python -m scripts.offline_tools inspect /tmp/techstream-examples/capture.dm --buffer-index 0
+```
 
-Подробности: [DDB](ddb-format.md), [числовой пересчёт](signal-conversion.md), [Toyota codecs](toyota-protocol.md), [CSDF/SRP](script-vm.md), [JLR channels](jlr-channels.md), [offline diagnostics](offline-diagnostics.md), [проверка оборудования](hardware-validation.md).
+## Доказательства и границы
 
-Полные REA bundles и исторические acceptance ledgers остаются в локальном исследовательском архиве. В технических документах приведены SHA и адреса; владельцы соответствующих ресурсов могут воспроизвести статическую проверку. Отсутствие адаптера не мешает продолжать оставшийся реверс и программную реализацию.
+Статический исходный контракт включает 424 PE и 332 семейства Snd/Rcv. Число имён не равно числу перенесённых команд: реализации сверяются с форматами, вызывающим кодом, зависимостями и отрицательными сценариями.
+
+Локальные проверки оригинальных ресурсов включают DDB разных версий и регионов, CT, XML/CSDF и CUW tables/modules. Два реальных файла TSE версий `0x1006` и `0x1025` проверены на побайтовое повторное сохранение; три DataList captures из второго воспроизводятся с исходными значениями. Оригинальные файлы, расшифрованные ресурсы, ключи и декомпилированный код в репозиторий не включаются. Публичные тесты используют авторские данные.
+
+После закрытия программного гейта останутся физические проверки: USB identity и возможности конкретного адаптера, фактические тайминги и ошибки транспорта, реальные ответы и поддержка ЭБУ, а также поведение автомобиля при диагностике и программировании. Сейчас все такие утверждения имеют статус `PHYSICAL_UNCONFIRMED`.
+
+Подробности: [выбор автомобиля](vehicle-selection.md), [Toyota session](toyota-session.md), [Utility runtime](utility-runtime.md), [CSDF](script-vm.md), [native snapshots](snapshot-format.md), [communication logs](communication-log.md), [JLR channels](jlr-channels.md), [калибровки](programming.md), [Drive Recorder](drive-recorder.md), [проверка оборудования](hardware-validation.md).

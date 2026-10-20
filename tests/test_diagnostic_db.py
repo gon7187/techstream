@@ -1,5 +1,7 @@
 import struct
 import unittest
+from hashlib import sha256
+from unittest.mock import patch
 
 from scripts.diagnostic_db import Language, decode_lzss, parse_database
 
@@ -26,6 +28,29 @@ def database_bytes(kind, sections, version=0x0100032F):
 
 
 class DiagnosticDatabaseTests(unittest.TestCase):
+    def test_combined_decoded_size_is_checked_before_decompression(self):
+        compressed = struct.pack("<IB", 180, 0)
+        source = database_bytes(2, {0: (1, compressed, 1), 1: (1, compressed, 1)})
+        with (
+            patch("scripts.diagnostic_db.MAX_SIZE", 300),
+            patch(
+                "scripts.diagnostic_db.decode_lzss", return_value=bytes(180)
+            ) as decode,
+            self.assertRaisesRegex(ValueError, "aggregate"),
+        ):
+            parse_database(source)
+        decode.assert_not_called()
+
+    def test_cached_section_cannot_bypass_declared_decoded_length(self):
+        compressed = struct.pack("<IB", 3, 0x63) + b"\x07abc"
+        source = database_bytes(2, {0: (1, compressed, 1)})
+        key = sha256(compressed).hexdigest()
+        self.assertEqual(
+            parse_database(source, {key: b"abc"}).sections[0].payload, b"abc"
+        )
+        with self.assertRaisesRegex(ValueError, "decoded length"):
+            parse_database(source, {key: b"ab"})
+
     def test_support_active_tests_and_vehicle_lookup_keep_variants(self):
         language = Language(parse_database(database_bytes(4, {0: (0, b"", 0)})))
         rows = []
@@ -70,7 +95,7 @@ class DiagnosticDatabaseTests(unittest.TestCase):
                 decode_lzss(bad)
 
     def test_sections_current_and_legacy_and_corruption(self):
-        for version in (0x01000137, 0x01000225, 0x0100032F):
+        for version in (0x01000137, 0x01000225, 0x0100030C, 0x0100032F):
             original = database_bytes(2, {5: (2, bytes(56), 0)}, version)
             db = parse_database(original)
             self.assertEqual(db.kind, 2)
