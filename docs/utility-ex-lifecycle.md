@@ -191,10 +191,14 @@ The separate108 original-context P6 facade checks now cover both Plus images
 and physical6/8012 through the shared four-slot pool and cancellation cleanup.
 
 The background fixed/SIS/selected-P5 loops now invoke the individual host
-`native_sleep(120)` primitive. Deterministic step calls do not sleep. A host
-fixture running real worker threads must provide blocking or synchronized
-Sleep; virtual clock-only Sleep is suitable for deterministic step checks.
-Foreign Sleep failures remain observable and retain lower ownership for close.
+`native_sleep(120)` primitive. Deterministic step calls do not sleep. Background
+loops use `_paced_native_sleep`: if host Sleep returns before 120 ms of monotonic
+time, the worker waits on its stop event for the remainder. This preserves the
+literal cadence and prevents a virtual-clock replay host from spinning the DCM,
+selected-P5 or SIS worker. A host fixture that asserts deterministic step timing
+should still provide blocking or synchronized Sleep; virtual clock-only Sleep is
+suitable for direct `worker_step` checks. Foreign Sleep failures remain observable
+and retain lower ownership for close.
 
 At this review freeze, ordinary broadcast support is admitted only for the
 two18 images. Other six ordinary broadcast source branches remain open. P6

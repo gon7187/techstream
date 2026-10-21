@@ -22,7 +22,8 @@
 - [ ] Реализовать ручной recorder producer; проверить вложенные CommandDataLib тела версии 12 отдельно от внешней ComTol grammar.
 - [ ] Довести MultiMon, mixed-provider, queue и normal active/system producers до настоящих публичных потребителей.
 - [ ] Закрыть оставшиеся UtilityEx, saved-FFD, DDR и report ветви; отдельные принятые строки не считать полным семейством.
-- [ ] Устранить DCM capture free-spin и проверить реальные GTK-потоки, включая отмену, ошибку и повтор.
+- [x] Устранить DCM capture free-spin: фоновые UtilityEx loops пейсят literal 120 мс и не крутятся на virtual-clock host Sleep.
+- [ ] Проверить реальные GTK-потоки DCM, включая отмену, ошибку и повтор.
 - [ ] Свести полный native inventory с реализацией; подтвердить отсутствие восстановимых программных пропусков.
 - [ ] Выполнить полный актуальный набор проверок, чистый публичный checkout без оригиналов, CI и normal/compact GTK. Публичный checkout, CI и `sh scripts/desktop-smoke.sh` уже зелёные; normal/compact GTK и приватные source gates остаются.
 

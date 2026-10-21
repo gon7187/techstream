@@ -127,7 +127,7 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 
 | Проверка | Результат |
 | --- | --- |
-| `python -m unittest discover -s tests` | 6 243 теста за 57,273 с; **0 failures, 0 errors**, 626 skipped |
+| `python -m unittest discover -s tests` | 6 244 теста за 73,835 с; **0 failures, 0 errors**, 626 skipped |
 | `ruff check scripts tests techstream.py` | PASS |
 | `ruff format --check scripts tests techstream.py` | 292 файла уже отформатированы |
 | `shellcheck techstream scripts/desktop-smoke.sh` | PASS |
@@ -143,6 +143,9 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 новый `tests/test_private_evidence.py` проверяет и skip, и отказ для публичного
 пути. `EngineThreadRetryBridgeTests` дополнительно прогоняет реальный `_run_outer`
 моста 145→51: успешный `callback3` на outer-потоке, возврат ошибки в child и отказ
-не-child publisher. 626 skipped включают прежние авторские пропуски; ни один публичный failure
+не-child publisher. `_paced_native_sleep` закрывает DCM free-spin: фоновый worker
+добирает реальные 120 мс, если host Sleep вернулся раньше; регрессия проверяет
+ограниченное число шагов на virtual-clock host. GTK-сценарий DCM всё ещё не
+подтверждён. 626 skipped включают прежние авторские пропуски; ни один публичный failure
 или error не скрыт. Приватный source-issued oracle, native multi-row cardinality,
 route-gates 58/68/69 и мост 145→51 по-прежнему не запускались.
