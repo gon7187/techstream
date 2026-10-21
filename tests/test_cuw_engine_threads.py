@@ -893,5 +893,181 @@ class ThreadOwnershipTests(unittest.TestCase):
         self.assertFalse(job.state.outer_started)
 
 
+class EngineThreadRetryBridgeTests(unittest.TestCase):
+    """Public thread-job dispatch of leaf 51's retry callback."""
+
+    class Lease:
+        state = "adopted"
+
+    class Retry:
+        def __init__(self, error=None):
+            self.calls = []
+            self.error = error
+
+        def callback3(self):
+            self.calls.append(threading.current_thread())
+            if self.error is not None:
+                raise self.error
+
+    class Cleanup:
+        def __init__(self):
+            self.released = []
+
+        def release_retired_selected(self, worker):
+            self.released.append(worker)
+
+    class Engine:
+        def __init__(self, error=None):
+            self._retry_controller = None
+            self.retry = EngineThreadRetryBridgeTests.Retry(error)
+            self.cleanup = EngineThreadRetryBridgeTests.Cleanup()
+            self.callback_threads = []
+            self.released_leases = []
+
+        def thread_callback_execution(self, job):
+            engine = self
+
+            class Execution:
+                def __enter__(self):
+                    engine.callback_threads.append(threading.current_thread())
+
+                def __exit__(self, *error):
+                    return False
+
+            return Execution()
+
+        def bind_retry_controller(self):
+            return self.retry
+
+        def bind_cleanup_controller(self):
+            return self.cleanup
+
+        def release_reserved_phase(self, lease):
+            self.released_leases.append(lease)
+
+        def _require_owned_phase(self):
+            pass
+
+    class Runtime:
+        def __init__(self):
+            self.checks = 0
+
+        def check(self):
+            self.checks += 1
+
+    class Controller:
+        def __init__(self):
+            self.runtime = EngineThreadRetryBridgeTests.Runtime()
+
+    class Worker:
+        def __init__(self, controller):
+            self.controller = controller
+            self.tail = 0
+            self.next = 0
+            self.logical = []
+            self.continuation = None
+
+        def _publish_outer_control_tail(self):
+            self.tail += 1
+
+        def notify_next_cpu(self):
+            self.next += 1
+
+        def notify_logical_cpu_boundary(self, index):
+            self.logical.append(index)
+
+        def take_continuation(self):
+            return self.continuation
+
+    def _job(self, *, error=None):
+        job = object.__new__(EngineThreadJob2026)
+        job._lock = threading.RLock()
+        job._resume = threading.Event()
+        job._completed = threading.Event()
+        job._child_resume = threading.Event()
+        job._child_done = threading.Event()
+        job._child_parked = threading.Event()
+        job._prepare_pending = threading.Event()
+        job._activity = threading.Event()
+        job._callback_requested = threading.Event()
+        job._callback_returned = threading.Event()
+        job._callback_error = None
+        job._callback_kind = None
+        job._callback_argument = None
+        job._outer = None
+        job._child = None
+        job._lease = self.Lease()
+        job._session = None
+        job._stop = False
+        job._host_stop = False
+        job._waiting = False
+        job._sequence = 1
+        job._result = None
+        job._error = None
+        job._continuation = None
+        job._child_exit = None
+        job._outer_exit = None
+        job._controller_entry = None
+        job.controller = self.Controller()
+        job.worker = self.Worker(job.controller)
+        job.engine = self.Engine(error)
+        return job
+
+    def _run(self, job):
+        errors = []
+
+        def child():
+            try:
+                job.dispatch_retry_callback()
+            except BaseException as error:  # noqa: BLE001 - preserve child failure
+                errors.append(error)
+            finally:
+                job._child_exit = 0
+                job._child_done.set()
+                job._activity.set()
+
+        job._run_child = child
+        outer = threading.Thread(target=job._run_outer, daemon=True)
+        job._outer = outer
+        outer.start()
+        job._resume.set()
+        try:
+            self.assertTrue(job._completed.wait(2))
+        finally:
+            job._stop = True
+            job._resume.set()
+            outer.join(2)
+        self.assertFalse(outer.is_alive())
+        return errors
+
+    def test_child_retry_callback_runs_on_the_outer_thread(self):
+        job = self._job()
+        errors = self._run(job)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(job.engine.retry.calls), 1)
+        self.assertIs(job.engine.retry.calls[0], job._outer)
+        self.assertEqual(len(job.engine.callback_threads), 1)
+        self.assertIs(job.engine.callback_threads[0], job._outer)
+        self.assertEqual(job.controller.runtime.checks, 1)
+        self.assertEqual(job.engine.cleanup.released, [job.worker])
+        self.assertIsNone(job._error)
+        self.assertFalse(job._callback_requested.is_set())
+
+    def test_retry_callback_failure_returns_to_the_child(self):
+        failure = OSError("authored retry callback failure")
+        job = self._job(error=failure)
+        errors = self._run(job)
+        self.assertEqual(errors, [failure])
+        self.assertEqual(len(job.engine.retry.calls), 1)
+        self.assertIs(job._callback_error, failure)
+        self.assertIsNone(job._error)
+
+    def test_retry_callback_rejects_a_non_child_publisher(self):
+        job = self._job()
+        with self.assertRaises(ValueError):
+            job.dispatch_retry_callback()
+        self.assertFalse(job._callback_requested.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()
