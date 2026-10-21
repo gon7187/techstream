@@ -120,3 +120,26 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 | GTK smoke через `sh scripts/desktop-smoke.sh` | PASS |
 
 113 errors — только `FileNotFoundError` для отсутствующих приватных `analysis/evidence/no-car-*`, `artifacts/extracted/*` и `runtime/no-car-*`; failures отсутствуют. Четыре ранее публичных harness-дефекта исправлены без маскировки: проверки `Body2026Tests` перенесены внутрь `subTest`, Suzuki-тест явно подменяет новый source-issued central gateway key, а UtilityEx retained-тест отвечает на реальный keepalive `3e00` каждого потока вместо общего итератора ответов. Фикстура `test_cuw_gateway_startup` теперь получает producer через `engine.bind_gateway_startup()`, а не через частный issuer; приватный повтор 55 тестов листа 134 остаётся отдельной проверкой.
+
+### После явных private-evidence skip
+
+Публичный прогон на ветке `offline-completion-20261020`, без приватного корпуса:
+
+| Проверка | Результат |
+| --- | --- |
+| `python -m unittest discover -s tests` | 6 240 тестов за 59,983 с; **0 failures, 0 errors**, 626 skipped |
+| `ruff check scripts tests techstream.py` | PASS |
+| `ruff format --check scripts tests techstream.py` | 292 файла уже отформатированы |
+| `shellcheck techstream scripts/desktop-smoke.sh` | PASS |
+| `python -m scripts.offline_verify workflows` | `OFFLINE_WORKFLOWS_PASSED` |
+| GTK smoke через `sh scripts/desktop-smoke.sh` | PASS |
+
+Добавлен `tests/private_evidence.py`: `require_private` принимает только пути под
+`analysis/`, `artifacts/`, `.unlazy/` или `runtime/no-car-*`; отсутствующий путь
+даёт `SkipTest` с точной причиной, публичный путь — `AssertionError`. Читатели
+`read_private_bytes/text/json` используют тот же барьер. Это не масс-скип по
+исключению: каждый затронутый тест явно требует конкретный приватный артефакт, а
+новый `tests/test_private_evidence.py` проверяет и skip, и отказ для публичного
+пути. 626 skipped включают прежние авторские пропуски; ни один публичный failure
+или error не скрыт. Приватный source-issued oracle, native multi-row cardinality,
+route-gates 58/68/69 и мост 145→51 по-прежнему не запускались.
