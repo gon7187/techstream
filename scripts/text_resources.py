@@ -501,30 +501,66 @@ class ViewerHelpResources:
         return result
 
 
-def create_utility_text_examples() -> dict[str, bytes]:
-    """Authored Door source IDs and text for the native group4934 consumer."""
+def create_utility_group_text_examples(
+    group: int,
+    identifiers: Sequence[int],
+    *,
+    common: Sequence[int] = (),
+    texts: Sequence[str] | None = None,
+    prefix: str = "IDS_AUTHORED_UTILITY",
+) -> dict[str, bytes]:
+    """Authored language and symbol pair for one native utility group.
+
+    `common` identifiers are published in the shared group 20000; every other
+    identifier belongs to the selected group. No OEM text is used.
+    """
     from scripts.demo import _ddb, _language
 
-    texts = [f"Authored Door instruction {index + 1}" for index in range(8)]
-    texts.append("Authored acknowledge")
-    identifiers = (*range(0x94B5, 0x94BD), 0x1043)
-    pool = parse_database(_language(texts)).sections[0]
+    if type(group) is not int or not 0 <= group <= 0xFFFFFFFF:
+        raise ValueError("Authored utility group must be an explicit DWORD")
+    selected = tuple(identifiers)
+    shared = tuple(common)
+    if not selected or len(set(selected)) != len(selected):
+        raise ValueError("Authored utility identifiers must be unique and non-empty")
+    if set(selected) & set(shared):
+        raise ValueError("Authored shared utility identifiers must stay distinct")
+    order = (*selected, *shared)
+    if texts is None:
+        labels = [f"Authored utility text {index + 1}" for index in range(len(order))]
+    else:
+        labels = list(texts)
+        if len(labels) != len(order):
+            raise ValueError("Authored utility texts must match the identifiers")
+    pool = parse_database(_language(labels)).sections[0]
     records, symbols = bytearray(), bytearray()
-    for index, identifier in enumerate(identifiers):
-        key = f"IDS_AUTHORED_DOOR_{index + 1}"
+    for index, identifier in enumerate(order):
+        key = f"{prefix}_{index + 1}"
         encoded = key.encode("utf-16le")
         records.extend((encoded + b"\0\0").ljust(80, b"\0"))
         records.extend(bytes(80))
         records.extend(struct.pack("<I", index + 1))
-        group = 20000 if identifier == 0x1043 else 4934
-        symbols.extend(struct.pack("<IIH", group, identifier, len(encoded)))
+        symbol_group = 20000 if identifier in shared else group
+        symbols.extend(struct.pack("<IIH", symbol_group, identifier, len(encoded)))
         symbols.extend(encoded)
     return {
         "U_Example.ddb": _ddb(
-            6, {0: (pool.count, pool.payload), 1: (len(identifiers), bytes(records))}
+            6, {0: (pool.count, pool.payload), 1: (len(order), bytes(records))}
         ),
         "UtilityResID_NK.rsd": bytes(symbols),
     }
+
+
+def create_utility_text_examples() -> dict[str, bytes]:
+    """Authored Door source IDs and text for the native group4934 consumer."""
+    texts = [f"Authored Door instruction {index + 1}" for index in range(8)]
+    texts.append("Authored acknowledge")
+    return create_utility_group_text_examples(
+        4934,
+        range(0x94B5, 0x94BD),
+        common=(0x1043,),
+        texts=texts,
+        prefix="IDS_AUTHORED_DOOR",
+    )
 
 
 def create_text_examples() -> dict[str, bytes]:

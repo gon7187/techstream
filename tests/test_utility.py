@@ -334,109 +334,17 @@ class NativeUtilityTests(unittest.TestCase):
     """Real authored TY business provider under the recovered native controller."""
 
     def native(self, *, initial=0, clear=0, fault=False, hold=False, dcm_value=None):
-        import hashlib
-        import threading
-        from dataclasses import replace
-        from types import SimpleNamespace
-        from unittest.mock import patch
+        from scripts.utility_authored import AuthoredNativeUtility
 
-        from scripts.script_libraries import NativeProcedureLibraries
-        from scripts.utility import NativeUtilityRuntime
-        from scripts.utility_ex import SOURCES, UtilityExContext, UtilityExEngine
-        from scripts.utility_ex_ty import SHA_18_TY, TYEngine, load_contract
-
-        data = b"authored native procedure integration fixture"
-        digest = hashlib.sha256(data).hexdigest()
-        contract = replace(
-            load_contract(SHA_18_TY),
-            source_sha256=digest,
-            frames={
-                **load_contract(SHA_18_TY).frames,
-                "door_clear": b"\x80\x01\x02\x03",
-            },
+        fixture = AuthoredNativeUtility(
+            initial=initial,
+            clear=clear,
+            fault=fault,
+            hold=hold,
+            dcm_value=dcm_value,
         )
-        events = []
-        cancel = threading.Event()
-        entered = threading.Event()
-
-        class Comm:
-            def initialize(self, mode=0):
-                events.append("initialize")
-                return initial
-
-            def configure(self, field, value):
-                events.append((field, value))
-
-            def session(self, mode, *args, **kwargs):
-                events.append(("session", mode))
-                return 0
-
-            def exchange(self, request):
-                events.append(request)
-                if fault:
-                    raise OSError("authored exchange fault")
-                if dcm_value is not None:
-                    return (
-                        0,
-                        b"\x6e\x20\x61"
-                        if request == b"\x2e\x20\x61\x00"
-                        else b"\x62\x20\x61" + bytes([dcm_value]),
-                    )
-                return clear, b"\xc0\x01\x02\x03"
-
-            def finalize(self):
-                events.append("finalize")
-
-        def sleep(ms):
-            events.append(("sleep", ms))
-            if hold:
-                entered.set()
-                if not cancel.wait(2):
-                    raise TimeoutError("authored worker was not cancelled")
-
-        context = SimpleNamespace(
-            module_bytes=data,
-            module_sha256=digest,
-            mode=20,
-            state={},
-            _cancel=cancel,
-            _worker=None,
-            is_cancelled=cancel.is_set,
-            comm=lambda _: Comm(),
-            sleep=sleep,
-        )
-
-        class Engine(UtilityExEngine):
-            def _providers(self):
-                if dcm_value is not None:
-                    from scripts import utility_ex_ty_body
-
-                    return [
-                        (
-                            utility_ex_ty_body,
-                            utility_ex_ty_body.supported_exports(digest),
-                        )
-                    ]
-                return [(TYEngine(contract), contract.exports)]
-
-        if dcm_value is not None:
-            from scripts import utility_ex_ty_body
-
-            body_source = patch.object(utility_ex_ty_body, "SHA_18_TY", digest)
-            body_source.start()
-            self.addCleanup(body_source.stop)
-        engine = Engine(cast(UtilityExContext, context))
-        libraries = object.__new__(NativeProcedureLibraries)
-        # Source-shaped caller fixture: constructor source rejection is checked by OWN9.
-        libraries.caller_sha256 = (
-            "ecba533aeaa2ec2a014fa59a113d025a8efe90338767c2786b8a5a891ca0f599"
-        )
-        libraries.engine = engine
-        mapping = patch.dict(SOURCES, {digest: "TY18"})
-        mapping.start()
-        self.addCleanup(mapping.stop)
-        runtime = NativeUtilityRuntime(libraries)
-        return runtime, events, entered
+        self.addCleanup(fixture.close)
+        return fixture.runtime, fixture.events, fixture.entered
 
     def test_native_selected_controller_executes_real_business_and_reports(self):
         runtime, events, _ = self.native()

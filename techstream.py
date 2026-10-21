@@ -81,10 +81,15 @@ from scripts.snapshot import TableFile
 from scripts.snapshot import dumps as dump_snapshot
 from scripts.snapshot import parse as parse_snapshot
 from scripts.support import correspondence_rows, word
-from scripts.text_resources import ViewerHelpResources, create_active_text_examples
+from scripts.text_resources import (
+    UtilityTextResources,
+    ViewerHelpResources,
+    create_active_text_examples,
+    create_utility_group_text_examples,
+)
 from scripts.toyota_workflows import create_example_files as create_workflow_examples
 from scripts.toyota_workflows import replay_workflow
-from scripts.utility import replay_native_utility
+from scripts.utility import native_utility_screen, replay_native_utility
 from scripts.workbench import (
     CatalogIndex,
     catalog_roots,
@@ -174,6 +179,7 @@ class Catalog(Adw.Application):
         state_path: Path,
         demo=False,
         replay_path=None,
+        smoke_compact=False,
     ):
         super().__init__(
             application_id="local.techstream.Workbench",
@@ -183,6 +189,7 @@ class Catalog(Adw.Application):
         self.demo = demo
         self.replay_path = replay_path
         self.smoke_test = smoke_test
+        self.smoke_compact = bool(smoke_compact)
         self.state_path = state_path
         self.exit_code = 0
         self.index: CatalogIndex | None = None
@@ -257,6 +264,9 @@ class Catalog(Adw.Application):
             application=self, title="Techstream", default_width=1340, default_height=820
         )
         self.window.set_size_request(580, 500)
+        if self.smoke_compact:
+            # The compact variant drives the same flow in the collapsed layout.
+            self.window.set_default_size(900, 700)
         self.toast_overlay = Adw.ToastOverlay()
         self.window.set_content(self.toast_overlay)
         self.nav_buttons = []
@@ -1764,6 +1774,13 @@ class Catalog(Adw.Application):
                 )
             ):
                 GLib.timeout_add(100, self.interact_utility_smoke)
+            if self.smoke_test and getattr(self, "offline_smoke_phase", "").startswith(
+                "native_utility_"
+            ):
+                self.smoke_native_utility_screens = (
+                    getattr(self, "smoke_native_utility_screens", 0) + 1
+                )
+                GLib.timeout_add(100, self.interact_native_utility_smoke)
         except Exception as exc:  # noqa: BLE001 - never strand the waiting procedure worker.
             state["error"] = str(exc) or type(exc).__name__
             state["event"].set()
@@ -6235,7 +6252,13 @@ class Catalog(Adw.Application):
                 self.session_mode.set_selected(3)
                 self.start_example()
                 return GLib.SOURCE_REMOVE
-            if self.window.get_width() <= 1100:
+            if self.smoke_compact:
+                assert self.window.get_width() <= 1100, "compact window is not narrow"
+                assert (
+                    self.layout.get_collapsed() and self.catalog_split.get_collapsed()
+                )
+                assert self.groups_button.get_visible()
+            elif self.window.get_width() <= 1100:
                 assert (
                     self.layout.get_collapsed() and self.catalog_split.get_collapsed()
                 )
@@ -6385,6 +6408,8 @@ class Catalog(Adw.Application):
         return GLib.SOURCE_REMOVE
 
     def check_offline_smoke(self):
+        from scripts.utility_authored import BSM_UTILITY_GROUP, DCM_UTILITY_GROUP
+
         try:
             assert not self.offline_busy
             assert self.offline_run.get_sensitive()
@@ -7115,6 +7140,70 @@ class Catalog(Adw.Application):
                 self.rks_smoke_key.write_bytes(
                     bytes.fromhex(document["workflow"]["key_xml"])
                 )
+                self.offline_smoke_phase = "native_utility_dcm_success"
+                self.start_native_utility_smoke(
+                    "native_utility_dcm_success",
+                    controller="dcm",
+                    group=DCM_UTILITY_GROUP,
+                    dcm_value=0,
+                )
+                return GLib.SOURCE_REMOVE
+            elif phase == "native_utility_dcm_success":
+                assert self.offline_report is not None, self.offline_status.get_text()
+                assert self.offline_report["status"] == "completed", self.offline_report
+                result = self.offline_report["result"]
+                assert result["status"] == "completed", result
+                assert result["result"] == 0, result
+                assert result["block"] == 0x13724, result
+                assert result["done"] is True, result
+                assert self.smoke_native_utility_screens >= 2
+                self.offline_smoke_phase = "native_utility_dcm_warning"
+                self.start_native_utility_smoke(
+                    "native_utility_dcm_warning",
+                    controller="dcm",
+                    group=DCM_UTILITY_GROUP,
+                    dcm_value=7,
+                )
+                return GLib.SOURCE_REMOVE
+            elif phase == "native_utility_dcm_warning":
+                assert self.offline_report is not None, self.offline_status.get_text()
+                assert self.offline_report["status"] == "completed", self.offline_report
+                result = self.offline_report["result"]
+                assert result["status"] == "native-result", result
+                assert result["result"] == 2005, result
+                assert self.smoke_native_utility_screens >= 2
+                self.offline_smoke_phase = "native_utility_dcm_cancel"
+                self.start_native_utility_smoke(
+                    "native_utility_dcm_cancel",
+                    controller="dcm",
+                    group=DCM_UTILITY_GROUP,
+                    dcm_value=0,
+                    cancel=True,
+                )
+                return GLib.SOURCE_REMOVE
+            elif phase == "native_utility_dcm_cancel":
+                assert self.offline_report is not None, self.offline_status.get_text()
+                assert self.offline_report["status"] == "cancelled", self.offline_report
+                result = self.offline_report["result"]
+                assert result["status"] == "cancelled", result
+                assert result["done"] is True, result
+                assert self.smoke_native_utility_screens >= 1
+                self.offline_smoke_phase = "native_utility_bsm_probe"
+                self.start_native_utility_smoke(
+                    "native_utility_bsm_probe",
+                    controller="bsm",
+                    group=BSM_UTILITY_GROUP,
+                )
+                return GLib.SOURCE_REMOVE
+            elif phase == "native_utility_bsm_probe":
+                assert self.offline_report is not None, self.offline_status.get_text()
+                assert self.offline_report["status"] == "completed", self.offline_report
+                result = self.offline_report["result"]
+                assert result["status"] == "error", result
+                assert result["result"] == 99, result
+                assert result["utility_group"] == BSM_UTILITY_GROUP, result
+                assert result["done"] is True, result
+                assert self.smoke_native_utility_screens >= 1
                 self.offline_smoke_phase = "rks_export"
                 self.export_rks_request(self.rks_smoke_request, self.rks_smoke_values)
             elif phase == "rks_export":
@@ -7160,7 +7249,7 @@ class Catalog(Adw.Application):
                 print(
                     "GTK workbench smoke passed: source-bound Toyota procedure replay and explicit raw RAM reads with profile mismatch, native partial fault, cancellation, retry and source guards; selected Viewer/V native active help resources; local RKS XML export/import with collision, write-fault, malformed-input and redaction/source guards; seven captured service/RKS/notice workflows with imported-file/fault/cancel/repeat/export checks; active P3/P5/routine native initialization, signed negative-value wire execution, argument forms and recorded cleanup; resource browsing, search, favorites, CSV, regions, USB inventory, docs, "
                     "2-ECU health replay, JSON export, rendered selectable chart, 7 recorded session modes, "
-                    f"{len(self.offline_keys)} offline procedures, native file inspection, cancellation, busy guard, failure recovery, protected export, vehicle categories/options/systems, selected command frames, 3 native recorded operations, exact calibration catalog planning, multiple snapshot buffers and imported XML/CSDF execution with native radio/key interaction, dialog cancellation and imported DRS capture with actual trigger/graph/native DM export and source-bound CUW programming stage replay with single-use/fault/cancel/export guards"
+                    f"{len(self.offline_keys)} offline procedures, native file inspection, cancellation, busy guard, failure recovery, protected export, vehicle categories/options/systems, selected command frames, 3 native recorded operations, exact calibration catalog planning, multiple snapshot buffers and imported XML/CSDF execution with native radio/key interaction, dialog cancellation, native DCM45 procedure success/native-warning/cancellation and the native BSM27 source rejection through the real utility dialog and imported DRS capture with actual trigger/graph/native DM export and source-bound CUW programming stage replay with single-use/fault/cancel/export guards"
                 )
                 self.finish_smoke()
             elif phase == "rks_import_fault":
@@ -7447,6 +7536,84 @@ class Catalog(Adw.Application):
             self.finish_smoke(exc)
         return GLib.SOURCE_REMOVE
 
+    def start_native_utility_smoke(
+        self, phase, *, controller, group, dcm_value=None, cancel=False
+    ):
+        """Drive a recovered native utility controller through the real GTK dialog."""
+        from scripts.utility_authored import (
+            DCM_COMMON_IDENTIFIERS,
+            DCM_TEXT_IDENTIFIERS,
+            DCM_UTILITY_GROUP,
+            AuthoredNativeUtility,
+        )
+
+        directory = self.state_path.parent / "native-utility-inputs"
+        directory.mkdir(exist_ok=True)
+        files = create_utility_group_text_examples(
+            DCM_UTILITY_GROUP,
+            DCM_TEXT_IDENTIFIERS,
+            common=DCM_COMMON_IDENTIFIERS,
+        )
+        language = directory / "U_Example.ddb"
+        symbols = directory / "UtilityResID_NK.rsd"
+        language.write_bytes(files["U_Example.ddb"])
+        symbols.write_bytes(files["UtilityResID_NK.rsd"])
+        self.native_utility_cancel = cancel
+        self.smoke_native_utility_screens = 0
+
+        def work():
+            from scripts.utility import NativeBSMRuntime
+
+            texts = UtilityTextResources.load(language, symbols, utility_group=group)
+            fixture = AuthoredNativeUtility(dcm_value=dcm_value)
+            runtime = fixture.runtime
+            if controller == "bsm":
+                runtime = NativeBSMRuntime(fixture.runtime.libraries)
+            try:
+                if controller == "bsm":
+                    runtime.open(0x137B8)
+                else:
+                    runtime.start(0x13723)
+                while not runtime.done:
+                    event = self.utility_dialog(native_utility_screen(runtime, texts))
+                    if type(event) is dict and set(event) == {"elapsed_ms"}:
+                        runtime.progress(event["elapsed_ms"])
+                    elif type(event) is dict and "key" in event:
+                        runtime.key(event["key"], event.get("values") or None)
+                    else:
+                        raise ValueError("Invalid native utility host dialog event")
+                status, report = "completed", runtime.report()
+            except InterruptedError:
+                runtime.cancel()
+                status, report = "cancelled", runtime.report()
+            finally:
+                fixture.close()
+            return {
+                "workflow": f"native_utility_{controller}",
+                "status": status,
+                "physical_status": "PHYSICAL_UNCONFIRMED",
+                "summary": "Нативная процедура выполнена по авторским данным",
+                "result": report,
+            }
+
+        self.offline_smoke_phase = phase
+        self.start_offline(language, operation=work, sources=(language, symbols))
+
+    def interact_native_utility_smoke(self):
+        try:
+            ui = self.utility_ui
+            assert ui is not None
+            if self.native_utility_cancel:
+                ui["dialog"].close()
+                return GLib.SOURCE_REMOVE
+            button = dict(ui["keys"]).get("acknowledge")
+            if button is not None and button.get_sensitive():
+                button.emit("clicked")
+        except Exception as exc:  # noqa: BLE001
+            self.offline_cancel.set()
+            self.finish_smoke(exc)
+        return GLib.SOURCE_REMOVE
+
     def start_native_smoke(self, operation, observations=True):
         assert self.vehicle_catalog is not None
         path = self.state_path.parent / f"native-{operation}.json"
@@ -7576,7 +7743,14 @@ def main() -> int:
         "--replay", type=Path, help="Open a diagnostic recording in the session page"
     )
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument(
+        "--smoke-compact",
+        action="store_true",
+        help="Run the smoke flow in the collapsed narrow layout",
+    )
     args = parser.parse_args()
+    if args.smoke_compact and not args.smoke_test:
+        parser.error("--smoke-compact requires --smoke-test")
     demo = args.demo or (args.root is None and not DEFAULT_ROOT.is_dir())
     temporary = (
         tempfile.TemporaryDirectory(prefix="techstream-smoke-")
@@ -7601,6 +7775,7 @@ def main() -> int:
             state / "saved.json",
             demo=demo,
             replay_path=args.replay,
+            smoke_compact=args.smoke_compact,
         )
         result = app.run([])
         return app.exit_code or result

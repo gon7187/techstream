@@ -47,5 +47,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 libusb-1.0-0 gir1.2-gdkpixbuf-2.0 librsvg2-common xvfb dbus-x11
-      - name: Render and exercise synthetic demo
-        run: sh scripts/desktop-smoke.sh
+      - name: Render and exercise the synthetic demo
+        run: sh scripts/desktop-smoke.sh normal
+      - name: Render and exercise the synthetic demo in the compact layout
+        run: sh scripts/desktop-smoke.sh compact
+
+  public-root:
+    name: public checkout and root gate
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Install the public runtime
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git python3
+      - uses: actions/checkout@v4
+      - name: Reject private evidence in the published tree
+        run: |
+          if find . -path ./.git -prune -o -type f \
+            \( -path './analysis/*' -o -path './artifacts/*' -o -path './.unlazy/*' \
+            -o -path './runtime/no-car-*' \) -print | grep -q .; then
+            echo "Private evidence paths must not be published" >&2
+            exit 1
+          fi
+      - name: Unit tests without a private corpus
+        run: python3 -m unittest discover -s tests
+      - name: Native offline workflows
+        run: python3 -m scripts.offline_verify workflows
