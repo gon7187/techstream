@@ -133,6 +133,7 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 | `shellcheck techstream scripts/desktop-smoke.sh` | PASS |
 | `python -m scripts.offline_verify workflows` | `OFFLINE_WORKFLOWS_PASSED` |
 | GTK smoke через `sh scripts/desktop-smoke.sh` | PASS |
+| GitHub Actions `39569915407` на `70ce9e1` | все четыре job PASS; `core (3.11)` 6 240 тестов за 57,691 с, `core (3.13)` 6 240 за 86,230 с; **0 failures, 0 errors**, 626 skipped |
 
 Добавлен `tests/private_evidence.py`: `require_private` принимает только пути под
 `analysis/`, `artifacts/`, `.unlazy/` или `runtime/no-car-*`; отсутствующий путь
