@@ -2149,5 +2149,73 @@ class SISDriverTest(unittest.TestCase):
         self.assertEqual(calls[-2:], [("logical_disconnect", 201), ("disconnect", 101)])
 
 
+class LifecycleHardeningTests(unittest.TestCase):
+    def test_p5_start_failure_leaves_no_unstarted_owner(self):
+        from unittest import mock
+
+        worker = object.__new__(UtilityExSelectedP5Worker)
+        worker._thread = None
+        worker._stop = threading.Event()
+        worker.error = None
+        worker.active = False
+        worker.status = 0
+
+        class FailingThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("authored Thread.start failure")
+
+        with (
+            mock.patch("scripts.utility_ex_lifecycle.threading.Thread", FailingThread),
+            self.assertRaises(RuntimeError),
+        ):
+            worker.start()
+        self.assertFalse(worker.active)
+        self.assertIsNone(worker._thread)
+        # Retry/finalization must not join an unstarted thread.
+        worker.stop()
+
+    def test_cmn_cancel_preserves_newer_shared_timer_status(self):
+        class Communication:
+            def exchange(self, request):
+                raise AssertionError("Cancelled CMN must not reach the wire")
+
+            def configure(self, field, value):
+                pass
+
+            def finalize(self):
+                pass
+
+        context = Context()
+        worker = object.__new__(UtilityExSelectedCMNWorker)
+        worker.context = context
+        worker.communication = cast(UtilityExComm, Communication())
+        worker.native_status = 0x101528B4
+        worker.native_result = 0x1014AF28
+        worker.busy_setter = 0x17320
+        worker.no_response_setter = 0x172F0
+        worker.status = 0
+        worker.error = None
+        worker.iterations = 0
+        status_key = f"native_global:{worker.native_status:x}"
+        context.state[status_key] = 0
+        original_sleep = context.native_sleep
+
+        def sleep(milliseconds):
+            original_sleep(milliseconds)
+            if context.tick >= 2000:
+                # The timer callback publishes a newer shared status while the
+                # cancelled CMN worker still holds its entry snapshot.
+                context.state[status_key] = 15
+                context.cancelled = True
+
+        context.native_sleep = sleep
+        self.assertEqual(worker.run(2000), 0)
+        self.assertEqual(context.state[status_key], 15)
+        self.assertEqual(context.state[f"native_global:{worker.native_result:x}"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

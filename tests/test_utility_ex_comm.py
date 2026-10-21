@@ -6,6 +6,7 @@ import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
@@ -22,6 +23,7 @@ from scripts.utility_ex_comm import (
     SHA_PLUS_NK,
     SHA_PLUS_TY,
     DriverReceive,
+    CommContext,
     UtilityExBroadcastCANLower,
     UtilityExCANLower,
     UtilityExClassicScheduler,
@@ -41,6 +43,7 @@ from scripts.utility_ex_comm import (
     UtilityExSourceError,
     UtilityExSupportCache,
     UtilityExUDSScheduler,
+    _published_state,
     elapsed,
     native_manager_protocol,
     p3_default_parameters,
@@ -3636,6 +3639,65 @@ class UtilityExCommunicationTests(unittest.TestCase):
             DriverReceive(True)
         with self.assertRaises(ValueError):
             DriverReceive(0, bytes(0x1020))
+
+
+class PublicationOwnerTests(unittest.TestCase):
+    def test_concurrent_publication_yields_one_owner_and_one_lock(self):
+        class Owner:
+            def __init__(self, context):
+                self.context = context
+                self.lock = threading.Lock()
+                time.sleep(0.01)
+
+        context = cast(CommContext, SimpleNamespace(state={}))
+        barrier = threading.Barrier(8)
+        created: list[Owner] = []
+        published: list[Owner] = []
+
+        def factory() -> Owner:
+            owner = Owner(context)
+            created.append(owner)
+            return owner
+
+        def publish() -> None:
+            barrier.wait()
+            published.append(
+                _published_state(
+                    context,
+                    "owner",
+                    Owner,
+                    factory,
+                    "Concrete same-context owner required",
+                )
+            )
+
+        threads = [threading.Thread(target=publish) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len({id(owner) for owner in published}), 1)
+        self.assertIs(context.state["owner"], published[0])
+        self.assertIs(published[0].lock, created[0].lock)
+
+    def test_publication_rejects_a_foreign_context_owner(self):
+        context = cast(CommContext, SimpleNamespace(state={}))
+        foreign = SimpleNamespace(state={})
+
+        class Owner:
+            def __init__(self, owner_context):
+                self.context = owner_context
+
+        context.state["owner"] = Owner(foreign)
+        with self.assertRaises(TypeError):
+            _published_state(
+                context,
+                "owner",
+                Owner,
+                lambda: Owner(context),
+                "Concrete same-context owner required",
+            )
 
 
 if __name__ == "__main__":

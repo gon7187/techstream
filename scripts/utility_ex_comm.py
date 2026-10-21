@@ -11,7 +11,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 from scripts.j2534_2026 import (
     J2534Device2026,
@@ -240,6 +240,43 @@ class CommContext(Protocol):
     def ticks(self) -> int: ...
     def sleep(self, milliseconds: int) -> None: ...
     def native_sleep(self, milliseconds: int) -> None: ...
+
+
+_T = TypeVar("_T")
+# One published owner per context key. The lock covers creation and publication,
+# not native I/O, so a slow constructor cannot be raced into a second owner.
+_PUBLICATION_LOCK = threading.RLock()
+
+
+def _published_state(
+    context: CommContext,
+    key: str,
+    expected: type[_T] | tuple[type, ...],
+    factory: Callable[[], _T],
+    error: str,
+    error_type: type[Exception] = TypeError,
+    *,
+    contextual: bool = True,
+) -> _T:
+    """Return the single same-context owner published under one state key."""
+
+    def checked(value: object) -> _T:
+        if not isinstance(value, expected) or (
+            contextual and getattr(value, "context", None) is not context
+        ):
+            raise error_type(error)
+        return cast(_T, value)
+
+    value = context.state.get(key)
+    if value is not None:
+        return checked(value)
+    with _PUBLICATION_LOCK:
+        value = context.state.get(key)
+        if value is None:
+            created = factory()
+            context.state[key] = created
+            value = created
+        return checked(value)
 
 
 SHA_18_TY = "79fc495c68eb099a7ebc0d1eefe0eafd80101ac0bc09a58d3f603ed556c84762"
@@ -648,12 +685,14 @@ def elapsed(now: int, start: int) -> int:
 
 def _uds_fields(context: CommContext, manager: int) -> UDSFields:
     key = f"utility_ex:uds_fields:{context.module_sha256}:{manager:x}"
-    if key not in context.state:
-        context.state[key] = UDSFields()
-    fields = context.state[key]
-    if not isinstance(fields, UDSFields):
-        raise TypeError("Concrete native UDS manager fields required")
-    return fields
+    return _published_state(
+        context,
+        key,
+        UDSFields,
+        UDSFields,
+        "Concrete native UDS manager fields required",
+        contextual=False,
+    )
 
 
 class UtilityExUDSScheduler:
@@ -976,12 +1015,14 @@ class ClassicFields:
 
 def _classic_fields(context: CommContext) -> ClassicFields:
     key = f"utility_ex:classic_globals:{context.module_sha256}"
-    if key not in context.state:
-        context.state[key] = ClassicFields()
-    fields = context.state[key]
-    if not isinstance(fields, ClassicFields):
-        raise TypeError("Concrete native classic counter state required")
-    return fields
+    return _published_state(
+        context,
+        key,
+        ClassicFields,
+        ClassicFields,
+        "Concrete native classic counter state required",
+        contextual=False,
+    )
 
 
 class UtilityExSelectedPending:
@@ -1799,12 +1840,13 @@ class UtilityExPassThruPool:
         self._queue_lock = threading.RLock()
         self._owned_protocols: dict[int, int] = {}
         key = f"utility_ex:driver_arbitration:{context.module_sha256}"
-        if key not in context.state:
-            context.state[key] = UtilityExDriverArbitration(context)
-        arbitration = context.state[key]
-        if not isinstance(arbitration, UtilityExDriverArbitration):
-            raise TypeError("Concrete native driver arbitration required")
-        self.arbitration = arbitration
+        self.arbitration = _published_state(
+            context,
+            key,
+            UtilityExDriverArbitration,
+            lambda: UtilityExDriverArbitration(context),
+            "Concrete native driver arbitration required",
+        )
 
     def _call(
         self,
@@ -2672,12 +2714,13 @@ class UtilityExCANLower:
         self.last_receive_tick = 0
         self.filter_ids = [0xFFFFFFFF] * self.filter_count
         key = f"utility_ex:can_manager_mutex:{context.module_sha256}"
-        if key not in context.state:
-            context.state[key] = UtilityExManagerMutex(context)
-        mutex = context.state[key]
-        if not isinstance(mutex, UtilityExManagerMutex):
-            raise TypeError("Concrete native CAN manager mutex required")
-        self.mutex = mutex
+        self.mutex = _published_state(
+            context,
+            key,
+            UtilityExManagerMutex,
+            lambda: UtilityExManagerMutex(context),
+            "Concrete native CAN manager mutex required",
+        )
 
     @property
     def connection_protocol(self) -> int:
@@ -3122,23 +3165,27 @@ class UtilityExComm:
             from scripts.utility_ex_lifecycle import UtilityExSISFields
 
             key = f"utility_ex:sis_fields:{context.module_sha256}:{self.manager_address:x}"
-            if key not in context.state:
-                context.state[key] = UtilityExSISFields()
-            fields = context.state[key]
-            if not isinstance(fields, UtilityExSISFields):
-                raise TypeError("Concrete independent SIS manager fields required")
-            self._sis_fields = fields
+            self._sis_fields = _published_state(
+                context,
+                key,
+                UtilityExSISFields,
+                UtilityExSISFields,
+                "Concrete independent SIS manager fields required",
+                contextual=False,
+            )
         self._p6_fields: UtilityExP6Fields | None = None
         if self.manager_address in _P6_OBJECTS.get(context.module_sha256, ()):
             key = (
                 f"utility_ex:p6_fields:{context.module_sha256}:{self.manager_address:x}"
             )
-            if key not in context.state:
-                context.state[key] = UtilityExP6Fields()
-            p6_fields = context.state[key]
-            if not isinstance(p6_fields, UtilityExP6Fields):
-                raise TypeError("Separate concrete P6 manager fields required")
-            self._p6_fields = p6_fields
+            self._p6_fields = _published_state(
+                context,
+                key,
+                UtilityExP6Fields,
+                UtilityExP6Fields,
+                "Separate concrete P6 manager fields required",
+                contextual=False,
+            )
         self._fields = (
             self._p6_fields
             if self._p6_fields is not None
@@ -3161,15 +3208,13 @@ class UtilityExComm:
 
     def _support_cache(self) -> UtilityExSupportCache:
         key = f"utility_ex:support_profiles:{self.context.module_sha256}"
-        if key not in self.context.state:
-            self.context.state[key] = UtilityExSupportCache(self.context)
-        cache = self.context.state[key]
-        if (
-            not isinstance(cache, UtilityExSupportCache)
-            or cache.context is not self.context
-        ):
-            raise TypeError("Concrete same-context native support cache required")
-        return cache
+        return _published_state(
+            self.context,
+            key,
+            UtilityExSupportCache,
+            lambda: UtilityExSupportCache(self.context),
+            "Concrete same-context native support cache required",
+        )
 
     def refresh_support_cache(self, kind: int) -> int:
         if self.manager_address is None:
@@ -3404,35 +3449,47 @@ class UtilityExComm:
 
         if self._sis_fields is None or self.manager_address is None:
             raise UtilityExSourceError("Concrete SIS manager required")
-        key = f"utility_ex:fixed_lifecycle:{self.context.module_sha256}:{self.manager_address:x}"
-        lifecycle = self.context.state.get(key)
-        if lifecycle is None and create:
+        sis_fields = self._sis_fields
+        manager_address = self.manager_address
+        key = f"utility_ex:fixed_lifecycle:{self.context.module_sha256}:{manager_address:x}"
+        if not create:
+            lifecycle = self.context.state.get(key)
+            if lifecycle is None:
+                raise UtilityExSourceError("Native SIS manager is not initialized")
+            if (
+                not isinstance(lifecycle, UtilityExSISLifecycle)
+                or lifecycle.context is not self.context
+            ):
+                raise UtilityExSourceError("Native SIS manager is not initialized")
+            return lifecycle
+
+        def publish_lifecycle() -> UtilityExSISLifecycle:
             driver_key = f"utility_ex:sis_driver:{self.context.module_sha256}"
-            driver = self.context.state.get(driver_key)
-            if driver is None:
-                driver = UtilityExSISDriver(
+            driver = _published_state(
+                self.context,
+                driver_key,
+                UtilityExSISDriver,
+                lambda: UtilityExSISDriver(
                     self.context,
                     cast(UtilityExContext, self.context).sis_driver_binding(),
-                )
-                self.context.state[driver_key] = driver
-            if (
-                not isinstance(driver, UtilityExSISDriver)
-                or driver.context is not self.context
-            ):
-                raise TypeError("Concrete same-context SIS DRIVER required")
-            lifecycle = UtilityExSISLifecycle(
+                ),
+                "Concrete same-context SIS DRIVER required",
+            )
+            return UtilityExSISLifecycle(
                 cast(SISContext, self.context),
                 driver,
-                self._sis_fields,
-                self.manager_address,
+                sis_fields,
+                manager_address,
             )
-            self.context.state[key] = lifecycle
-        if (
-            not isinstance(lifecycle, UtilityExSISLifecycle)
-            or lifecycle.context is not self.context
-        ):
-            raise UtilityExSourceError("Native SIS manager is not initialized")
-        return lifecycle
+
+        return _published_state(
+            self.context,
+            key,
+            UtilityExSISLifecycle,
+            publish_lifecycle,
+            "Native SIS manager is not initialized",
+            UtilityExSourceError,
+        )
 
     def _fixed_lifecycle(
         self, *, create: bool = False
@@ -3454,44 +3511,56 @@ class UtilityExComm:
         if self.context.module_sha256 not in _CAN_LOWER_SOURCES:
             raise UtilityExSourceError("Native fixed lower lifecycle is unported")
         key = f"utility_ex:fixed_lifecycle:{self.context.module_sha256}:{self.manager_address:x}"
-        lifecycle = self.context.state.get(key)
-        if lifecycle is None and create and self._p6_fields is not None:
-            from scripts.utility_ex import UtilityExContext
-
-            pool_key = f"utility_ex:p6_pool:{self.context.module_sha256}"
-            pool = self.context.state.get(pool_key)
-            if pool is None:
-                actual = cast(UtilityExContext, self.context)
-                adapter = UtilityExDriverPrimitives(
-                    self.context, actual.p6_driver_binding(6)
-                )
-                pool = UtilityExP6Pool(
-                    self.context,
-                    J2534Device2026(
-                        adapter,
-                        cancelled=self.context.is_cancelled,
-                        background_workers=False,
-                    ),
-                )
-                pool.register_binding(actual.p6_driver_binding(0x8012))
-                self.context.state[pool_key] = pool
+        fields = self._fields
+        manager = self.manager_address
+        p6_fields = self._p6_fields
+        if not create:
+            lifecycle = self.context.state.get(key)
             if (
-                not isinstance(pool, UtilityExP6Pool)
-                or pool.context is not self.context
+                not isinstance(lifecycle, UtilityExFixedLifecycle)
+                or lifecycle.context is not self.context
             ):
-                raise TypeError("Separate same-context P6 pool required")
-            lifecycle = UtilityExP6Lifecycle(
-                self.context, pool, self._p6_fields, self.manager_address
-            )
-            self.context.state[key] = lifecycle
-        if lifecycle is None and create:
+                raise UtilityExSourceError("Native fixed manager is not initialized")
+            return lifecycle
+
+        def publish_lifecycle() -> UtilityExFixedLifecycle:
+            if p6_fields is not None:
+                from scripts.utility_ex import UtilityExContext
+
+                pool_key = f"utility_ex:p6_pool:{self.context.module_sha256}"
+
+                def publish_p6_pool() -> UtilityExP6Pool:
+                    actual = cast(UtilityExContext, self.context)
+                    adapter = UtilityExDriverPrimitives(
+                        self.context, actual.p6_driver_binding(6)
+                    )
+                    pool = UtilityExP6Pool(
+                        self.context,
+                        J2534Device2026(
+                            adapter,
+                            cancelled=self.context.is_cancelled,
+                            background_workers=False,
+                        ),
+                    )
+                    pool.register_binding(actual.p6_driver_binding(0x8012))
+                    return pool
+
+                pool = _published_state(
+                    self.context,
+                    pool_key,
+                    UtilityExP6Pool,
+                    publish_p6_pool,
+                    "Separate same-context P6 pool required",
+                )
+                return UtilityExP6Lifecycle(self.context, pool, p6_fields, manager)
+
             pool_key = f"utility_ex:can_pool:{self.context.module_sha256}"
-            pool = self.context.state.get(pool_key)
-            if pool is None:
+
+            def publish_pool() -> UtilityExPassThruPool:
                 adapter = UtilityExDriverPrimitives(
                     self.context, self.context.driver_binding(6)
                 )
-                pool = UtilityExPassThruPool(
+                return UtilityExPassThruPool(
                     self.context,
                     J2534Device2026(
                         adapter,
@@ -3499,22 +3568,26 @@ class UtilityExComm:
                         background_workers=False,
                     ),
                 )
-                self.context.state[pool_key] = pool
-            if (
-                not isinstance(pool, UtilityExPassThruPool)
-                or pool.context is not self.context
-            ):
-                raise TypeError("Concrete same-context native pool required")
-            lifecycle = UtilityExFixedLifecycle(
-                self.context, pool, self._fields, self.manager_address
+
+            pool = _published_state(
+                self.context,
+                pool_key,
+                UtilityExPassThruPool,
+                publish_pool,
+                "Concrete same-context native pool required",
             )
-            self.context.state[key] = lifecycle
-        if (
-            not isinstance(lifecycle, UtilityExFixedLifecycle)
-            or lifecycle.context is not self.context
-        ):
-            raise UtilityExSourceError("Native fixed manager is not initialized")
-        return lifecycle
+            return UtilityExFixedLifecycle(
+                self.context, pool, cast(UDSFields, fields), manager
+            )
+
+        return _published_state(
+            self.context,
+            key,
+            UtilityExFixedLifecycle,
+            publish_lifecycle,
+            "Native fixed manager is not initialized",
+            UtilityExSourceError,
+        )
 
     def _selected_lower(self) -> UtilityExP3Lower | UtilityExClassicCANLower:
         from scripts.utility_ex_lifecycle import UtilityExClassicCANLower
@@ -3601,24 +3674,26 @@ class UtilityExComm:
         protocol = 4 if index < 5 else 6
         constructor = 0xD if manager in objects[5:8] else 0
         key = f"utility_ex:direct_driver:{self.context.module_sha256}:{protocol}:{constructor}"
-        driver = self.context.state.get(key)
-        if driver is None:
+
+        def publish_driver() -> UtilityExDirectDriver:
             adapter = UtilityExDriverPrimitives(
                 self.context,
                 self.context.driver_binding(
                     protocol, constructor_parameter=constructor
                 ),
             )
-            driver = UtilityExDirectDriver(self.context, adapter, protocol)
-            self.context.state[key] = driver
-        if (
-            not isinstance(driver, UtilityExDirectDriver)
-            or driver.context is not self.context
-        ):
-            raise TypeError("Concrete same-context direct singleton required")
+            return UtilityExDirectDriver(self.context, adapter, protocol)
+
+        driver = _published_state(
+            self.context,
+            key,
+            UtilityExDirectDriver,
+            publish_driver,
+            "Concrete same-context direct singleton required",
+        )
         key = f"utility_ex:selected_lower:{self.context.module_sha256}:{manager:x}"
-        lower = self.context.state.get(key)
-        if lower is None:
+
+        def publish_lower() -> UtilityExP3Lower | UtilityExClassicCANLower:
             p3_types = (
                 UtilityExP3Lower,
                 UtilityExP3F1Lower,
@@ -3626,17 +3701,19 @@ class UtilityExComm:
                 UtilityExLegacyP4Lower,
                 UtilityExP3SlowLower,
             )
-            lower = (
+            return (
                 p3_types[index](self.context, driver)
                 if index < len(p3_types)
                 else UtilityExClassicCANLower(self.context, driver, manager)
             )
-            self.context.state[key] = lower
-        if (
-            not isinstance(lower, (UtilityExP3Lower, UtilityExClassicCANLower))
-            or lower.context is not self.context
-        ):
-            raise TypeError("Concrete same-context selected P3 lower required")
+
+        lower = _published_state(
+            self.context,
+            key,
+            (UtilityExP3Lower, UtilityExClassicCANLower),
+            publish_lower,
+            "Concrete same-context selected P3 lower required",
+        )
         profile = self.context.state.get(f"native_global:{profile_global:x}", 0)
         if type(profile) is not int or not 0 <= profile <= 0xFFFFFFFF:
             raise ValueError("Native selected profile must be uint32")

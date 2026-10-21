@@ -2457,7 +2457,13 @@ class UtilityExSelectedCMNWorker:
                 if now < end:
                     duration = interval if plain else fields.interval_ms
                     self._wait((start - now + duration) & 0xFFFFFFFF)
-            self.context.state[f"native_global:{self.native_status:x}"] = global_status
+            status_key = f"native_global:{self.native_status:x}"
+            current = self.context.state.get(status_key)
+            # A cancelled worker has no new result to publish. Restore the entry
+            # snapshot only when no other owner (for example the timer callback)
+            # has published a newer shared status in the meantime.
+            if global_status != previous or current is None or current == previous:
+                self.context.state[status_key] = global_status
             comm.configure(f"native_rva:{self.busy_setter:x}", 100)
             comm.configure(f"native_rva:{self.no_response_setter:x}", 3)
             self.context.state[f"native_global:{self.native_result:x}"] = self.status
@@ -3102,10 +3108,19 @@ class UtilityExSelectedP5Worker:
         self.active = True
         self.error = None
         self._stop.clear()
-        self._thread = threading.Thread(
+        thread = threading.Thread(
             target=self._run, name="utility-ex-selected-p5", daemon=True
         )
-        self._thread.start()
+        self._thread = thread
+        try:
+            thread.start()
+        except BaseException:
+            # A failed Thread.start leaves no live worker. Do not retain an
+            # active owner or an unstarted thread that a later stop cannot join.
+            self._thread = None
+            self.active = False
+            self._stop.set()
+            raise
 
     def stop(self, close: int = 0) -> None:
         unsigned(close)

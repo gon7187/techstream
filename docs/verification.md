@@ -13,7 +13,7 @@ python -m scripts.demo --output /tmp/techstream-demo
 python -m scripts.offline_verify workflows
 ruff check scripts tests techstream.py
 ruff format --check scripts tests techstream.py
-shellcheck techstream
+shellcheck techstream scripts/desktop-smoke.sh
 ```
 
 CI в `.github/workflows/ci.yml` запускает unittest на Python 3.11 и 3.13, офлайн replay, генерацию синтетических demo-ресурсов, авторские offline workflows, Ruff lint/format, ShellCheck и GTK smoke test на Ubuntu 24.04 с Xvfb и D-Bus. Перед утверждением результата на текущем checkpoint нужно сверить сам workflow и SHA опубликованного дерева.
@@ -74,3 +74,18 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 Ошибки полного прогона относятся, в частности, к gateway-cache/worker joins, native-pointer replay и отдельным source-backed utility SDK-путям. Они не были скрыты или исправлены в рамках запрошенной паузы. Полные локальные логи остаются частными; публичный CI на конкретном коммите показывает независимый результат чистого checkout. Успешные выборочные проверки не отменяют этот красный общий результат.
 
 Изолированный source-only прогон использовал только явно отобранные публичные файлы; исходный home и частный корпус не монтировались, сеть была отключена. Он обнаружил незаявленные частные зависимости части тестов и дополнительные ошибки. Это экспорт файлов для проверки, а не доказательство успешного fresh Git clone или зелёного GitHub CI. Исправление переносимости остаётся отдельной работой; массовое добавление skip ради зелёного результата не является решением.
+
+### После lifecycle-исправлений 21 октября 2026
+
+Повторный публичный прогон на ветке `offline-completion-20261020` после слияния PR #3, без приватного корпуса:
+
+| Проверка | Результат |
+| --- | --- |
+| `python -m unittest discover -s tests` | 6 228 тестов за 57,180 с; **0 failures**, 117 errors, 529 skipped |
+| `ruff check scripts tests techstream.py` | PASS |
+| `ruff format --check scripts tests techstream.py` | 290 файлов уже отформатированы |
+| `shellcheck techstream scripts/desktop-smoke.sh` | PASS |
+| `python -m scripts.offline_verify workflows` | `OFFLINE_WORKFLOWS_PASSED` |
+| GTK smoke через `sh scripts/desktop-smoke.sh` | PASS |
+
+117 errors — это `FileNotFoundError` для отсутствующих приватных `analysis/evidence/no-car-*` и `artifacts/extracted/*`; публичные lifecycle-регрессии и остальные авторские тесты зелёные. Это не полный native pass: оригинальный oracle листов 153/108 и независимый source-review не запускались.
