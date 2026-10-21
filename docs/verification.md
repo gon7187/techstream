@@ -105,3 +105,18 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 | GitHub Actions `39564815857` на `9b7deeb` | `static` и `desktop` PASS; `core (3.11)`/`core (3.13)` — 6 237 тестов, 0 failures, 117 errors, 529 skipped |
 
 117 errors — те же отсутствующие приватные `analysis/evidence/no-car-*` и `artifacts/extracted/*`. Авторские `ControllerExecuteTests` покрывают one-phase dispatch, classic/modern prepare, write retry, recovery/probe, pool replacement и фактическую pair chronology. Это не source-issued native oracle: оригинальный execute/context, native multi-row cardinality и независимый consumer review не запускались.
+
+### После исправления публичных harness-дефектов
+
+Повторный публичный прогон на ветке `offline-completion-20261020`, без приватного корпуса:
+
+| Проверка | Результат |
+| --- | --- |
+| `python -m unittest discover -s tests` | 6 237 тестов за 54,428 с; **0 failures**, 113 errors, 547 skipped |
+| `ruff check scripts tests techstream.py` | PASS |
+| `ruff format --check scripts tests techstream.py` | 290 файлов уже отформатированы |
+| `shellcheck techstream scripts/desktop-smoke.sh` | PASS |
+| `python -m scripts.offline_verify workflows` | `OFFLINE_WORKFLOWS_PASSED` |
+| GTK smoke через `sh scripts/desktop-smoke.sh` | PASS |
+
+113 errors — только `FileNotFoundError` для отсутствующих приватных `analysis/evidence/no-car-*`, `artifacts/extracted/*` и `runtime/no-car-*`; failures отсутствуют. Четыре ранее публичных harness-дефекта исправлены без маскировки: проверки `Body2026Tests` перенесены внутрь `subTest`, Suzuki-тест явно подменяет новый source-issued central gateway key, а UtilityEx retained-тест отвечает на реальный keepalive `3e00` каждого потока вместо общего итератора ответов. Фикстура `test_cuw_gateway_startup` теперь получает producer через `engine.bind_gateway_startup()`, а не через частный issuer; приватный повтор 55 тестов листа 134 остаётся отдельной проверкой.
