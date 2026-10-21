@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import calendar
 import io
+import threading
 import time
 import unittest
 import zipfile
@@ -1154,19 +1155,12 @@ class RetainedTests(unittest.TestCase):
         host = Host()
         host.values.update({0x6F: 20, 0x70: 0x12, 0x74: 0x7E0})
         host.data[500] = bytes.fromhex("0100000020a10700")
-        replies = iter(
-            bytes.fromhex(value)
-            for value in (
-                "5001",
-                "5003",
-                "71011106",
-                "7103110601",
-                "7103110602",
-                "5001",
-            )
-        )
         calls: list[object] = []
         filters = iter((51, 52))
+        # The native session3 helper starts its real keepalive worker, which
+        # sends 3e00 concurrently. Answer each thread's own request instead of
+        # sharing one reply iterator between the worker and the caller.
+        requests = threading.local()
 
         def connect(protocol: int, flags: int, output: bytearray) -> PrimitiveResult:
             calls.append(("connect", protocol, flags))
@@ -1180,13 +1174,36 @@ class RetainedTests(unittest.TestCase):
         def write(
             channel: int, messages: Any, count: Any, timeout: int
         ) -> PrimitiveResult:
-            calls.append(messages[0].data)
+            payload = messages[0].data
+            calls.append(payload)
+            request = payload[4:]
+            seen = getattr(requests, "seen", None)
+            if seen is None:
+                seen = requests.seen = {}
+            seen[request] = seen.get(request, 0) + 1
+            requests.last = request
             return PrimitiveResult()
 
         def read(
             channel: int, messages: Any, count: Any, timeout: int
         ) -> PrimitiveResult:
-            messages[0] = NativeMessage(6, bytes.fromhex("000007e8") + next(replies))
+            request = getattr(requests, "last", None)
+            if request == b"\x3e\x00":
+                reply = b"\x7e\x00"
+            elif request == b"\x10\x01":
+                reply = b"\x50\x01"
+            elif request == b"\x10\x03":
+                reply = b"\x50\x03"
+            elif request == b"\x31\x01\x11\x06\x02":
+                reply = b"\x71\x01\x11\x06"
+            elif request == b"\x31\x03\x11\x06":
+                count = requests.seen[request]
+                reply = b"\x71\x03\x11\x06" + (b"\x01" if count == 1 else b"\x02")
+            else:
+                raise AssertionError(
+                    f"read without a matching native request: {request!r}"
+                )
+            messages[0] = NativeMessage(6, bytes.fromhex("000007e8") + reply)
             return PrimitiveResult()
 
         names = (
@@ -1236,7 +1253,11 @@ class RetainedTests(unittest.TestCase):
         self.assertEqual(calls[0], ("connect", 6, 0))
         self.assertEqual(calls[-1], ("disconnect", 42))
         self.assertEqual(
-            [value for value in calls if isinstance(value, bytes)],
+            [
+                value
+                for value in calls
+                if isinstance(value, bytes) and value[4:] != bytes.fromhex("3e00")
+            ],
             [
                 bytes.fromhex("000007e0" + value)
                 for value in (

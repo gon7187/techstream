@@ -9,10 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from scripts.cuw_2026 import CUWEngine2026
-from scripts.cuw_gateway_startup import (
-    GatewayStartup2026,
-    _issue_gateway_startup,
-)
+from scripts.cuw_gateway_startup import GatewayStartup2026
 from scripts.demo_calibration import table
 from scripts.j2534_2026 import (
     DriverMetadata2026,
@@ -189,7 +186,9 @@ class GatewayStartupTests(unittest.TestCase):
         controller = fixtures.make_controller(runtime)
         worker = engine.bind_worker(controller)
         engine.bind_interface_pair(pair)
-        producer = _issue_gateway_startup(engine, worker)
+        # The engine owns the issued producer: the ED0C publication guard
+        # rejects a producer obtained through the private issuer path.
+        producer = engine.bind_gateway_startup()
         return sdk, device, engine, controller, worker, producer
 
     def p4_replies(self, *, classify=b"\x7e"):
@@ -618,7 +617,7 @@ class GatewayStartupTests(unittest.TestCase):
         self.run_owned(engine, controller, producer)
         self.assertEqual(sdk.writes.count(REQUEST + b"\x3e"), 1)
         self.assertEqual(sdk.writes.count(REQUEST + b"\x10\x60"), 2)
-        self.assertIs(_issue_gateway_startup(engine, producer.worker), producer)
+        self.assertIs(engine.bind_gateway_startup(), producer)
 
     def test_callback14_runs_actual5b1e0_without_inventing5a835_be0(self):
         sdk, _, engine, controller, worker, producer = self.context(self.p4_replies())

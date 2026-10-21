@@ -2289,12 +2289,12 @@ class Body2026Tests(unittest.TestCase):
                     fired = True
                     raise original
 
-            with (
-                self.subTest(module=module, scope="unknown_business"),
-                self.assertRaises(NativeException2026) as caught,
-            ):
-                self._sonar_control(module=module, typed=True, fault=unknown)
-            self.assertIs(caught.exception, original)
+            # Keep the post-call assertion inside the subTest scope: an absent
+            # private image skips the control call and must skip this check too.
+            with self.subTest(module=module, scope="unknown_business"):
+                with self.assertRaises(NativeException2026) as caught:
+                    self._sonar_control(module=module, typed=True, fault=unknown)
+                self.assertIs(caught.exception, original)
 
             fired = False
 
@@ -2405,23 +2405,29 @@ class Body2026Tests(unittest.TestCase):
             "TCUWP5CanBodyFlashWriter.dll",
         ):
             events = []
-            with (
-                self.subTest(module=module),
-                self.assertRaisesRegex(
+            # The skip for an absent private image must cover the retained-event
+            # assertions as well, not only the control call itself.
+            with self.subTest(module=module):
+                with self.assertRaisesRegex(
                     ValueError, "984|36800|retained|getter|actual CUW engine worker"
-                ),
-            ):
-                self._sonar_control(module=module, typed=True, fault=events.append)
-            self.assertEqual(
-                events[-1], {"operation": "set_timeout", "milliseconds": 0}
-            )
-            self.assertIn("stop_filter", [event["operation"] for event in events])
-            if "CXPI" in module:
-                self.assertIn(
-                    {"operation": "control_io", "ioctl": 2, "parameters": ((30, 0),)},
-                    events,
+                ):
+                    self._sonar_control(module=module, typed=True, fault=events.append)
+                self.assertEqual(
+                    events[-1], {"operation": "set_timeout", "milliseconds": 0}
                 )
-            self.assertNotIn("write_messages", [event["operation"] for event in events])
+                self.assertIn("stop_filter", [event["operation"] for event in events])
+                if "CXPI" in module:
+                    self.assertIn(
+                        {
+                            "operation": "control_io",
+                            "ioctl": 2,
+                            "parameters": ((30, 0),),
+                        },
+                        events,
+                    )
+                self.assertNotIn(
+                    "write_messages", [event["operation"] for event in events]
+                )
 
     def test_body_gateway_distinct_native_parameter_phase(self):
         context, _, selected = fixture(

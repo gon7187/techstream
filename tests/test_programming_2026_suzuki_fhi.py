@@ -1491,13 +1491,21 @@ class SuzukiIdentificationTests(unittest.TestCase):
         from unittest.mock import patch
 
         from scripts.cuw_2026 import CUWEngine2026
+        from scripts.programming_2026_common import NativeCentralGatewayKey2026
 
+        # This authored Suzuki path supplies its own engine bytes. The engine
+        # constructor now also requires a source-issued central gateway key; the
+        # key is not consumed here, so bind an explicit test substitute rather
+        # than pretending the authored bytes are an authenticated CUW2026 image.
         with (
             patch(
                 "scripts.cuw_2026.identity_2026",
                 return_value=SimpleNamespace(sha256="authored-engine"),
             ),
             patch("scripts.cuw_2026.gateway_authentication2026", return_value=None),
+            patch.object(
+                NativeCentralGatewayKey2026, "from_native_module", return_value=None
+            ),
         ):
             engine = CUWEngine2026(b"authored")
         engine.configure(struct.pack("<IIddII", 1, 0, 1, 2, 0, 0))
@@ -2030,6 +2038,9 @@ class SuzukiIdentificationTests(unittest.TestCase):
                 return_value=SimpleNamespace(sha256="authored-engine"),
             ),
             patch("scripts.cuw_2026.gateway_authentication2026", return_value=None),
+            patch.object(
+                NativeCentralGatewayKey2026, "from_native_module", return_value=None
+            ),
         ):
             retry_engine = CUWEngine2026(b"authored")
         retry_engine.configure(struct.pack("<IIddII", 1, 0, 1, 2, 0, 0))
