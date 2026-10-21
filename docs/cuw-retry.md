@@ -107,6 +107,8 @@ without invoking it, while input `1` completes 97 events and invokes the retaine
 uses its authenticated connected channel; no initial Connect is invented.
 This remains scoped `3b90/4780`, not full `b3e0` or a repeated write.
 
+`ControlCommPhase2026.execute` now composes `retry_failed_write` when the actual writer report returns native false. The retry loop keeps the original executed writer row, and a successful PrepareRetry clears post-write state; the outer Execute still returns the original writer Boolean and reports `retry_decision` separately. This is public composition evidence only; the private failed-family oracle remains the acceptance boundary.
+
 The private `verify_prepare_ack.py` proof replays an actual phase-1 prepare
 prefix through the missing Control-module loader branch, leaving the persistent
 child parked with `be8=1`. A recorded engine-view `ReadVersion` native status `7`

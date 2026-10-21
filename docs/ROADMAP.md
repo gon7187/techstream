@@ -16,7 +16,7 @@
 ## До финального гейта без оборудования
 
 - [ ] Исправить три независимо воспроизведённых дефекта lifecycle: неудачный запуск потока, конкурентная публикация владельца и устаревший общий статус CMN.
-- [ ] Завершить канонический gateway cache, source-issued working context, параметрический пул и полный `ControlCommPhase2026.execute`.
+- [ ] Завершить канонический gateway cache, source-issued working context, native multi-row cardinality параметрического пула и независимый review публичного one-phase `ControlCommPhase2026.execute`.
 - [ ] Подключить реальный consolidated bridge к worker/runtime; сохранить отдельные владельцы, scratch buffers и точную последовательность callback.
 - [ ] Закрыть актуальные legacy-router/recovery/TechVim цепочки и независимые проверки ошибок и очистки.
 - [ ] Реализовать ручной recorder producer; проверить вложенные CommandDataLib тела версии 12 отдельно от внешней ComTol grammar.

@@ -170,5 +170,8 @@ Native prepare/write phases require the caller-supplied connected CJ channel. Th
 source modules do not perform an initial `Connect`; classic prepare connects only
 inside the explicit mask protocol transitions at1a15(protocol5) and1ac9(protocol6).
 A concrete runtime channel observation suppresses the old wire-fixture convenience
-connection without claiming a new disconnect owner. Engine→CONTROL pair import keeps
-the original acquisition-view cleanup. Opaque provider fixtures retain explicit setup.
+connection without claiming a new disconnect owner. `ControlCommPhase2026.execute`
+applies the engine→CONTROL pair import and the CONTROL→engine return only when an actual
+`J2534InterfacePair2026` is bound, so the original acquisition-view cleanup survives;
+unpaired callers retain the supplied connected control channel. Opaque provider fixtures
+retain explicit setup.

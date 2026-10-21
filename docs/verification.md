@@ -89,3 +89,18 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 | GTK smoke через `sh scripts/desktop-smoke.sh` | PASS |
 
 117 errors — это `FileNotFoundError` для отсутствующих приватных `analysis/evidence/no-car-*` и `artifacts/extracted/*`; публичные lifecycle-регрессии и остальные авторские тесты зелёные. Это не полный native pass: оригинальный oracle листов 153/108 и независимый source-review не запускались.
+
+### После execute/context листа 31 и пула 151
+
+Повторный публичный прогон на ветке `offline-completion-20261020`, без приватного корпуса:
+
+| Проверка | Результат |
+| --- | --- |
+| `python -m unittest discover -s tests` | 6 237 тестов за 60,575 с; **0 failures**, 117 errors, 529 skipped |
+| `ruff check scripts tests techstream.py` | PASS |
+| `ruff format --check scripts tests techstream.py` | 290 файлов уже отформатированы |
+| `shellcheck techstream scripts/desktop-smoke.sh` | PASS |
+| `python -m scripts.offline_verify workflows` | `OFFLINE_WORKFLOWS_PASSED` |
+| GTK smoke через `sh scripts/desktop-smoke.sh` | PASS |
+
+117 errors — те же отсутствующие приватные `analysis/evidence/no-car-*` и `artifacts/extracted/*`. Авторские `ControllerExecuteTests` покрывают one-phase dispatch, classic/modern prepare, write retry, recovery/probe, pool replacement и фактическую pair chronology. Это не source-issued native oracle: оригинальный execute/context, native multi-row cardinality и независимый consumer review не запускались.
