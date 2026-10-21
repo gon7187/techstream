@@ -1,5 +1,6 @@
 """Authored controls for shared2026 primitives; no original secret material."""
 
+import threading
 import unittest
 from typing import Any
 
@@ -2495,6 +2496,341 @@ class ControllerCIDFallbackTests(unittest.TestCase):
         following.assert_not_called()
         commit.assert_called_once_with(values, controller=controller)
         self.assertFalse(controller.alternate_cid_used)
+
+
+class ControllerExecuteTests(unittest.TestCase):
+    def shell(self, operation, *, contact="CAN", worker_phase=None):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.programming_2026_common import ControlCommPhase2026
+        from scripts.programming_replay import ProgrammingReplay
+
+        phase = {
+            "get_cid": 0,
+            "prepare": 1,
+            "write": 2,
+            "recovery": 2,
+            "probe": 2,
+            "change_gateway": 3,
+        }[operation]
+        controller = object.__new__(ControlCommPhase2026)
+        controller._retained_parameter_pool = ()
+        controller._parameter_session = None
+        controller.alternate_cid_used = False
+        controller.runtime = Mock()
+        session = object.__new__(ProgrammingReplay)
+        session.context = {"operation": operation}
+        session.used = False
+        session.bind_controller2026 = Mock()
+        session.bind_engine2026 = Mock()
+        session.selected_binding2026 = Mock()
+        engine = object.__new__(CUWEngine2026)
+        engine._active = True
+        engine._phase_thread = threading.get_ident()
+        engine._worker_phase = 1 if phase == 3 else phase
+        if worker_phase is not None:
+            engine._worker_phase = worker_phase
+        engine._controller_execution = controller
+        engine._metadata = SimpleNamespace(
+            vehicle={"contacttype": contact}, node=1, cpu_index=0
+        )
+        engine._worker = Mock()
+        engine._worker.controller = controller
+        engine._worker.validate_source = Mock()
+        engine._interface_pair = None
+        return engine, controller, session
+
+    def test_prepare_dispatches_classic_transition_and_modern_does_not(self):
+        from unittest.mock import Mock, patch
+
+        from scripts.programming_2026_common import NativeParameterBinding2026
+
+        for contact, expected in (("CAN", 1), ("P5-Unified", 0)):
+            with self.subTest(contact=contact):
+                engine, controller, session = self.shell("prepare", contact=contact)
+                binding = Mock(spec=NativeParameterBinding2026)
+                binding.operation = "prepare"
+                binding.require_control_versions = Mock()
+                session.selected_binding2026.return_value = binding
+                session.executed_binding2026 = Mock(return_value=binding)
+                report = {"native_return": True, "state": "prepare_completed"}
+                with (
+                    patch.object(controller, "run_bound_export", return_value=report),
+                    patch.object(
+                        controller, "_load_parameter_pool", return_value=binding
+                    ),
+                ):
+                    result = controller.execute(engine, session)
+                self.assertEqual(result["native_phase"], 1)
+                self.assertFalse(result["programming_completed"])
+                self.assertEqual(result["exports"], (report,))
+                self.assertEqual(
+                    engine._worker.finish_classic_prepare.call_count, expected
+                )
+
+    def test_write_success_clears_and_failed_export_uses_retry_loop(self):
+        from unittest.mock import Mock, patch
+
+        from scripts.programming_2026_common import NativeParameterBinding2026
+
+        engine, controller, session = self.shell("write")
+        binding = Mock(spec=NativeParameterBinding2026)
+        binding.operation = "write"
+        binding.require_control_versions = Mock()
+        session.selected_binding2026.return_value = binding
+        session.executed_binding2026 = Mock(return_value=binding)
+        with (
+            patch.object(
+                controller,
+                "run_bound_export",
+                return_value={"native_return": True, "state": "write_completed"},
+            ),
+            patch.object(controller, "_load_parameter_pool", return_value=binding),
+        ):
+            controller.execute(engine, session)
+        engine._worker.clear_post_write_state.assert_called_once_with()
+
+        engine, controller, session = self.shell("write")
+        session.selected_binding2026.return_value = binding
+        session.executed_binding2026 = Mock(return_value=binding)
+        retry = {"native_return": True, "state": "prepare_retry_completed"}
+        with (
+            patch.object(
+                controller,
+                "run_bound_export",
+                return_value={"native_return": False, "state": "write_failed"},
+            ),
+            patch.object(controller, "_load_parameter_pool", return_value=binding),
+            patch.object(
+                controller,
+                "retry_failed_write",
+                return_value={"exports": (retry,), "retry_decision": False},
+            ) as retry_call,
+        ):
+            result = controller.execute(engine, session)
+        retry_call.assert_called_once_with(engine, session)
+        self.assertEqual(
+            result["exports"],
+            ({"native_return": False, "state": "write_failed"}, retry),
+        )
+        self.assertEqual(result["retry_decision"], False)
+        engine._worker.clear_post_write_state.assert_not_called()
+
+    def test_recovery_and_probe_use_their_post_write_consumers(self):
+        from unittest.mock import Mock, patch
+
+        from scripts.programming_2026_common import NativeParameterBinding2026
+
+        engine, controller, session = self.shell("recovery")
+        binding = Mock(spec=NativeParameterBinding2026)
+        binding.operation = "write"
+        binding.require_control_versions = Mock()
+        session.selected_binding2026.return_value = binding
+        session.executed_binding2026 = Mock(return_value=binding)
+        with (
+            patch.object(
+                controller,
+                "run_bound_export",
+                return_value={
+                    "native_return": True,
+                    "state": "prepare_retry_completed",
+                },
+            ),
+            patch.object(controller, "_load_parameter_pool", return_value=binding),
+        ):
+            controller.execute(engine, session)
+        engine._worker.clear_post_write_state.assert_called_once_with()
+
+        engine, controller, session = self.shell("probe")
+        session.selected_binding2026.return_value = binding
+        session.executed_binding2026 = Mock(return_value=binding)
+        with (
+            patch.object(
+                controller,
+                "run_bound_export",
+                return_value={"native_return": True, "state": "probe_completed"},
+            ),
+            patch.object(controller, "_load_parameter_pool", return_value=binding),
+        ):
+            controller.execute(engine, session)
+        engine._worker.finish_recovery_probe.assert_called_once_with(controller)
+
+    def test_get_cid_and_gateway_dispatch_without_writer_hooks(self):
+        from unittest.mock import Mock, patch
+
+        engine, controller, session = self.shell("get_cid")
+        getter = {"native_return": True, "identifiers": (b"authored",)}
+        with (
+            patch.object(controller, "receive_cids", return_value=getter) as receive,
+            patch.object(controller, "_load_parameter_pool") as load,
+        ):
+            result = controller.execute(engine, session)
+        receive.assert_called_once_with(engine, session)
+        load.assert_not_called()
+        self.assertEqual(result["native_phase"], 0)
+        self.assertEqual(result["exports"], (getter,))
+
+        engine, controller, session = self.shell("change_gateway")
+        from scripts.programming_2026_common import NativeParameterBinding2026
+
+        binding = Mock(spec=NativeParameterBinding2026)
+        binding.operation = "change_gateway"
+        binding.require_control_versions = Mock()
+        session.selected_binding2026.return_value = binding
+        session.executed_binding2026 = Mock(return_value=binding)
+        gateway = {"native_return": True, "state": "gateway_completed"}
+        with (
+            patch.object(controller, "run_bound_export", return_value=gateway),
+            patch.object(controller, "_load_parameter_pool", return_value=binding),
+        ):
+            result = controller.execute(engine, session)
+        self.assertEqual(result["native_phase"], 3)
+        engine._worker.clear_post_write_state.assert_not_called()
+        engine._worker.finish_classic_prepare.assert_not_called()
+
+    def test_execute_rejects_foreign_or_inactive_context_before_dispatch(self):
+        from unittest.mock import patch
+
+        engine, controller, session = self.shell("prepare")
+        with patch.object(controller, "_load_parameter_pool") as load:
+            engine._worker.controller = object()
+            with self.assertRaises(ValueError):
+                controller.execute(engine, session)
+            load.assert_not_called()
+
+        engine, controller, session = self.shell("prepare")
+        engine._controller_execution = None
+        with self.assertRaises(ValueError):
+            controller.execute(engine, session)
+
+        engine, controller, session = self.shell("prepare", worker_phase=2)
+        with self.assertRaises(ValueError):
+            controller.execute(engine, session)
+
+        engine, controller, session = self.shell("prepare")
+        session.used = True
+        with self.assertRaises(ValueError):
+            controller.execute(engine, session)
+
+        with self.assertRaises(TypeError):
+            controller.execute(object(), session)
+        with self.assertRaises(TypeError):
+            controller.execute(engine, object())
+
+    def test_execute_rejects_a_different_executed_parameter_row(self):
+        from unittest.mock import Mock, patch
+
+        from scripts.programming_2026_common import NativeParameterBinding2026
+
+        engine, controller, session = self.shell("prepare")
+        binding = Mock(spec=NativeParameterBinding2026)
+        binding.operation = "prepare"
+        binding.require_control_versions = Mock()
+        session.selected_binding2026.return_value = binding
+        session.executed_binding2026 = Mock(return_value=object())
+        with (
+            patch.object(
+                controller,
+                "run_bound_export",
+                return_value={"native_return": True},
+            ),
+            patch.object(controller, "_load_parameter_pool", return_value=binding),
+            self.assertRaises(ValueError),
+        ):
+            controller.execute(engine, session)
+
+    def test_parameter_pool_rejects_a_non_binding_selection(self):
+        from unittest.mock import Mock
+
+        engine, controller, session = self.shell("prepare")
+        session.selected_binding2026.return_value = Mock()
+        with self.assertRaises(TypeError):
+            controller._load_parameter_pool(engine, session)
+
+    def test_parameter_pool_replaces_the_loaded_row_and_rejects_wrong_stage(self):
+        from unittest.mock import Mock
+
+        from scripts.programming_2026_common import NativeParameterBinding2026
+
+        engine, controller, session = self.shell("prepare")
+        prepare = Mock(spec=NativeParameterBinding2026)
+        prepare.operation = "prepare"
+        prepare.require_control_versions = Mock()
+        session.selected_binding2026.return_value = prepare
+        self.assertIs(controller._load_parameter_pool(engine, session), prepare)
+        self.assertEqual(controller._retained_parameter_pool, (prepare,))
+        self.assertIs(controller._parameter_session, session)
+        prepare.require_control_versions.assert_called_once_with()
+
+        write_session = object.__new__(type(session))
+        write_session.context = {"operation": "write"}
+        write_session.used = False
+        write_session.bind_controller2026 = Mock()
+        write_session.bind_engine2026 = Mock()
+        write = Mock(spec=NativeParameterBinding2026)
+        write.operation = "write"
+        write.require_control_versions = Mock()
+        write_session.selected_binding2026 = Mock(return_value=write)
+        controller._load_parameter_pool(engine, write_session)
+        self.assertEqual(controller._retained_parameter_pool, (write,))
+        self.assertIs(controller._parameter_session, write_session)
+
+        recovery = object.__new__(type(session))
+        recovery.context = {"operation": "recovery"}
+        recovery.used = False
+        recovery.bind_controller2026 = Mock()
+        recovery.bind_engine2026 = Mock()
+        recovery.selected_binding2026 = Mock(return_value=write)
+        controller._load_parameter_pool(engine, recovery)
+        self.assertEqual(controller._retained_parameter_pool, (write,))
+
+        wrong = Mock(spec=NativeParameterBinding2026)
+        wrong.operation = "prepare"
+        write_session.selected_binding2026 = Mock(return_value=wrong)
+        with self.assertRaises(ValueError):
+            controller._load_parameter_pool(engine, write_session)
+
+    def test_execute_imports_the_engine_view_and_exports_the_control_snapshot(self):
+        from unittest.mock import Mock, patch
+
+        from scripts.j2534_2026 import (
+            DriverMetadata2026,
+            J2534Device2026,
+            J2534InterfacePair2026,
+        )
+        from scripts.programming_2026_common import NativeParameterBinding2026
+        from tests.test_j2534_2026 import Provider
+
+        provider = Provider()
+        engine_view = J2534Device2026(provider, background_workers=False)
+        control_view = J2534Device2026(provider, background_workers=False)
+        pair = J2534InterfacePair2026(engine_view, control_view)
+        for view in (engine_view, control_view):
+            view.set_driver(DriverMetadata2026("authored", "fixture.dll"))
+        engine, controller, session = self.shell("prepare")
+        from scripts.programming_2026_common import NativeRuntime2026
+
+        controller.runtime = NativeRuntime2026(control_view.primitive)
+        engine._interface_pair = pair
+        binding = Mock(spec=NativeParameterBinding2026)
+        binding.operation = "prepare"
+        binding.require_control_versions = Mock()
+        session.selected_binding2026.return_value = binding
+        session.executed_binding2026 = Mock(return_value=binding)
+
+        def export(_engine, _session):
+            control_view.timeout = 321
+            return {"native_return": True, "state": "prepare_completed"}
+
+        with (
+            patch.object(controller, "_load_parameter_pool", return_value=binding),
+            patch.object(controller, "run_bound_export", side_effect=export),
+        ):
+            controller.execute(engine, session)
+        self.assertEqual(control_view.timeout, 321)
+        self.assertEqual(engine_view.timeout, 321)
 
 
 class OnlineSourceBindingTests(unittest.TestCase):

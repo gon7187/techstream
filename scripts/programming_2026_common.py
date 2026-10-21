@@ -3443,10 +3443,12 @@ class NativeEmptyControlParameter2026:
 
 
 class ControlCommPhase2026:
-    """Exact ControlCommPhase query/disconnect exports over one runtime device.
+    """Exact ControlCommPhase exports and one-phase Execute boundary.
 
-    The controller retains one explicit module-runtime address history. Execute
-    still needs the complete separately bound engine/family orchestration.
+    The controller retains one explicit module-runtime address history. Its
+    `execute` method dispatches one bound engine/session phase over the optional
+    interface pair and public parameter pool; the thread job owns the surrounding
+    orchestration and the outer host owns final shared-trace validation.
     """
 
     def __init__(self, identity: NativeModuleIdentity, runtime: NativeRuntime2026):
@@ -3631,6 +3633,161 @@ class ControlCommPhase2026:
         session.bind_controller2026(self)
         return engine.run_bound_phase(phase, session, self.runtime)
 
+    def _retain_parameter(self, session, binding) -> None:
+        """Retain the exact loaded row in the public one-entry pool.
+
+        The public binding currently exposes one selected CParameter row per
+        LoadParameter call. Keeping a tuple preserves the native array boundary
+        without inventing extra rows; native multi-row cardinality and source
+        review remain open. A later CPU or phase replaces the retained entry.
+        """
+        binding.require_control_versions()
+        self._retained_parameter_pool = (binding,)
+        self._parameter_session = session
+
+    def _load_parameter_pool(self, engine, session):
+        """Load the exact row consumed by this phase into the public pool.
+
+        The public Execute chronology selects the row before the family export.
+        The retained row is also the source for the constructor-empty fallback
+        check and must be the same immutable binding the replay executes.
+        """
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.programming_replay import ProgrammingReplay
+
+        if type(engine) is not CUWEngine2026 or type(session) is not ProgrammingReplay:
+            raise TypeError("Concrete native engine and programming replay required")
+        engine._require_owned_phase()
+        if engine.worker.controller is not self:
+            raise ValueError("Native parameter pool belongs to another controller")
+        expected = (
+            "write" if session.operation in ("recovery", "probe") else session.operation
+        )
+        if expected not in ("get_cid", "prepare", "write", "change_gateway"):
+            raise ValueError("Known actual native parameter stage required")
+        session.bind_controller2026(self)
+        session.bind_engine2026(engine)
+        binding = session.selected_binding2026()
+        if not isinstance(binding, NativeParameterBinding2026):
+            raise TypeError("Source-bound native2026 parameter selection required")
+        if binding.operation != expected:
+            raise ValueError("Loaded parameter row differs from the execute phase")
+        self._retain_parameter(session, binding)
+        return binding
+
+    def _begin_execute_pair(self, engine):
+        """Apply the source-issued engine→CONTROL ImportData view transition."""
+        pair = engine.interface_pair
+        if pair is None:
+            return None
+        if getattr(self.runtime._device_calls, "view", None) is not None:
+            raise ValueError("Execute cannot start in an engine wire view")
+        control = self.runtime_device()
+        if pair.control is not control:
+            raise ValueError("Actual paired native control interface required")
+        wire = pair.export_from(pair.engine)
+        pair.import_into(control, wire)
+        return pair, wire
+
+    @staticmethod
+    def _finish_execute_pair(pair_context) -> None:
+        """Return the control view's exact ExportData snapshot to the engine."""
+        if pair_context is None:
+            return
+        pair, wire = pair_context
+        returned = pair.export_from(pair.control, previous=wire)
+        pair.import_into(pair.engine, returned)
+
+    @staticmethod
+    def _execute_result(report, phase: int, exports, **extra) -> dict:
+        """Compose one b3e0 phase report without promoting native completion."""
+        return {
+            **report,
+            "native_phase": phase,
+            "exports": tuple(exports),
+            "programming_completed": False,
+            **extra,
+        }
+
+    def execute(self, engine, session) -> dict:
+        """Dispatch one actual b3e0 phase over the bound engine/control context.
+
+        The thread job reserves exactly one worker phase per invocation. This
+        method therefore dispatches the session's real export, the classic
+        prepare transition, the loaded-writer retry loop and the post-write
+        consumers. It never chains a second host phase or promotes completion.
+        """
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.programming_replay import ProgrammingReplay
+
+        if type(engine) is not CUWEngine2026 or type(session) is not ProgrammingReplay:
+            raise TypeError("Concrete native engine and programming replay required")
+        phases = {
+            "get_cid": 0,
+            "prepare": 1,
+            "write": 2,
+            "recovery": 2,
+            "probe": 2,
+            "change_gateway": 3,
+        }
+        phase = phases.get(session.operation)
+        if phase is None:
+            raise ValueError("Known actual native execute phase required")
+        engine._require_owned_phase()
+        if engine._controller_execution is not self:
+            raise ValueError("Execute requires its active controller execution")
+        worker = engine.worker
+        if worker.controller is not self:
+            raise ValueError("Execute belongs to another native worker")
+        expected_worker_phase = 1 if phase == 3 else phase
+        if engine.worker_phase != expected_worker_phase:
+            raise ValueError("Execute phase differs from the native worker phase")
+        if session.used:
+            raise ValueError("Unused native replay required for Execute")
+        session.bind_controller2026(self)
+        session.bind_engine2026(engine)
+        binding = None
+        if session.operation != "get_cid":
+            binding = self._load_parameter_pool(engine, session)
+
+        pair_context = self._begin_execute_pair(engine)
+        retry_decision = None
+        if session.operation == "get_cid":
+            report = self.receive_cids(engine, session)
+            exports = report.get("exports")
+            if not isinstance(exports, (tuple, list)):
+                exports = (report,)
+        else:
+            report = self.run_bound_export(engine, session)
+            exports = [report]
+            executed = session.executed_binding2026(engine=engine, controller=self)
+            if binding is None or executed != binding:
+                raise ValueError("Executed native row differs from the loaded pool")
+            if session.operation == "write" and report.get("native_return") is False:
+                retry = self.retry_failed_write(engine, session)
+                exports.extend(retry["exports"])
+                retry_decision = retry["retry_decision"]
+        self._finish_execute_pair(pair_context)
+
+        # Native8990 runs after the classic prepare export regardless of its
+        # callback Boolean. Modern P5/P6/Ethernet phases use their own transition.
+        if session.operation == "prepare" and engine.native_metadata.vehicle.get(
+            "contacttype", ""
+        ) not in ("P5-Unified", "Phase6", "Ethernet"):
+            worker.finish_classic_prepare()
+        elif (
+            session.operation in ("write", "recovery")
+            and report.get("native_return") is True
+        ):
+            worker.clear_post_write_state()
+        elif session.operation == "probe" and report.get("native_return") is True:
+            worker.finish_recovery_probe(self)
+
+        extra = {}
+        if retry_decision is not None:
+            extra["retry_decision"] = retry_decision
+        return self._execute_result(report, phase, exports, **extra)
+
     def retry_failed_write(self, engine, session) -> dict:
         """3b90's actual loaded-writer retry loop, retaining the original source row."""
         from scripts.calibration_2026 import native2026_cpu_file_list_flag
@@ -3716,6 +3873,7 @@ class ControlCommPhase2026:
             reports.append(report)
             if returned:
                 errors.record_native_error(None, 0, 0)
+                worker.clear_post_write_state()
                 break
             if not (parameter.boolean("FlagToNonSetEerrorKindConnect") or False):
                 worker.set_control_error_kind(5 if checkpoint else 3)
@@ -3790,18 +3948,17 @@ class ControlCommPhase2026:
         session.bind_controller2026(self)
         session.bind_engine2026(engine)
         primary = session.selected_binding2026()
-        self._retained_parameter_pool = (primary,)
-        self._parameter_session = session
-        primary.require_control_versions()
-        report = self.run_bound_export(engine, session)
+        self._retain_parameter(session, primary)
+        reports = [self.run_bound_export(engine, session)]
         self.alternate_cid_used = False
-        values = self._cid_vector(report)
+        values = self._cid_vector(reports[0])
         if not values:
             alternate = session.next_alternate_getter2026(primary)
             if alternate is not None:
-                alternate.selected_binding2026().require_control_versions()
-                report = self.run_bound_export(engine, alternate)
-                values = self._cid_vector(report)
+                alternate_binding = alternate.selected_binding2026()
+                self._retain_parameter(alternate, alternate_binding)
+                reports.append(self.run_bound_export(engine, alternate))
+                values = self._cid_vector(reports[-1])
                 if values:
                     self.alternate_cid_used = True
         engine.commit_received_identifiers(values, controller=self)
@@ -3809,10 +3966,11 @@ class ControlCommPhase2026:
         if engine.active:
             target_selection = engine.worker.mark_cid_reception_complete()
         return {
-            **report,
+            **reports[-1],
             "identifiers": values,
             "alternate_getter_used": self.alternate_cid_used,
             "target_selection_return": target_selection,
+            "exports": tuple(reports),
         }
 
     @staticmethod
@@ -3884,6 +4042,10 @@ class ControlCommPhase2026:
             raise ValueError("Native DH fallback module dependencies are not bound")
         if self._retained_parameter_pool:
             selection = self._retained_parameter_pool[0]
+            if not isinstance(selection, NativeParameterBinding2026):
+                raise TypeError("Actual loaded native parameter row required")
+            if selection.operation not in ("get_cid", "prepare", "write"):
+                raise ValueError("DH fallback requires a loaded writer/getter row")
             if selection.metadata != engine.native_metadata:
                 if selection.operation == "get_cid":
                     selection = selection.rebind_getter_metadata(engine.native_metadata)
