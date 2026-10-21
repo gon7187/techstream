@@ -1197,6 +1197,24 @@ class LifecycleTest(unittest.TestCase):
         self.assertIsNone(manager._thread)
         self.assertEqual(calls[-1], ("disconnect", 42))
 
+    def test_real_background_worker_paces_virtual_native_sleep(self):
+        manager, context, _calls = self.fixture()
+        self.assertEqual(manager.initialize(), 0)
+        steps = []
+
+        def step():
+            steps.append(time.monotonic())
+            return False
+
+        manager.worker_step = step
+        manager.keepalive(True)
+        time.sleep(0.30)
+        manager.keepalive(False)
+        self.assertGreaterEqual(len(steps), 1)
+        self.assertLessEqual(len(steps), 4)
+        self.assertGreaterEqual(len(context.native_sleeps), len(steps))
+        self.assertEqual(manager.finalize(), 0)
+
     def test_background_native_sleep_fault_remains_observable_on_restart(self):
         manager, context, calls = self.fixture()
         self.assertEqual(manager.initialize(), 0)

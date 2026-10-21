@@ -7,6 +7,7 @@ provided by the concrete communication module, never an initialization callback.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -50,6 +51,15 @@ from scripts.utility_ex_comm import (
     elapsed,
     unpack_uds_response,
 )
+
+
+def _paced_native_sleep(context: CommContext, stop: threading.Event) -> None:
+    """Keep the literal 120 ms worker cadence even with a virtual host clock."""
+    started = time.monotonic()
+    context.native_sleep(120)
+    remaining = 0.120 - (time.monotonic() - started)
+    if remaining > 0:
+        stop.wait(remaining)
 
 
 @dataclass
@@ -673,7 +683,7 @@ class UtilityExFixedLifecycle:
     def _run(self) -> None:
         try:
             while not self._stop.is_set():
-                self.context.native_sleep(120)
+                _paced_native_sleep(self.context, self._stop)
                 self.worker_step()
         except BaseException as error:  # noqa: BLE001 - expose worker failure to its owner
             self.worker_error = error
@@ -2831,7 +2841,7 @@ class UtilityExSISLifecycle:
     def _run(self) -> None:
         try:
             while not self._stop.is_set():
-                self.context.native_sleep(120)
+                _paced_native_sleep(self.context, self._stop)
                 self.worker_step()
         except BaseException as error:  # noqa: BLE001 - expose owned worker failure
             self.worker_error, self._worker_exit_status = error, 99
@@ -3091,7 +3101,7 @@ class UtilityExSelectedP5Worker:
         self.status, self.running, self._last_result = 15, True, 0
         try:
             while not self._stop.is_set():
-                self.context.native_sleep(120)
+                _paced_native_sleep(self.context, self._stop)
                 self.worker_step()
         except BaseException as error:  # noqa: BLE001 - expose worker failure to its owner
             self.error, self._last_result = error, 99
