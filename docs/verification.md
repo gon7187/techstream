@@ -163,6 +163,7 @@ route-gates 58/68/69 и мост 145→51 по-прежнему не запус�
 | `sh scripts/desktop-smoke.sh normal` | PASS |
 | `sh scripts/desktop-smoke.sh compact` | PASS |
 | `python -m scripts.offline_verify workflows` | `OFFLINE_WORKFLOWS_PASSED` |
+| GitHub Actions `39578033940` на `ec9db8d` | `static`, `desktop`, `core (3.11)`, `core (3.13)` и `public checkout and root gate` — PASS; оба core-прогона — 6 252 теста, 0 failures, 0 errors, 626 skipped |
 
 Что изменилось в публичной части:
 
