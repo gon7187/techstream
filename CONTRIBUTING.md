@@ -13,7 +13,7 @@ ruff format --check scripts tests techstream.py
 shellcheck techstream
 ```
 
-Install the desktop dependencies from [Getting started](docs/getting-started.md) for GUI changes, then run `./techstream --demo --smoke-test` and inspect the actual window. CI uses Xvfb for a display-independent smoke test. Keep fixtures synthetic and tests runnable from a clean checkout.
+Install the desktop dependencies from [Getting started](docs/getting-started.md) for GUI changes, then run `./techstream --demo --smoke-test` and inspect the actual window. For a headless check, use `sh scripts/desktop-smoke.sh`, also used by CI. Keep fixtures synthetic and tests runnable from a clean checkout.
 
 ## Pull requests
 
