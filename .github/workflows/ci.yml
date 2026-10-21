@@ -56,12 +56,12 @@ jobs:
     name: public checkout and root gate
     runs-on: ubuntu-24.04
     container:
-      image: ubuntu:24.04
+      image: python:3.12-slim
     steps:
       - name: Install the public runtime
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git python3
+          apt-get install -y --no-install-recommends ca-certificates git
       - uses: actions/checkout@v4
       - name: Reject private evidence in the published tree
         run: |
