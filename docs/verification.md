@@ -127,7 +127,7 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 
 | Проверка | Результат |
 | --- | --- |
-| `python -m unittest discover -s tests` | 6 240 тестов за 59,983 с; **0 failures, 0 errors**, 626 skipped |
+| `python -m unittest discover -s tests` | 6 243 теста за 57,273 с; **0 failures, 0 errors**, 626 skipped |
 | `ruff check scripts tests techstream.py` | PASS |
 | `ruff format --check scripts tests techstream.py` | 292 файла уже отформатированы |
 | `shellcheck techstream scripts/desktop-smoke.sh` | PASS |
@@ -141,6 +141,8 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 `read_private_bytes/text/json` используют тот же барьер. Это не масс-скип по
 исключению: каждый затронутый тест явно требует конкретный приватный артефакт, а
 новый `tests/test_private_evidence.py` проверяет и skip, и отказ для публичного
-пути. 626 skipped включают прежние авторские пропуски; ни один публичный failure
+пути. `EngineThreadRetryBridgeTests` дополнительно прогоняет реальный `_run_outer`
+моста 145→51: успешный `callback3` на outer-потоке, возврат ошибки в child и отказ
+не-child publisher. 626 skipped включают прежние авторские пропуски; ни один публичный failure
 или error не скрыт. Приватный source-issued oracle, native multi-row cardinality,
 route-gates 58/68/69 и мост 145→51 по-прежнему не запускались.
