@@ -624,7 +624,15 @@ class PacketA8Tests(unittest.TestCase):
                 )
             calls = []
 
-            def exchange(request, *, deadline, cancelled, calls=calls):
+            def exchange(
+                request,
+                *,
+                deadline,
+                cancelled,
+                calls=calls,
+                connection=connection,
+                response_key=response_key,
+            ):
                 wire, payload = decode_vim_command(request)
                 calls.append(wire)
                 if wire == DMCI_WIRE_COMMANDS[0x10D]:
@@ -665,7 +673,7 @@ class PacketA8Tests(unittest.TestCase):
                 capabilities=frozenset({"denso-vim-control", "denso-vim-dmci"}),
             )
 
-            def run():
+            def run(plan=plan, connection=connection, client=client):
                 return run_packet_a8_dmci(
                     plan,
                     connection,

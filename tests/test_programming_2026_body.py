@@ -2031,9 +2031,9 @@ class Body2026Tests(unittest.TestCase):
                         fault=fault,
                         on_unwind=unwind,
                     )
-                self.assertTrue(fired)
-                self.assertIs(caught.exception, original)
-                self.assertEqual(state, [(0, None)])
+                    self.assertTrue(fired)
+                    self.assertIs(caught.exception, original)
+                    self.assertEqual(state, [(0, None)])
 
     def test_public_writer_target_vector_selects_second_source_target_password(self):
         for module in (
