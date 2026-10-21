@@ -89,10 +89,11 @@ python -m unittest discover -s tests -v
 The smoke test opens the GUI, exercises workbench behavior, and exits with a failing status if an assertion fails. For a headless Linux development environment with Xvfb and a D-Bus session launcher installed:
 
 ```sh
-sh scripts/desktop-smoke.sh
+sh scripts/desktop-smoke.sh normal
+sh scripts/desktop-smoke.sh compact
 ```
 
-The headless runner uses X11 and temporary runtime, configuration, cache and data directories. Its private D-Bus session uses the GTK portal backend, so it cannot activate a second Hyprland portal or replace the desktop document-portal mount. Avoid running a private `dbus-run-session` against your desktop's existing `XDG_RUNTIME_DIR`.
+The `normal` variant renders the wide layout on a 1600×1200 screen. The `compact` variant renders the same flow in the collapsed narrow layout, asserts the collapsed breakpoint and the menu button, and repeats the same procedure, error, cancellation and export checks. The headless runner uses X11 and temporary runtime, configuration, cache and data directories. Its private D-Bus session uses the GTK portal backend, so it cannot activate a second Hyprland portal or replace the desktop document-portal mount. Avoid running a private `dbus-run-session` against your desktop's existing `XDG_RUNTIME_DIR`.
 
 This checks the rendered demo interface and synthetic data paths. It does not validate USB, an ECU or road use.
 
