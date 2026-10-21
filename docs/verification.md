@@ -156,7 +156,7 @@ route-gates 58/68/69 и мост 145→51 по-прежнему не запус�
 
 | Проверка | Результат |
 | --- | --- |
-| `python -m unittest discover -s tests` | 6 252 теста; **0 failures, 0 errors**, 626 skipped |
+| `python -m unittest discover -s tests` | 6 253 теста; **0 failures, 0 errors**, 626 skipped |
 | `ruff check scripts tests techstream.py` | PASS |
 | `ruff format --check scripts tests techstream.py` | PASS, 294 файла отформатированы |
 | `shellcheck techstream scripts/desktop-smoke.sh` | PASS |
