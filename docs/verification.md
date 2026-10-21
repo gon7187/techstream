@@ -149,3 +149,47 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 подтверждён. 626 skipped включают прежние авторские пропуски; ни один публичный failure
 или error не скрыт. Приватный source-issued oracle, native multi-row cardinality,
 route-gates 58/68/69 и мост 145→51 по-прежнему не запускались.
+
+### После normal/compact GTK и нативных utility-сценариев
+
+Публичный прогон на ветке `offline-completion-20261020`, без приватного корпуса:
+
+| Проверка | Результат |
+| --- | --- |
+| `python -m unittest discover -s tests` | 6 252 теста; **0 failures, 0 errors**, 626 skipped |
+| `ruff check scripts tests techstream.py` | PASS |
+| `ruff format --check scripts tests techstream.py` | PASS, 294 файла отформатированы |
+| `shellcheck techstream scripts/desktop-smoke.sh` | PASS |
+| `sh scripts/desktop-smoke.sh normal` | PASS |
+| `sh scripts/desktop-smoke.sh compact` | PASS |
+| `python -m scripts.offline_verify workflows` | `OFFLINE_WORKFLOWS_PASSED` |
+
+Что изменилось в публичной части:
+
+- `scripts/desktop-smoke.sh` принимает вариант `normal|compact`. `normal`
+  поднимает Xvfb 1600×1200 и рендерит широкий layout; `compact` — 1024×768 и
+  запускает тот же поток в свёрнутом layout, где smoke дополнительно проверяет
+  сработавший breakpoint, свёрнутый split и кнопку меню. Неизвестный вариант
+  отвергается с кодом 2 до запуска рабочего стола.
+- `techstream.py --smoke-compact` (только вместе с `--smoke-test`) задаёт узкое
+  окно 900×700; без него приложение сохраняет прежний размер 1340×820.
+- Новый публичный модуль `scripts/utility_authored.py` собирает настоящие
+  контроллеры DCM45/BSM27 по авторским байтам и внедрённому провайдеру. Он
+  намеренно обходит проверку source-issued пары caller/engine и никогда не
+  обслуживает production-процедуру: `scripts.utility.open_native_utility`
+  сохраняет эту проверку, а `tests/test_utility_authored.py` фиксирует, что
+  авторская пара не проходит production-путь.
+- Smoke прогоняет DCM45 через настоящий GTK-диалог: успешный бизнес-этап с
+  исходным результатом 0 и выводом получателя, native-предупреждение 2005 с
+  экраном 0x948c/0x9492, отмену с присоединением рабочего потока и закрытием по
+  `acknowledge`; затем BSM27 с исходным отказом зонда 99 и общим экраном ошибки.
+  `scripts/text_resources.create_utility_group_text_examples` публикует
+  авторские подписи выбранной native-группы и общей группы 20000.
+
+Границы: этот GTK-сценарий подтверждает только публичный контракт — реальный
+диалог, реальный контроллер, реальный рабочий поток и авторский провайдер.
+CGW-prelude DCM45, raw-SDK хронология, полный BSM-цикл записи и физическое
+поведение ЭБУ по-прежнему не подтверждены. CI получил job `public-root`:
+свежий checkout в контейнере под root без приватного корпуса, запрет
+публикации `analysis/`, `artifacts/`, `.unlazy/` и `runtime/no-car-*`, полный
+прогон тестов и offline workflows.
