@@ -162,14 +162,19 @@ class AuthoredNativeUtility:
         if self.closed:
             return
         self.closed = True
-        worker = self.runtime.libraries.engine.worker
-        if worker._thread is not None:
-            self.runtime.cancel()
-        if self._previous_source is None:
-            self._sources.pop(self._digest, None)
-        else:
-            self._sources[self._digest] = self._previous_source
-        self._body_module.SHA_18_TY = self._previous_body_sha
+        try:
+            worker = self.runtime.libraries.engine.worker
+            if worker._thread is not None:
+                if self.runtime.done:
+                    worker.stop()
+                else:
+                    self.runtime.cancel()
+        finally:
+            if self._previous_source is None:
+                self._sources.pop(self._digest, None)
+            else:
+                self._sources[self._digest] = self._previous_source
+            self._body_module.SHA_18_TY = self._previous_body_sha
 
     def __enter__(self) -> Self:
         return self

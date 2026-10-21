@@ -82,6 +82,16 @@ class AuthoredNativeUtilityTests(unittest.TestCase):
         self.assertEqual(utility_ex_ty_body.SHA_18_TY, previous_body)
         self.assertIsNone(runtime.libraries.engine.worker._thread)
 
+    def test_close_after_acknowledgement_is_safe(self):
+        fixture = AuthoredNativeUtility(dcm_value=0)
+        runtime = fixture.runtime
+        runtime.start(0x13723)
+        runtime.progress(1000)
+        runtime.key("acknowledge")
+        self.assertTrue(runtime.done)
+        fixture.close()
+        self.assertIsNone(runtime.libraries.engine.worker._thread)
+
     def test_authored_pair_is_not_a_production_source_pair(self):
         from scripts.utility import open_native_utility
 
