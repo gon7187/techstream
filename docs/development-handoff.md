@@ -79,6 +79,6 @@
 - Пул параметров обновляется фактически исполненной строкой, включая alternate getter; `gateway_startup_fallback` проверяет тип и стадию первой строки; execute сверяет исполненную строку с загруженной.
 - Добавлены `ControllerExecuteTests`: classic/modern prepare, write success/retry, recovery/probe, get_cid/change_gateway, foreign context, pool replacement/stage mismatch и фактическая pair chronology.
 
-Проверка: **6 237 тестов, 0 failures, 117 errors, 529 skipped**; все 117 errors — отсутствующие приватные `analysis/evidence/no-car-*` и `artifacts/extracted/*`. Ruff, format, ShellCheck, offline workflows и GTK smoke проходят.
+Проверка: **6 237 тестов, 0 failures, 117 errors, 529 skipped**; все 117 errors — отсутствующие приватные `analysis/evidence/no-car-*` и `artifacts/extracted/*`. Ruff, format, ShellCheck, offline workflows и GTK smoke проходят. CI `39564815857` на `9b7deeb`: `static` и `desktop` PASS; оба `core` падают только на тех же 117 private-evidence errors, без failures.
 
 Границы: это публичный one-phase контракт, а не полный native oracle. Оригинальный execute/context, native multi-row cardinality и независимый consumer review не запускались; 117 private-evidence errors оставлены жёсткими.

@@ -102,5 +102,6 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 | `shellcheck techstream scripts/desktop-smoke.sh` | PASS |
 | `python -m scripts.offline_verify workflows` | `OFFLINE_WORKFLOWS_PASSED` |
 | GTK smoke через `sh scripts/desktop-smoke.sh` | PASS |
+| GitHub Actions `39564815857` на `9b7deeb` | `static` и `desktop` PASS; `core (3.11)`/`core (3.13)` — 6 237 тестов, 0 failures, 117 errors, 529 skipped |
 
 117 errors — те же отсутствующие приватные `analysis/evidence/no-car-*` и `artifacts/extracted/*`. Авторские `ControllerExecuteTests` покрывают one-phase dispatch, classic/modern prepare, write retry, recovery/probe, pool replacement и фактическую pair chronology. Это не source-issued native oracle: оригинальный execute/context, native multi-row cardinality и независимый consumer review не запускались.
