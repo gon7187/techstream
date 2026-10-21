@@ -38,6 +38,7 @@ from scripts.utility_ex import (
     UtilitySISDriverBinding,
     UtilityWorker,
 )
+from tests.private_evidence import require_private
 
 
 class Host:
@@ -715,6 +716,7 @@ class NativeWrapperTests(unittest.TestCase):
     def test_nk96_any_mode_and_ordered_byte_constant_store_schema(self):
         from scripts import utility_ex as kernel
 
+        require_private("runtime/no-car-83")
         helpers = runpy.run_path("runtime/no-car-83/bind_wrapper_packets.py")
         mode = helpers["nk96_mode"]
         store_index = helpers["nk96_store_index"]
@@ -1075,12 +1077,13 @@ class NativeWrapperTests(unittest.TestCase):
                     engine.invoke(export, (4,))
 
     def test_native_str_after_copies_output_pointers_before_mode_rejection(self):
+        root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-83")
         engine = self.engine()
         first, second = bytearray(4), bytearray(4)
         packet = json.loads(
             (
-                Path(__file__).resolve().parents[1]
-                / "analysis/evidence/no-car-83/nk-owner95-wrapper-import.json"
+                root / "analysis/evidence/no-car-83/nk-owner95-wrapper-import.json"
             ).read_text()
         )
         for row in packet["rows"]:
@@ -1111,6 +1114,7 @@ class NativeWrapperTests(unittest.TestCase):
     def test_str_permuted_and_zero_wrapper_stores_precede_mode_guard(self):
         engine = self.engine()
         root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-83")
         packet = json.loads(
             (
                 root / "analysis/evidence/no-car-83/nk-owner95-wrapper-import.json"
@@ -1139,6 +1143,7 @@ class NativeWrapperTests(unittest.TestCase):
 
     def test_smrt41_conditional_pointer_globals_precede_mode_guard(self):
         root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-83")
         packet = json.loads(
             (
                 root / "analysis/evidence/no-car-83/nk-owner96-wrapper-import.json"
@@ -1203,6 +1208,7 @@ class NativeWrapperTests(unittest.TestCase):
 class SuppliedSourceTests(unittest.TestCase):
     def test_sol_admitted_str52_exact16_wrapper_metadata(self):
         root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-95")
         packet_path = root / "analysis/evidence/no-car-95/str52-wrapper-packet.json"
         verdict_path = (
             root / "analysis/evidence/no-car-95/sol-review/component-verdict.json"
@@ -1248,6 +1254,7 @@ class SuppliedSourceTests(unittest.TestCase):
 
     def test_sol_admitted_abs52_exact_plus_wrapper_rows(self):
         root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-102")
         packet_path = root / "analysis/evidence/no-car-102/reviewed-wrapper-packet.json"
         review_path = root / "analysis/evidence/no-car-102/sol-review/abs52-review.json"
         packet = json.loads(packet_path.read_text())
@@ -1288,6 +1295,7 @@ class SuppliedSourceTests(unittest.TestCase):
 
     def test_sol_admitted_smrt55_exact21_metadata_and_all_anchors(self):
         root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-96")
         packet_path = root / "analysis/evidence/no-car-96/smrt55-wrapper-candidate.json"
         verdict_path = (
             root
@@ -1461,6 +1469,7 @@ class SuppliedSourceTests(unittest.TestCase):
 
     def test_all8_generic_timer_export_abi_and_shared_native_status(self):
         root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-83")
         packet = json.loads(
             (
                 root / "analysis/evidence/no-car-83/all8-timer-export-source.json"
@@ -1630,6 +1639,7 @@ class SuppliedSourceTests(unittest.TestCase):
 
     def test_all8_standard_driver_literal_tables_and_each_missing_symbol(self):
         root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-83")
         packet = json.loads(
             (
                 root / "analysis/evidence/no-car-83/driver-constructors-all8.json"
@@ -1923,6 +1933,7 @@ class SuppliedSourceTests(unittest.TestCase):
 
     def plus_context(self, source):
         root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-83")
         queue = json.loads(
             (root / "analysis/evidence/no-car-83/source-queue.json").read_text()
         )
@@ -1933,6 +1944,7 @@ class SuppliedSourceTests(unittest.TestCase):
 
     def test_typlus_sis_tables_and_controller_metadata(self):
         root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-83")
         contract = json.loads(
             (
                 root / "analysis/evidence/no-car-83/plus-driver-binding-contract.json"
@@ -2141,6 +2153,7 @@ class SuppliedSourceTests(unittest.TestCase):
 
     def test_actual_ms2_pressure_direct_all_modes_and_zero_argument_workers(self):
         root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-83")
         packet = json.loads(
             (
                 root / "analysis/evidence/no-car-83/ty-owner118-wrapper-import.json"
@@ -2259,6 +2272,9 @@ class SuppliedSourceTests(unittest.TestCase):
 
     def test_nk_full_export_ownership_preserves_every_original_slot(self):
         root = Path(__file__).resolve().parents[1]
+        require_private(
+            root / "analysis/evidence/no-car-83", root / "runtime/no-car-83"
+        )
         ledger = json.loads(
             (
                 root / "analysis/evidence/no-car-83/nk-full-export-ownership.json"
@@ -2291,6 +2307,9 @@ class SuppliedSourceTests(unittest.TestCase):
 
     def test_four_large_ty18_pointer_imports_preserve_live_argument_identity(self):
         root = Path(__file__).resolve().parents[1]
+        require_private(
+            root / "analysis/evidence/no-car-142", root / "analysis/evidence/no-car-83"
+        )
         packet = json.loads(
             (
                 root

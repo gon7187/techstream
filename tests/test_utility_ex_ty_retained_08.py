@@ -29,6 +29,7 @@ from scripts.utility_ex_ty_retained_08 import (
     run_body,
     supported_exports,
 )
+from tests.private_evidence import require_private
 
 
 class Comm:
@@ -131,6 +132,7 @@ def plus_context(comm):
     path = Path(
         "artifacts/extracted/gtsplus-application/Setup_PF/GTSPlus/bin/UtilityEx2TY.dll"
     )
+    require_private(path)
 
     class Host:
         elapsed = 0
@@ -397,6 +399,7 @@ class RetainedTests(unittest.TestCase):
             def get_parameter(self, key):
                 return 0
 
+        require_private("analysis/evidence/no-car-127/wrapper-import-packet.json")
         rows = json.loads(
             Path("analysis/evidence/no-car-127/wrapper-import-packet.json").read_text()
         )["rows"]

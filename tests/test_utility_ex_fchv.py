@@ -19,6 +19,7 @@ from scripts.utility_ex_fchv import (
 from scripts.utility_ex_ty import TYSourceError
 from scripts.utility_ex_ty import run_body as ty_run_body
 from scripts.utility_ex_ty import supported_exports as ty_supported_exports
+from tests.private_evidence import require_private
 
 
 class Context:
@@ -628,6 +629,9 @@ class ValuesTests(unittest.TestCase):
         self.assertEqual(ctx.events, [])
 
     def test_typed_values_reach_the_actual_ty_dispatcher(self):
+        require_private(
+            "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityEx2TY.dll"
+        )
         path = Path(
             "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityEx2TY.dll"
         )
@@ -643,6 +647,7 @@ class ValuesTests(unittest.TestCase):
             SHA_18_TY: "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityEx2TY.dll",
             SHA_PLUS_TY: "artifacts/extracted/gtsplus-application/Setup_PF/GTSPlus/bin/UtilityEx2TY.dll",
         }
+        require_private(*sources.values())
         for sha, path in sources.items():
             ctx = Context(
                 sha, [(0, b"\x6f\x28\x0c\x03\0\0"), (0, b"\x62\x1b\x94\x01\x01")]

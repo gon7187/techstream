@@ -19,6 +19,7 @@ from scripts.cuw_legacy_recovery import (
     write_recovery_file,
 )
 from scripts.programming import inspect_recovery_info
+from tests.private_evidence import read_private_text
 from tests.test_cuw_legacy_engine import imported_context
 
 
@@ -80,10 +81,10 @@ class RecoveryCodecTests(unittest.TestCase):
 
     def test_field_order_matches_version_specific_static_initializer(self):
         evidence = json.loads(
-            (
+            read_private_text(
                 Path(__file__).resolve().parents[1]
                 / "analysis/evidence/no-car-112/source-map.json"
-            ).read_text()
+            )
         )
         for build in (12, 18):
             names = [

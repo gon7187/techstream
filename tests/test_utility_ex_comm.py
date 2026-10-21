@@ -56,6 +56,11 @@ from scripts.utility_ex_comm import (
     unpack_p6_response,
     unpack_uds_response,
 )
+from tests.private_evidence import require_private
+
+
+def _require_comm_queue():
+    require_private("analysis/evidence/no-car-83/source-queue.json")
 
 
 class Context:
@@ -594,6 +599,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
                 comm.configure("native_rva:17320", value)
 
     def test_all_source_global_busy_setters_feed_shared_scheduler_fields(self):
+        _require_comm_queue()
         rows = json.loads(
             Path("analysis/evidence/no-car-83/source-queue.json").read_text()
         )
@@ -627,6 +633,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
                     self.assertEqual(scheduler.fields.busy_interval_ms, 500)
 
     def test_exact_native_counter_getters_are_different_for_all_nk_sources(self):
+        _require_comm_queue()
         rows = json.loads(
             Path("analysis/evidence/no-car-83/source-queue.json").read_text()
         )
@@ -877,6 +884,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
         self.assertEqual(context.state["native_global:1015185c"], 0)
 
     def test_all_nk_short_cleanup_setters_change_concrete_fixed_scheduler(self):
+        _require_comm_queue()
         rows = json.loads(
             Path("analysis/evidence/no-car-83/source-queue.json").read_text()
         )
@@ -1250,6 +1258,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
         self.assertEqual(pending.interrupt(100), 0)
 
     def test_all_nk_selected_override_and_profile_are_literal_global_setters(self):
+        _require_comm_queue()
         cases = (
             (SHA_12_NK, 0xF830, 0xF840, 0x100EA9A8, 0x100EA9D0),
             (SHA_18_NK, 0x170A0, 0x170B0, 0x10151858, 0x10151880),
@@ -1279,6 +1288,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
     def test_support_length_all_nk_sources_requires_current_object_and_exact_kind_codec(
         self,
     ):
+        _require_comm_queue()
         rows = json.loads(
             Path("analysis/evidence/no-car-83/source-queue.json").read_text()
         )
@@ -1523,6 +1533,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
         )
 
     def test_actual_modern_fixed_facades_run_source_specific_driver_and_cleanup(self):
+        _require_comm_queue()
         queue = json.loads(
             Path("analysis/evidence/no-car-83/source-queue.json").read_text()
         )
@@ -1540,6 +1551,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
                 self._assert_actual_fixed_facade(source["input_path"], selector)
 
     def test_actual_plus_mode74_uses_source_response_address_delta16(self):
+        _require_comm_queue()
         queue = json.loads(
             Path("analysis/evidence/no-car-83/source-queue.json").read_text()
         )
@@ -1554,6 +1566,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
                 )
 
     def test_actual_12_fixed_facades_use_older_native_lower_layout(self):
+        _require_comm_queue()
         queue = json.loads(
             Path("analysis/evidence/no-car-83/source-queue.json").read_text()
         )
@@ -1566,6 +1579,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
                 self._assert_actual_fixed_facade(source["input_path"], selector)
 
     def test_actual_all8_fixed_extended_and_oem_source_branches(self):
+        _require_comm_queue()
         queue = json.loads(
             Path("analysis/evidence/no-car-83/source-queue.json").read_text()
         )
@@ -1587,6 +1601,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
                     )
 
     def test_actual_all8_direct_driver_uses_each_standard_constructor(self):
+        _require_comm_queue()
         from scripts.utility_ex import _DRIVER_SLOTS
 
         queue = json.loads(
@@ -1657,6 +1672,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
     def test_actual_broadcast_facade_keeps_functional_wire_and_physical_response_separate(
         self,
     ):
+        _require_comm_queue()
         from scripts.utility_ex_comm import _FIXED_OBJECTS
 
         rows = json.loads(
@@ -1901,6 +1917,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
     def test_actual_original_context_selected_p3_runs_all8_native_globals(
         self,
     ):
+        _require_comm_queue()
         from scripts.utility_ex import _DRIVER_SLOTS
 
         queue = json.loads(
@@ -1988,6 +2005,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
                 self.assertEqual(calls[-1], ("disconnect", 74))
 
     def test_actual_nk18_selected_legacy_p4_uses_distinct_lower_and_iso_wire(self):
+        _require_comm_queue()
         from scripts.utility_ex import _DRIVER_SLOTS
         from scripts.utility_ex_lifecycle import UtilityExLegacyP4Lower
 
@@ -2657,6 +2675,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
         self.assertEqual(context.state["native_global:1011f768"], 0)
 
     def test_selected_can_facade_joins_direct_sdk_and_shared_a8_cache(self):
+        _require_comm_queue()
         from scripts.utility_ex import _DRIVER_SLOTS
 
         queue = json.loads(
@@ -2795,6 +2814,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
         self.assertEqual(driver.finalize(), 0)
 
     def test_actual_all8_selected_classic_sil_and_extended_manager_matrix(self):
+        _require_comm_queue()
         from scripts.utility_ex import _DRIVER_SLOTS
 
         queue = json.loads(
@@ -2938,6 +2958,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
                     self.assertEqual(calls[-1], ("disconnect", 42))
 
     def test_actual_all8_selected_p3_derived_and_legacy_original_context_matrix(self):
+        _require_comm_queue()
         from scripts.utility_ex import _DRIVER_SLOTS
         from scripts.utility_ex_lifecycle import UtilityExByteArray
 
@@ -3436,6 +3457,7 @@ class UtilityExCommunicationTests(unittest.TestCase):
         self.assertEqual({call[1] for call in calls if call[0] == "close"}, {6, 0x8012})
 
     def test_actual_plus_p6_original_context_facade_and_cancel_safe_raw_sdk(self):
+        _require_comm_queue()
         from scripts.utility_ex import _P6_DRIVER_SLOTS
 
         rows = json.loads(

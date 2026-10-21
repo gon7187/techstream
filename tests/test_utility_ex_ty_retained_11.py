@@ -16,6 +16,7 @@ from scripts.utility_ex_ty_retained_11 import (
     run_body,
     supported_exports,
 )
+from tests.private_evidence import require_private
 from tests.test_utility_ex_fchv_actions import Context
 
 
@@ -600,6 +601,7 @@ class Retained11Tests(unittest.TestCase):
         from tests.test_utility_ex import Host
 
         root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-130")
         packet = json.loads(
             (
                 root / "analysis/evidence/no-car-130/reviewed-wrapper-packet.json"

@@ -108,6 +108,7 @@ from scripts.programming_2026_dh import (
     writable_write_software_id,
     write_software_id,
 )
+from tests.private_evidence import read_private_bytes, require_private
 
 
 def authored_general_source():
@@ -137,9 +138,11 @@ def bind_dh_parameter_fixture(
 
 
 def native_secret_client():
+    root = Path("runtime/no-car-21/recovered")
+    require_private(root)
     return SecretInfoClient.from_native_modules(
-        Path("runtime/no-car-21/recovered/SecretInfo.dll").read_bytes(),
-        Path("runtime/no-car-21/recovered/CUW.dll").read_bytes(),
+        read_private_bytes(root / "SecretInfo.dll"),
+        read_private_bytes(root / "CUW.dll"),
     )
 
 
@@ -156,12 +159,13 @@ def bind_authored_dh_online(test, runtime, seed, key, *, engine=None):
     from tests.test_cuw_online import capture, configuration, step
 
     root = Path("runtime/no-car-21/recovered")
+    require_private(root)
     if engine is None:
-        engine = CUWEngine2026((root / "CUW.dll").read_bytes())
+        engine = CUWEngine2026(read_private_bytes(root / "CUW.dll"))
         test.addCleanup(engine.close)
         engine.configure(struct.pack("<IIddII", 4, 0, 0, 0, 0, 0))
         engine.load_cuw(cuw(cpu_text()), region=2)
-    control_bytes = (root / "TCUWControlCommPhase.dll").read_bytes()
+    control_bytes = read_private_bytes(root / "TCUWControlCommPhase.dll")
     worker = engine._worker
     if worker is None:
         worker = engine.bind_worker(

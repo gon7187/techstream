@@ -80,6 +80,7 @@ from scripts.toyota_saved_ffd import (
     tss3_supported_ids,
 )
 from scripts.toyota_session import Cancelled, Limits, SessionError
+from tests.private_evidence import read_private_bytes
 
 
 def database(kind, sections):
@@ -187,7 +188,7 @@ def internal_image_profile(
         / "analysis/evidence/no-car-49/internal-consumer-fixture"
         / variant
     )
-    original = parse_database((base / "Toyota.ddb").read_bytes())
+    original = parse_database(read_private_bytes(base / "Toyota.ddb"))
     can = serialized_profile(
         version=build, request=b"\x21\x00", mask=b"", check=b""
     ).catalog.management

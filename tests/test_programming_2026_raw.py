@@ -10,6 +10,7 @@ from scripts.programming_2026_raw import (
     decode_software_info2026,
     run_software_info,
 )
+from tests.private_evidence import read_private_json
 
 
 class SoftwareInfoTests(unittest.TestCase):
@@ -1687,13 +1688,10 @@ class ReproPrepareTests(unittest.TestCase):
 
 class NativeExportAllocationTests(unittest.TestCase):
     def test_all_six_exports_match_original_2026_manifest(self):
-        import json
-        from pathlib import Path
-
         from scripts.programming_2026_raw import IMPLEMENTED_EXPORTS
 
-        rows = json.loads(
-            Path("analysis/evidence/no-car-29/owner-37-2026-exports.json").read_text()
+        rows = read_private_json(
+            "analysis/evidence/no-car-29/owner-37-2026-exports.json"
         )
         selected = {
             row["name"]: tuple(sorted(row["callable_exports"]))

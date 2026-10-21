@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from scripts import utility_ex_chassis as chassis
+from tests.private_evidence import require_private
 
 SYNTHETIC = b"authored chassis test identity, not an executable"
 SYNTHETIC_SHA = hashlib.sha256(SYNTHETIC).hexdigest()
@@ -1580,6 +1581,7 @@ class ChassisTests(unittest.TestCase):
         path = Path(
             "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityExNK2.dll"
         )
+        require_private(path)
 
         class Host:
             def __init__(self) -> None:
@@ -3245,6 +3247,7 @@ class ChassisTests(unittest.TestCase):
                 0x101BC9C8,
             ),
         )
+        require_private(*(path for path, _ in images))
         with patch.object(chassis, "NK18_SHA256", SHA_18_NK):
             for path, base in images:
                 with self.subTest(source=path):
@@ -3335,6 +3338,7 @@ class ChassisTests(unittest.TestCase):
                 "artifacts/extracted/gtsplus-application/Setup_PF/GTSPlus/bin/UtilityExNK2.dll",
             ),
         ]
+        require_private(*(path for _, _, path in sources))
         for constant, digest, path in sources:
             for family in (50, 63):
                 with (
@@ -3401,6 +3405,7 @@ class ChassisTests(unittest.TestCase):
                 "artifacts/extracted/gtsplus-application/Setup_PF/GTSPlus/bin/UtilityExNK2.dll",
             ),
         ]
+        require_private(*(path for _, _, path in sources))
         for constant, digest, path in sources:
             with self.subTest(source=constant), patch.object(chassis, constant, digest):
                 host = Mock()
@@ -3480,6 +3485,7 @@ class ChassisTests(unittest.TestCase):
                 "artifacts/extracted/gtsplus-application/Setup_PF/GTSPlus/bin/UtilityExNK2.dll",
             ),
         ]
+        require_private(*(path for _, _, path in sources))
         for constant, digest, path in sources:
             with self.subTest(source=constant), patch.object(chassis, constant, digest):
                 host = Mock()
@@ -3533,6 +3539,7 @@ class ChassisTests(unittest.TestCase):
                 "artifacts/extracted/gtsplus-application/Setup_PF/GTSPlus/bin/UtilityExNK2.dll",
             ),
         ]
+        require_private(*(path for _, _, path in sources))
         for constant, digest, path in sources:
             for selector in (4, 20):
                 with (
@@ -3588,6 +3595,7 @@ class ChassisTests(unittest.TestCase):
                 "artifacts/extracted/gtsplus-application/Setup_PF/GTSPlus/bin/UtilityExNK2.dll",
             ),
         ]
+        require_private(*(path for _, _, path in sources))
         for family in (46, 47):
             for constant, digest, path in sources:
                 with (
@@ -3631,6 +3639,7 @@ class ChassisTests(unittest.TestCase):
         path = Path(
             "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityExNK2.dll"
         )
+        require_private(path)
         host = Mock()
         host.get_parameter.side_effect = lambda key: 4 if key == 0x6F else 0
         host.ticks.return_value = 1000
@@ -4594,9 +4603,11 @@ class ChassisTests(unittest.TestCase):
             return 0
 
         with patch.object(chassis, "NK18_SHA256", SHA_18_NK):
-            image = Path(
+            image_path = Path(
                 "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityExNK2.dll"
-            ).read_bytes()
+            )
+            require_private(image_path)
+            image = image_path.read_bytes()
             context = UtilityExContext(image, host, None, None)
             engine = UtilityExEngine(context)
             with (

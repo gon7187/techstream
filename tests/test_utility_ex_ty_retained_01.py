@@ -14,6 +14,7 @@ from unittest.mock import patch
 from scripts import utility_ex_ty_retained_01 as retained
 from scripts.toyota_session import Cancelled
 from scripts.utility_ex_ty import SHA_12_TY, SHA_18_TY, SHA_PLUS_TY, TYSourceError
+from tests.private_evidence import require_private
 
 
 class Comm:
@@ -182,6 +183,7 @@ def invoke(export: str, context: Context, data: bytearray) -> int:
 
 class RetainedTests(unittest.TestCase):
     def test_exact_assigned_pairs_and_literal_positive_branches(self):
+        require_private("analysis/evidence/no-car-120/assigned-source-pairs.json")
         pairs = json.loads(
             Path("analysis/evidence/no-car-120/assigned-source-pairs.json").read_text()
         )["pairs"]
@@ -227,6 +229,7 @@ class RetainedTests(unittest.TestCase):
         from scripts.utility_ex_ty import run_body
         from tests.test_utility_ex import Host
 
+        require_private("analysis/evidence/no-car-83/source-queue.json")
         rows = json.loads(
             Path("analysis/evidence/no-car-83/source-queue.json").read_text()
         )

@@ -127,6 +127,7 @@ from scripts.utility_ex_ty_powertrain import (
     run_body,
     supported_exports,
 )
+from tests.private_evidence import require_private
 
 
 class Context:
@@ -604,6 +605,7 @@ class PowertrainTests(unittest.TestCase):
         path = Path(
             "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityEx2TY.dll"
         )
+        require_private(path)
         calls = []
         filters, incoming = iter(range(11, 99)), iter(replies)
 
@@ -3561,6 +3563,7 @@ class PowertrainTests(unittest.TestCase):
                 "artifacts/extracted/gtsplus-application/Setup_PF/GTSPlus/bin/UtilityEx2TY.dll",
             ),
         ):
+            require_private(path)
             image = Path(path).read_bytes()
             context = Context(source)
             context.module_bytes = image

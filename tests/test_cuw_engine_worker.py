@@ -24,6 +24,7 @@ from scripts.programming_2026_common import (
     NativeRuntime2026,
 )
 from scripts.programming_replay import load_programming_replay
+from tests.private_evidence import read_private_bytes
 from tests.test_calibration_2026 import cuw, srecord
 
 RUNTIME = Path("runtime/no-car-21/recovered")
@@ -128,7 +129,7 @@ class EngineWorker2026Tests(unittest.TestCase):
             encoded=False,
         )
         engine = CUWEngine2026(
-            (RUNTIME / "CUW.dll").read_bytes(),
+            read_private_bytes(RUNTIME / "CUW.dll"),
             persistence=persistence,
             general_parameters=general,
         )

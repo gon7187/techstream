@@ -16,6 +16,7 @@ from scripts.utility_ex_fchv_actions import (
     supported_exports,
 )
 from scripts.utility_ex_ty import TYComm, TYSourceError
+from tests.private_evidence import require_private
 
 
 class Context:
@@ -553,6 +554,9 @@ class ActionsTests(unittest.TestCase):
         from tests.test_utility_ex import Host
 
         host = Host()
+        require_private(
+            "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityEx2TY.dll"
+        )
         source = Path(
             "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityEx2TY.dll"
         ).read_bytes()
@@ -724,8 +728,11 @@ class ActionsTests(unittest.TestCase):
 
         source = Path(
             "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityEx2TY.dll"
-        ).read_bytes()
-        context = UtilityExContext(source, Host(), None, None, driver_exports=exports)
+        )
+        require_private(source)
+        context = UtilityExContext(
+            source.read_bytes(), Host(), None, None, driver_exports=exports
+        )
         engine = UtilityEx2TY(context)
         self.assertEqual(engine.invoke("Ex2FCHV_17_SendMessage", (block("17", 0),)), 15)
         worker = engine.worker._thread
@@ -764,6 +771,7 @@ class ActionsTests(unittest.TestCase):
             SHA_18_TY: "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityEx2TY.dll",
             SHA_PLUS_TY: "artifacts/extracted/gtsplus-application/Setup_PF/GTSPlus/bin/UtilityEx2TY.dll",
         }
+        require_private(*paths.values())
         for source, path in paths.items():
             ctx = Context(source)
             ctx.module_bytes = Path(path).read_bytes()
@@ -780,6 +788,7 @@ class ActionsTests(unittest.TestCase):
             SHA_18_TY: "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityEx2TY.dll",
             SHA_PLUS_TY: "artifacts/extracted/gtsplus-application/Setup_PF/GTSPlus/bin/UtilityEx2TY.dll",
         }
+        require_private(*paths.values())
         for source, path in paths.items():
             for mode in (20, 21):
                 for group, action, expected in (

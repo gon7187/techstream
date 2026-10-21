@@ -24,6 +24,7 @@ from scripts.programming_2026_common import (
 )
 from scripts.programming_replay import load_programming_replay
 from tests import test_cuw_gateway_startup as gateway_fixtures
+from tests.private_evidence import read_private_bytes, require_private
 from tests.test_calibration_2026 import cuw
 from tests.test_cuw_engine_worker import calibration, encoded_table, make_controller
 
@@ -124,26 +125,27 @@ class ThreadOwnershipTests(unittest.TestCase):
             "events": events,
         }
         images = Path("runtime/no-car-21/recovered")
+        require_private(images)
         session = load_programming_replay(
             source,
             json.dumps(context).encode(),
             catalog,
             {
-                name: (images / name).read_bytes(),
+                name: read_private_bytes(images / name),
                 **(
                     {
-                        "TCUWControlCommPhase.dll": (
+                        "TCUWControlCommPhase.dll": read_private_bytes(
                             images / "TCUWControlCommPhase.dll"
-                        ).read_bytes()
+                        )
                     }
                     if include_control
                     else {}
                 ),
                 **(
                     {
-                        "TCUWJ2534DeviceIF.dll": (
+                        "TCUWJ2534DeviceIF.dll": read_private_bytes(
                             images / "TCUWJ2534DeviceIF.dll"
-                        ).read_bytes()
+                        )
                     }
                     if recorded_driver
                     else {}
@@ -158,7 +160,7 @@ class ThreadOwnershipTests(unittest.TestCase):
             local_milliseconds_of_day=session.trace.native_local_milliseconds_of_day,
         )
         engine = CUWEngine2026(
-            (images / "CUW.dll").read_bytes(),
+            read_private_bytes(images / "CUW.dll"),
             general_parameters=NativeGeneralParameters2026.from_sources(catalog),
         )
         engine.configure(
