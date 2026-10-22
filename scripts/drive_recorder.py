@@ -5,6 +5,7 @@ from __future__ import annotations
 import configparser
 import math
 import struct
+import sys
 import time
 from _thread import LockType
 from collections import deque
@@ -1234,6 +1235,25 @@ class NativeVehicleSelection:
             lists[2],
             (trail1, trail2),
         )
+
+
+@dataclass(frozen=True)
+class NativeCategoryChoice:
+    value: int
+    label: str
+
+
+@dataclass(frozen=True)
+class NativeCategoryItem:
+    level: int
+    label: str
+    choices: tuple[NativeCategoryChoice, ...]
+
+
+@dataclass(frozen=True)
+class NativeCategoryMenu:
+    mode: int
+    items: tuple[NativeCategoryItem, ...]
 
 
 @dataclass(frozen=True)
@@ -5211,6 +5231,17 @@ class NativeVehicleSession:
         self.communication = communication
         self._vin_entries: list[NativeVehicleVinEntry] = []
         self._contexts: dict[tuple[int, int], NativeCommunication] = {}
+        self.shared_bus = 0xFF
+        self.shared_category = 0xFFFFFFFF
+        self.shared_protocol = 0xFF
+        self.shared_option = 0xFFFF
+        self.category_mode = 0
+        self.category_ids: list[tuple[int, int]] = []
+        self.option_groups: list[object] = []
+        self.current_model: int | None = None
+        self.model_list: list[int] = []
+        self.manual_identity: tuple[object, ...] | None = None
+        self.manual_parent_record: bytes | None = None
         self._closed = False
 
     def _check(self) -> None:
@@ -5227,6 +5258,17 @@ class NativeVehicleSession:
         """Release this CDataCtrl's embedded lists, independently of the adapter."""
         self._vin_entries.clear()
         self._contexts.clear()
+        self.category_ids.clear()
+        self.option_groups.clear()
+        self.model_list.clear()
+        self.shared_bus = 0xFF
+        self.shared_category = 0xFFFFFFFF
+        self.shared_protocol = 0xFF
+        self.shared_option = 0xFFFF
+        self.category_mode = 0
+        self.current_model = None
+        self.manual_identity = None
+        self.manual_parent_record = None
         self._closed = True
 
 
@@ -5310,6 +5352,62 @@ class NativeVehicleSelector:
         if self.communication is not None:
             self.communication._check()
 
+    def _manual_admit(self, *, bind: bool = False) -> tuple[bytes, ...]:
+        """Admit only the source-selected ordinary NA18 translation."""
+        from scripts.native_communication import NativeFrameController
+
+        self._check()
+        if (
+            self.owner.source_build != 18
+            or not isinstance(self.owner.operations, NativeFrameController)
+            or self.owner.operations.native_build != 18
+        ):
+            raise UnsupportedRecorderOperation(
+                "Manual categories require the admitted native18 controller"
+            )
+        rows = self.owner.profile.dll_records(0x7D)
+        if not rows or len(rows[0]) < 80:
+            raise UnsupportedRecorderOperation(
+                "Manual categories require the selected native18 provider row"
+            )
+        module = rows[0][:80].decode("utf-16le").split("\0", 1)[0]
+        if module != "SelectCarTypVn10_DT.dll":
+            raise UnsupportedRecorderOperation(
+                "Manual categories are admitted only for the NA18 provider"
+            )
+        identity = (
+            self.catalog,
+            self.catalog.management.sha256,
+            rows[0],
+            self.owner.profile.exception_ids,
+            self.owner.source_build,
+            self.owner.operations.native_build,
+        )
+        if self.session is not None and self.session.manual_identity is not None:
+            if self.session.manual_identity != identity:
+                raise UnsupportedRecorderOperation(
+                    "Manual category owner no longer matches its source catalog"
+                )
+        elif bind and self.session is not None:
+            self.session.manual_identity = identity
+        return rows
+
+    def _manual_owner(self) -> NativeVehicleSession:
+        if self.session is None:
+            self.session = NativeVehicleSession(self.owner)
+            self._contexts = self.session._contexts
+        self.session._check()
+        return self.session
+
+    def _consumer_cache_init(self) -> None:
+        if self.session is None:
+            return
+        self.session._check()
+        if self.session.current_model is None:
+            self.session.current_model = 0xFFFF
+        if not self.session.model_list:
+            self.session.model_list.append(0xFFFF)
+
     def _text(self, value: str) -> NativeCoreString:
         try:
             data = (value.split("\0", 1)[0] + "\0").encode(self.text_encoding)
@@ -5372,6 +5470,755 @@ class NativeVehicleSelector:
             return True
         name = rows[0][:18].decode("utf-16le").split("\0", 1)[0]
         return name in self.catalog.registered_sets
+
+    def _manual_key(
+        self,
+        category: int,
+        bus: int,
+        values: tuple[int, int, int, int],
+        *,
+        selected_fields: int,
+    ) -> VehicleContext:
+        key = bytearray(40)
+        struct.pack_into("<H", key, 2, category & 0xFFFF)
+        key[27] = bus
+        struct.pack_into("<H", key, 28, selected_fields)
+        key[30] = 1
+        struct.pack_into("<4H", key, 32, *values)
+        return VehicleContext.from_native_key(bytes(key))
+
+    def _manual_rows(self, context: VehicleContext) -> tuple[dict, ...]:
+        self._check()
+        section = self.catalog.management.sections.get(41)
+        if section is None:
+            raise NativeDrsError(0xA0030107)
+        if section.count > 100_000:
+            raise RecorderError("Native vehicle table exceeds entry budget")
+        if len(section.payload) != section.count * 52:
+            raise RecorderError("Malformed native DB129 vehicle table")
+        rows = self.catalog.raw_matching_vehicles(context)
+        if len(rows) > 100_000:
+            raise RecorderError("Too many native vehicle entries")
+        result = []
+        for row in rows:
+            self._check()
+            model, option = row["vehicle_name_key"], row["option_key"]
+            if model:
+                valid = self._registered(model)
+            else:
+                valid = self._valid_options(option, 1)[0]
+            if valid:
+                result.append(row)
+        if not result:
+            raise NativeDrsError(0xC0040101)
+        return tuple(result)
+
+    @staticmethod
+    def _manual_variant_sort(
+        rows: tuple[dict, ...], *, check: Callable[[], None] | None = None
+    ) -> list[dict]:
+        """The recovered variant-only shortsort/qsort, including unstable ties."""
+        values = list(rows)
+
+        def key(index: int) -> int:
+            return bytes.fromhex(values[index]["raw_hex"])[2]
+
+        if len(values) <= 8:
+            for high in range(len(values) - 1, 0, -1):
+                if check is not None:
+                    check()
+                maximum = 0
+                for index in range(1, high + 1):
+                    if check is not None:
+                        check()
+                    if key(index) > key(maximum):
+                        maximum = index
+                values[maximum], values[high] = values[high], values[maximum]
+            return values
+
+        stack: list[tuple[int, int]] = [(0, len(values) - 1)]
+        while stack:
+            if check is not None:
+                check()
+            low, high = stack.pop()
+            if high - low + 1 <= 8:
+                for end in range(high, low, -1):
+                    if check is not None:
+                        check()
+                    maximum = low
+                    for index in range(low + 1, end + 1):
+                        if check is not None:
+                            check()
+                        if key(index) > key(maximum):
+                            maximum = index
+                    values[maximum], values[end] = values[end], values[maximum]
+                continue
+            middle = low + (high - low + 1) // 2
+            values[low], values[middle] = values[middle], values[low]
+            pivot, i, j = key(low), low, high + 1
+            while True:
+                if check is not None:
+                    check()
+                i += 1
+                while i <= high and key(i) <= pivot:
+                    if check is not None:
+                        check()
+                    i += 1
+                j -= 1
+                while j > low and key(j) >= pivot:
+                    if check is not None:
+                        check()
+                    j -= 1
+                if i > j:
+                    break
+                values[i], values[j] = values[j], values[i]
+            values[low], values[j] = values[j], values[low]
+            left, right = (low, j - 1), (i, high)
+            if 4 * (j - low) - 1 < 4 * (high - i):
+                if right[0] < right[1]:
+                    stack.append(right)
+                if left[0] < left[1]:
+                    stack.append(left)
+            else:
+                if left[0] < left[1]:
+                    stack.append(left)
+                if right[0] < right[1]:
+                    stack.append(right)
+        return values
+
+    def _manual_null_send(self, communication: NativeCommunication) -> int:
+        """Run the native NULL SendInt through the already-bound real adapter."""
+        from scripts.native_communication import NativeFrameController
+
+        communication._primitive()
+        operations = communication.operations
+        if not isinstance(operations, NativeFrameController):
+            raise UnsupportedRecorderOperation(
+                "Manual protocol probes require the native frame controller"
+            )
+        try:
+            status = operations.send(
+                None,
+                timeout=1000,
+                initialization_mode=0,
+                clear_rx=1,
+                no_session=False,
+                deadline=communication.deadline,
+                profile=communication.profile,
+                bus_id=communication.bus_id,
+                first_request=communication._context_first_request,
+            )
+        finally:
+            communication._check(timeout_error=sys.exception())
+        if type(status) is not int or not 0 <= status <= 0xFFFFFFFF:
+            raise RecorderError("Native NULL SendInt returned malformed status")
+        return status
+
+    def _manual_protocol_context(self, category: int, bus: int) -> NativeCommunication:
+        communication = self._context(category, bus)
+        self._check()
+        return communication
+
+    def _except_hv(self) -> tuple[int, int, int, int]:
+        section = self.catalog.management.sections.get(2)
+        if section is None:
+            raise NativeDrsError(0xA0030107)
+        if section.count > 0x7FFF:
+            raise NativeDrsError(0xA0030110)
+        if len(section.payload) != section.count * 4:
+            raise RecorderError("Malformed native DB102 candidate table")
+        if section.count == 0:
+            raise NativeDrsError(0xC0040101)
+        for index in range(section.count):
+            self._check()
+            candidate = section.payload[index * 4 : index * 4 + 4]
+            category, bus = struct.unpack_from("<HB", candidate)
+            records = self.owner.profile.category_records(category)
+            if len(records) != 1:
+                raise NativeDrsError(0xC0040102)
+            protocol = records[0][72]
+            communication = self._manual_protocol_context(category, bus)
+            status = self._manual_null_send(communication)
+            if status == 0 and (category, bus) != (0x3C, 0x12):
+                return category, bus, protocol, index
+            if status != 0:
+                self.owner.connect_set(category, 0, bus, protocol)
+        return 0, 0, 0, 0
+
+    def _manual_probe_pair(self, rows: tuple[dict, ...]) -> tuple[int, int]:
+        ordered = self._manual_variant_sort(rows, check=self._check)
+        selected = (0, 0)
+        for row in ordered:
+            self._check()
+            category = word(bytes.fromhex(row["raw_hex"]), 0)
+            bus = bytes.fromhex(row["raw_hex"])[2]
+            records = self.owner.profile.category_records(category)
+            if len(records) != 1:
+                raise NativeDrsError(0xC0040102)
+            communication = self._manual_protocol_context(category, bus)
+            if self._manual_null_send(communication) == 0:
+                return category, bus
+            selected = category, bus
+        return selected
+
+    def select_categories(
+        self,
+        selected_ids: tuple[tuple[int, int], ...],
+        *,
+        bus_judge: int,
+    ) -> NativeCategoryMenu:
+        try:
+            return self._select_categories(selected_ids, bus_judge=bus_judge)
+        except ToyotaCodecError as error:
+            raise NativeDrsError(error.code) from error
+
+    def _select_categories(
+        self,
+        selected_ids: tuple[tuple[int, int], ...],
+        *,
+        bus_judge: int,
+    ) -> NativeCategoryMenu:
+        """Execute ordinary18 SelectCarCategory; state is retained on the session."""
+        if (
+            not isinstance(selected_ids, tuple)
+            or len(selected_ids) > 100_000
+            or any(
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or type(pair[0]) is not int
+                or not 0 <= pair[0] <= 0xFFFF
+                or type(pair[1]) is not int
+                or not 0 <= pair[1] <= 0xFFFF
+                for pair in selected_ids
+            )
+            or type(bus_judge) is not int
+            or not 0 <= bus_judge <= 0xFF
+        ):
+            raise RecorderError("Invalid native manual category request")
+        if any(level not in (1, 2, 3, 4) for level, _ in selected_ids):
+            raise NativeDrsError(0xC0040001)
+        session = self._manual_owner()
+        self._manual_admit(bind=True)
+        self._check()
+        selected: list[int] = [0, 0, 0, 0]
+        for level, value in selected_ids:
+            self._check()
+            selected[level - 1] = value
+        current_bus, current_category = 0, 0
+        current_valid = 1
+        if bus_judge == 1:
+            self._check()
+            current_bus, current_category = session.shared_bus, session.shared_category
+            if current_bus == 0xFF and current_category == 0xFFFFFFFF:
+                current_valid = 0
+                category, bus, _protocol, _index = self._except_hv()
+                session.shared_category = category
+                session.shared_bus = bus
+                current_category, current_bus = category, bus
+            else:
+                current_valid = int(not (current_bus == 0 and current_category == 0))
+
+        selected_fields = (1 if current_category != 0 else 0) | (
+            2 if current_bus != 0 else 0
+        )
+        context = self._manual_key(
+            current_category,
+            current_bus,
+            (selected[0], selected[1], selected[2], selected[3]),
+            selected_fields=selected_fields,
+        )
+        surviving = self._manual_rows(context)
+
+        # DB12F is an eager ALL query, even when no selected value is present.
+        master_section = self.catalog.management.sections.get(47)
+        if master_section is None:
+            raise NativeDrsError(0xA0030107)
+        if master_section.count > 0x7FFF:
+            raise NativeDrsError(0xA0030110)
+        masters = self.catalog.category_master_records()
+        if not masters:
+            raise NativeDrsError(0xC0040101)
+        items: list[NativeCategoryItem] = []
+        count, budget = 0, 0
+        max_choices = 0
+        for master in masters:
+            self._check()
+            level = word(master, 4)
+            if not 1 <= level <= 4:
+                raise NativeDrsError(0xC0040102)
+            values: list[int] = []
+            for vehicle in surviving:
+                self._check()
+                raw = bytes.fromhex(vehicle["raw_hex"])
+                value = word(raw, 40 + (level - 1) * 2)
+                if value and value not in values:
+                    values.append(value)
+            gathered: list[tuple[int, str, int, bytes]] = []
+            gathered_bytes = gathered_max = 0
+            for value in values:
+                self._check()
+                records = self.catalog.collect_item_records(level, value)
+                if not records:
+                    raise NativeDrsError(0xC0040101)
+                label = self.catalog.language.resolve(
+                    struct.unpack_from("<I", records[0])[0]
+                )
+                label_data = self._text(label).data
+                entry_bytes = 12 + len(label_data)
+                gathered_bytes += entry_bytes
+                gathered_max = max(gathered_max, entry_bytes)
+                projected = max(gathered_bytes, len(gathered) * gathered_max)
+                if (
+                    count + len(gathered) + 1 > 100_000
+                    or budget + projected > MAX_RECORDER_BYTES
+                ):
+                    raise RecorderError("Native category menu exceeds host budget")
+                gathered.append((value, label, word(records[0], 8), label_data))
+            choices: list[NativeCategoryChoice] = []
+            for _ in range(len(gathered)):
+                self._check()
+                candidates = [
+                    i for i, entry in enumerate(gathered) if int(entry[2]) != 0
+                ]
+                if candidates:
+                    selected_index = min(candidates, key=lambda i: int(gathered[i][2]))
+                elif gathered:
+                    selected_index = 0
+                else:
+                    break
+                value, label, _sort, label_data = gathered[selected_index]
+                choices.append(NativeCategoryChoice(int(value), str(label)))
+                budget += 10 + 2 + len(label_data)
+                count += 1
+                value, label, _sort, label_data = gathered[selected_index]
+                gathered[selected_index] = (value, label, 0, label_data)
+                if count > 100_000 or budget > MAX_RECORDER_BYTES:
+                    raise RecorderError("Native category menu exceeds host budget")
+            master_label = self.catalog.language.resolve(
+                struct.unpack_from("<I", master)[0]
+            )
+            master_data = self._text(master_label).data
+            budget += 10 + 2 + len(master_data)
+            count += 1
+            if count > 100_000 or budget > MAX_RECORDER_BYTES:
+                raise RecorderError("Native category menu exceeds host budget")
+            max_choices = max(max_choices, len(choices))
+            items.append(NativeCategoryItem(level, master_label, tuple(choices)))
+
+        mode = 0
+        category_fields: list[tuple[int, int, int, int]] = []
+        for row in surviving:
+            self._check()
+            raw = bytes.fromhex(row["raw_hex"])
+            category_fields.append(
+                (
+                    word(raw, 40),
+                    word(raw, 42),
+                    word(raw, 44),
+                    word(raw, 46),
+                )
+            )
+        if current_valid == 0 and (
+            (len(surviving) == 1 and bytes.fromhex(surviving[0]["raw_hex"])[2] != 0)
+            or (len(surviving) > 1 and max_choices == 1)
+        ):
+            mode = 2
+        elif len(surviving) == 1:
+            mode = 1
+            raw = bytes.fromhex(surviving[0]["raw_hex"])
+            session.shared_category = word(raw, 0)
+            session.shared_bus = raw[2]
+        elif len(surviving) > 1:
+            first_row = bytes.fromhex(surviving[0]["raw_hex"])
+            if all(fields == category_fields[0] for fields in category_fields) and any(
+                word(bytes.fromhex(row["raw_hex"]), 0) != word(first_row, 0)
+                or bytes.fromhex(row["raw_hex"])[2] != first_row[2]
+                for row in surviving[1:]
+            ):
+                session.shared_category, session.shared_bus = self._manual_probe_pair(
+                    surviving
+                )
+                mode = 1
+
+        if mode:
+            session.category_ids.clear()
+            session.category_mode = mode
+            for item in items:
+                self._check()
+                session.category_ids.append(
+                    (item.level, item.choices[0].value if item.choices else 0)
+                )
+                if len(session.category_ids) > 100_000:
+                    raise RecorderError("Native category state exceeds entry budget")
+        self._check()
+        return NativeCategoryMenu(mode, tuple(items))
+
+    def _manual_local_values(self) -> tuple[int, int, int, int]:
+        assert self.session is not None
+        return (
+            0 if self.session.shared_bus == 0xFF else self.session.shared_bus,
+            0
+            if self.session.shared_category == 0xFFFFFFFF
+            else self.session.shared_category,
+            0 if self.session.shared_protocol == 0xFF else self.session.shared_protocol,
+            0 if self.session.shared_option == 0xFFFF else self.session.shared_option,
+        )
+
+    def _manual_commit_globals(self, *, option_value: int | None = None) -> None:
+        assert self.session is not None
+        bus, category, protocol, option = self._manual_local_values()
+        if option_value is not None:
+            option = option_value
+        self.session.shared_category = category
+        self.session.shared_protocol = protocol
+        self.session.shared_option = option
+        self.session.shared_bus = bus
+
+    def _manual_setup_protocol(self) -> int:
+        assert self.session is not None
+        category = self.session.shared_category
+        if category in (0, 0xFFFFFFFF):
+            return 0
+        records = self.owner.profile.category_records(category)
+        if len(records) != 1:
+            raise NativeDrsError(0xC0040102)
+        return records[0][72]
+
+    def _manual_option_output(
+        self,
+        option_key: int,
+        group: int,
+        *,
+        base: NativeVehicleSelection | None = None,
+    ) -> NativeVehicleSelection:
+        self._check()
+        rows = self.catalog.option_records(option_key, group)
+        valid, invalid = self._valid_options(option_key, group)
+        if not valid:
+            raise NativeDrsError(0xC0040101)
+        rows = tuple(row for row in rows if (word(row, 6), word(row, 8)) not in invalid)
+        if not rows:
+            raise NativeDrsError(0xC0040101)
+        options = []
+        for row in rows:
+            self._check()
+            label = self.catalog.language.resolve(struct.unpack_from("<I", row)[0])
+            self._append(
+                options,
+                NativeVehicleEntry((1, 0), (word(row, 8),), self._text(label)),
+            )
+        result = NativeVehicleSelection(
+            (1, 0),
+            self._text(""),
+            ((1, 0), (1, 0), (1, 0)),
+            () if base is None else base.select_names,
+            () if base is None else base.car_info,
+            tuple(options),
+            (group, 0),
+        )
+        self._check()
+        self._current = result
+        return result
+
+    def _manual_car_info(
+        self, model: int, provider_protocol: int
+    ) -> tuple[tuple[NativeVehicleEntry, ...], tuple[NativeVehicleEntry, ...]]:
+        assert self.session is not None
+        select_names: list[NativeVehicleEntry] = []
+        car_info: list[NativeVehicleEntry] = []
+        provider: _NativeVehicleProtocolState | None = None
+        provider_created = False
+        masters: tuple[bytes, ...] | None = None
+        info_level = info_value = 0
+        category = self.session.shared_category
+        bus = self.session.shared_bus
+        protocol = provider_protocol & 31
+        communication: NativeCommunication | None = None
+        phase_supported = protocol in (3, 4, 20, 21)
+        for item in self.info_ids:
+            self._check()
+            if item in (1, 2, 3, 16, 17):
+                value = b""
+                if phase_supported:
+                    if not provider_created:
+                        provider_created = True
+                        communication = self._manual_protocol_context(category, bus)
+                        status = self._manual_null_send(communication)
+                        if status == 0:
+                            provider = _selected_vehicle_protocol_setup(
+                                communication, protocol
+                            )
+                        else:
+                            provider = _NativeVehicleProtocolState(
+                                protocol, bytes(0x6C)
+                            )
+                            text = NativeCoreString((1, 0), b"\0")
+                            self._append(
+                                car_info,
+                                NativeVehicleEntry((1, 0), (item,), text),
+                            )
+                            continue
+                    if provider_created and provider is not None:
+                        value = provider.formatted().get(item, b"")
+                text = NativeCoreString((1, 0), value.split(b"\0", 1)[0] + b"\0")
+                self._append(car_info, NativeVehicleEntry((1, 0), (item,), text))
+                continue
+            if item == 4:
+                rows = self.catalog.vehicle_name_records(model)
+                label = (
+                    self.catalog.language.resolve(struct.unpack_from("<I", rows[0])[0])
+                    if len(rows) == 1
+                    else ""
+                )
+                self._append(
+                    car_info, NativeVehicleEntry((1, 0), (item,), self._text(label))
+                )
+                continue
+
+            if masters is None:
+                masters = self.catalog.category_master_records()
+            if not masters:
+                raise NativeDrsError(0xC0040101)
+            for master in masters:
+                self._check()
+                if word(master, 6) == item:
+                    info_level = word(master, 4)
+                    info_value = next(
+                        (
+                            value
+                            for level, value in self.session.category_ids
+                            if level == info_level
+                        ),
+                        0,
+                    )
+                    break
+            if not info_level:
+                raise NativeDrsError(0xC0040001)
+            if not 1 <= info_level <= 4:
+                raise NativeDrsError(0xC0040102)
+            if not info_value:
+                text = self._text("")
+                output_id = info_level
+            else:
+                records = self.catalog.collect_item_records(info_level, info_value)
+                if len(records) != 1:
+                    raise NativeDrsError(0xC0040102)
+                label = self.catalog.language.resolve(
+                    struct.unpack_from("<I", records[0])[0]
+                )
+                text = self._text(label)
+                output_id = item
+            self._append(
+                select_names,
+                NativeVehicleEntry((1, 0), (output_id, info_value), text),
+            )
+        return tuple(select_names), tuple(car_info)
+
+    def _manual_finish(
+        self,
+        model: int,
+        *,
+        option_value: int = 0,
+        provider_protocol: int = 0,
+        postlude: bool = True,
+    ) -> NativeVehicleSelection:
+        assert self.session is not None
+        self._reset_budget(b"")
+        select_names, names = self._manual_car_info(model, provider_protocol)
+        # 5BF0 commits only after the provider has formatted all requested IDs.
+        self._manual_commit_globals(option_value=option_value)
+        self.session.current_model = model
+        if self.session.model_list:
+            self.session.model_list[0] = model
+        else:
+            self.session.model_list.append(model)
+        self._check()
+        car = tuple(row for row in names if row.values[0] not in (16, 17, 18))
+        result = NativeVehicleSelection(
+            (1, 0),
+            self._text(""),
+            ((1, 0), (1, 0), (1, 0)),
+            select_names,
+            car,
+            (),
+            (0, model),
+        )
+        if len(result.encode()) > MAX_RECORDER_BYTES:
+            raise RecorderError("Native vehicle context exceeds byte budget")
+        self._check()
+        self._current = result
+        if postlude:
+            self._manual_parent_postlude()
+            self._check()
+        return result
+
+    def _manual_parent_postlude(self) -> None:
+        assert self.session is not None
+        category = self.session.shared_category
+        if category == 0:
+            self.session.manual_parent_record = None
+            self._check()
+            return
+        if category == 0xFFFFFFFF:
+            self.session.manual_parent_record = None
+            self._check()
+            return
+        records = self.owner.profile.category_records(category)
+        if len(records) != 1:
+            raise NativeDrsError(0xC0040102)
+        self.session.manual_parent_record = records[0]
+        self._check()
+
+    def _manual_resume_index(self, category: int, bus: int) -> int:
+        section = self.catalog.management.sections.get(2)
+        if section is None:
+            raise NativeDrsError(0xA0030107)
+        if section.count > 0x7FFF:
+            raise NativeDrsError(0xA0030110)
+        if len(section.payload) != section.count * 4:
+            raise RecorderError("Malformed native DB102 candidate table")
+        if section.count == 0:
+            raise NativeDrsError(0xC0040101)
+        return self.catalog.protocol_resume_index(category, bus)
+
+    def _manual_select(self) -> NativeVehicleSelection:
+        session = self._manual_owner()
+        self._manual_admit()
+        if not session.category_ids:
+            raise RecorderError("No retained native manual category menu")
+        mode = session.category_mode
+        if mode == 0:
+            raise NativeDrsError(0xA0040403)
+        if mode == 2:
+            session.current_model = 0xFFFF
+            if session.model_list:
+                session.model_list[0] = 0xFFFF
+            else:
+                session.model_list.append(0xFFFF)
+            result = NativeVehicleSelection(
+                (1, 0),
+                self._text(""),
+                ((1, 0), (1, 0), (1, 0)),
+                (),
+                (),
+                (),
+                (0, 0xFFFF),
+            )
+            self._current = result
+            self._manual_parent_postlude()
+            self._check()
+            return result
+        if (
+            not isinstance(session.category_ids, list)
+            or len(session.category_ids) > 100_000
+            or any(
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or type(pair[0]) is not int
+                or not 0 <= pair[0] <= 0xFFFF
+                or type(pair[1]) is not int
+                or not 0 <= pair[1] <= 0xFFFF
+                for pair in session.category_ids
+            )
+        ):
+            raise RecorderError("Invalid retained native category state")
+        pairs = tuple(session.category_ids)
+        values: list[int] = [0, 0, 0, 0]
+        for level, value in pairs:
+            if level not in (1, 2, 3, 4):
+                raise NativeDrsError(0xA0040403)
+            values[level - 1] = value
+        local_bus, local_category, _local_protocol, _local_option = (
+            self._manual_local_values()
+        )
+        provider_protocol = self._manual_setup_protocol()
+        context = self._manual_key(
+            local_category,
+            local_bus,
+            (values[0], values[1], values[2], values[3]),
+            selected_fields=0,
+        )
+        rows = self._manual_rows(context)
+        if len(rows) == 1:
+            chosen = rows[0]
+        else:
+            chosen = next(
+                (row for row in rows if bytes.fromhex(row["raw_hex"])[2] == local_bus),
+                None,
+            )
+            if chosen is None:
+                raise NativeDrsError(0xC0040102)
+        model, option_key = chosen["vehicle_name_key"], chosen["option_key"]
+        if option_key:
+            base = self._manual_finish(
+                model,
+                option_value=option_key,
+                provider_protocol=provider_protocol,
+                postlude=False,
+            )
+            self.option_key = option_key
+            result = self._manual_option_output(option_key, 1, base=base)
+            if result.trailing_words[1] != 0:
+                self._manual_parent_postlude()
+                self._check()
+            return result
+        if not model:
+            raise NativeDrsError(0xC0040102)
+        return self._manual_finish(
+            model, option_value=0, provider_protocol=provider_protocol
+        )
+
+    def _manual_answer(self, group: int, choice: int) -> NativeVehicleSelection:
+        assert self.session is not None
+        self._manual_admit()
+        option_key = self.session.shared_option
+        if not option_key:
+            raise RecorderError("No pending native manual option selection")
+        self._reset_budget(b"")
+        self.hidden_name = ""
+        try:
+            rows = self.catalog.option_records(option_key, group, choice)
+            valid, invalid = self._valid_options(option_key, group)
+            if not valid:
+                raise NativeDrsError(0xC0040101)
+            rows = tuple(
+                row for row in rows if (word(row, 6), word(row, 8)) not in invalid
+            )
+            if len(rows) != 1:
+                raise NativeDrsError(0xC0040102)
+            model, next_group = struct.unpack_from("<HH", rows[0], 10)
+            if model:
+                self.option_key = 0
+                # Terminal option answers re-enter 1E30, then 5BF0 and the
+                # common parent postlude. The provider protocol remains local.
+                provider_protocol = self._manual_setup_protocol()
+                return self._manual_finish(
+                    model, option_value=0, provider_protocol=provider_protocol
+                )
+            if next_group:
+                self.session.shared_option = option_key
+                self.option_key = option_key
+                result = self._manual_option_output(option_key, next_group)
+                if result.trailing_words[1] != 0:
+                    self._manual_parent_postlude()
+                    self._check()
+                return result
+            self.option_key = 0
+            category = self.session.shared_category
+            bus = self.session.shared_bus
+            result = self._select(self._manual_resume_index(category, bus))
+            if result.trailing_words[1] == 0xFFFF:
+                self.session.current_model = 0xFFFF
+                if self.session.model_list:
+                    self.session.model_list[0] = 0xFFFF
+                else:
+                    self.session.model_list.append(0xFFFF)
+            if result.trailing_words[1] != 0:
+                self._manual_parent_postlude()
+                self._check()
+            return result
+        except ToyotaCodecError as error:
+            raise NativeDrsError(error.code) from error
 
     def _valid_options(
         self, key: int, group: int, visited: frozenset[int] = frozenset()
@@ -5502,7 +6349,27 @@ class NativeVehicleSelector:
         car: tuple[NativeVehicleEntry, ...] | None = None,
     ) -> NativeVehicleSelection:
         if car is None:
-            car = self._car(model)
+            car = (
+                ()
+                if self.session is not None and self.session.category_ids and model == 0
+                else self._car(model)
+            )
+        if self.session is not None and self.session.category_ids and model != 0:
+            if self.communication is None or not 0 <= self.protocol <= 0xFF:
+                raise RecorderError("Manual resume lost its selected native context")
+            selected_bus = self.communication.bus_id
+            if not 0 <= selected_bus <= 0xFF or not 0 <= self.option_key <= 0xFFFF:
+                raise RecorderError("Manual resume returned invalid shared fields")
+            self._check()
+            self.session.shared_category = self.communication.profile.category
+            self.session.shared_protocol = self.protocol
+            self.session.shared_option = self.option_key
+            self.session.shared_bus = selected_bus
+            self.session.current_model = model
+            if self.session.model_list:
+                self.session.model_list[0] = model
+            else:
+                self.session.model_list.append(model)
         options = ()
         if self.option_key:
             group = group or 1
@@ -5551,6 +6418,15 @@ class NativeVehicleSelector:
         """Execute an automatic request (Index0), with actual native probes."""
         self._check()
         try:
+            if self.session is not None and self.session.option_groups:
+                raise UnsupportedRecorderOperation(
+                    "Native multi-option session consumption is not admitted"
+                )
+            if self.session is not None and self.session.category_ids:
+                self._manual_admit()
+                self._consumer_cache_init()
+                return self._manual_select()
+            self._consumer_cache_init()
             return self._select(0)
         except ToyotaCodecError as error:
             raise NativeDrsError(error.code) from error
@@ -5729,6 +6605,29 @@ class NativeVehicleSelector:
             for value in (group, choice)
         ):
             raise RecorderError("Native option answer must contain ushort integers")
+        if self.session is not None and self.session.option_groups:
+            raise UnsupportedRecorderOperation(
+                "Native multi-option session consumption is not admitted"
+            )
+        if self.session is not None and self.session.category_ids:
+            self._check()
+            self._manual_admit()
+            self._consumer_cache_init()
+            if (
+                group == 0
+                or self.session.shared_bus == 0xFF
+                or self.session.shared_category == 0xFFFFFFFF
+                or self.session.shared_protocol == 0xFF
+                or self.session.shared_option == 0xFFFF
+            ):
+                raise NativeDrsError(0xC0040001)
+            if not self.session.shared_option:
+                raise NativeDrsError(0xC0040001)
+            try:
+                return self._manual_answer(group, choice)
+            except ToyotaCodecError as error:
+                raise NativeDrsError(error.code) from error
+        self._consumer_cache_init()
         if (
             not group
             or not self.option_key

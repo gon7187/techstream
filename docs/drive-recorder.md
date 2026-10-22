@@ -262,15 +262,25 @@ vehicle owner independently of the adapter. Cancellation and invalid host state
 do not create negative observations. Passing the communication directly retains
 the separately proven absent-slot path.
 
-The current runtime uses fresh empty manual/NA multi-option state. It does not
-manufacture a positive connection observation or selected VIN. Existing NA1D
-groups, manual category-state transitions and complete regional GUI lifecycle
-remain open. Unsupported provider allocation and native undefined receive state fail
-closed. Source/cancellation/deadline checks and incremental output/count bounds
-also apply to option-only answers. A serialized authored database test joins the
-automatic selection to the production monitor metadata adapter, native DRS
-round-trip, actual injected DMCI acquisition and DM packet playback. This is
-software replay evidence; physical communication remains unconfirmed.
+`NativeVehicleSession` also retains the ordinary18 manual category state used by
+the selected `SelectCarTypVn10_DT.dll` NA translation. Its
+`NativeVehicleSelector.select_categories(selected_ids, bus_judge=...)` returns an
+immutable `NativeCategoryMenu`; the menu is not a DRS table. A fresh selector
+using that same session can consume mode1/mode2 through `select()`. The adapter
+admits only source build18, native controller build18 and the first actual DB113
+selection naming `SelectCarTypVn10_DT.dll`; EU Brd and JP Std sources reject the
+manual entry before communication. Retained state is bound to the catalog,
+management hash, selected DB113 row and exception IDs, and is invalidated by
+session disposal.
+
+The ordinary producer preserves the embedded1D list. Manual selection and
+answers reject a nonempty1D list while its separate source route is unimplemented.
+Option42 continuation is retained on the same session and emits fresh option
+menus on later answers. Provider setup and formatter output use the existing
+`NativeCommunication` adapter and typed DRS selection fields. The new authored
+tests are serialized-DDB software replay; they do not attest a loaded OEM DLL
+hash, prove every regional GUI lifecycle, or confirm physical communication.
+Existing automatic12/18 tests remain independent and unchanged.
 
 The selected vehicle context models the recorder-facing GUI export: ordered
 names/options and terminal words survive, while display-only CarInfo IDs

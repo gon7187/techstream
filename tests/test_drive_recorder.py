@@ -96,6 +96,7 @@ from scripts.snapshot import (
 from scripts.snapshot import (
     parse as parse_snapshot,
 )
+from scripts.toyota_session import Cancelled, SessionError
 
 
 class NativeDrsTests(unittest.TestCase):
@@ -2131,6 +2132,8 @@ class NativeMonitorRecorderTests(unittest.TestCase):
         probe_status=0,
         module="SelectCarTypVn10_DT.dll",
         protocol_only=False,
+        extra_category_master_id=None,
+        p4_category=False,
     ):
         from scripts.demo import _ddb
         from scripts.frame_transport import DriverProperties, J2534Result
@@ -2150,6 +2153,16 @@ class NativeMonitorRecorderTests(unittest.TestCase):
         struct.pack_into("<I7H", row, 0, 0x7FF, 1, 1, 1, 1, 1, 0, 1)
         row[18] = 0x12
         sections[59] = (1, bytes(row))
+        if extra_category_master_id is not None:
+            count, masters = sections[47]
+            sections[47] = (
+                count + 1,
+                masters + struct.pack("<IHH", 12, 1, extra_category_master_id),
+            )
+        if p4_category:
+            category = bytearray(sections[16][1])
+            category[72] = 6
+            sections[16] = (sections[16][0], bytes(category))
         for key, value in (section_updates or {}).items():
             if value is None:
                 sections.pop(key, None)
@@ -2262,6 +2275,381 @@ class NativeMonitorRecorderTests(unittest.TestCase):
         )
         self.assertEqual(terminal.car_info[-1].text.data, b"2065\0")
         self.assertEqual(len(backend.calls), before)
+
+    def manual_ordinary_runtime(
+        self,
+        *,
+        module="SelectCarTypVn10_DT.dll",
+        option=0,
+        model=10001,
+        extra_category_master_id=None,
+        phase=3,
+        p4_category=False,
+        probe_status=0,
+        source_build=18,
+        option_records=None,
+        section_updates=None,
+    ):
+        row = bytearray(52)
+        struct.pack_into("<H", row, 0, 1)
+        row[2] = 0x12
+        struct.pack_into("<4H", row, 40, 1, 1, 1, 1)
+        struct.pack_into("<HH", row, 48, option, model)
+        updates = {41: (1, bytes(row))}
+        updates.update(section_updates or {})
+        if option_records is not None:
+            updates[42] = (len(option_records) // 16, option_records)
+        return self.automatic_vehicle_runtime(
+            phase=phase,
+            source_build=source_build,
+            module=module,
+            section_updates=updates,
+            extra_category_master_id=extra_category_master_id,
+            p4_category=p4_category,
+            probe_status=probe_status,
+        )
+
+    def test_manual18_menu_and_fresh_selector_share_actual_native_session(self):
+        communication, backend, _vin = self.manual_ordinary_runtime()
+        session = NativeVehicleSession(communication)
+        producer = NativeVehicleSelector(session, info_ids=(), text_encoding="ascii")
+
+        menu = producer.select_categories((), bus_judge=0)
+        self.assertEqual(menu.mode, 1)
+        self.assertEqual(
+            tuple(
+                (item.level, tuple(choice.value for choice in item.choices))
+                for item in menu.items
+            ),
+            ((1, (1,)), (2, (1,)), (3, (1,)), (4, (1,))),
+        )
+        self.assertEqual(session.category_ids, [(1, 1), (2, 1), (3, 1), (4, 1)])
+        self.assertEqual((session.shared_category, session.shared_bus), (1, 0x12))
+        self.assertEqual(backend.calls, [])
+
+        consumer = NativeVehicleSelector(session, info_ids=(), text_encoding="ascii")
+        selected = consumer.select()
+        self.assertEqual(selected.trailing_words, (0, 10001))
+        self.assertEqual(NativeVehicleSelection.parse(selected.encode()), selected)
+        self.assertEqual((session.current_model, session.model_list), (10001, [10001]))
+        self.assertEqual((session.shared_protocol, session.shared_option), (0, 0))
+
+    def test_manual18_except_hv_uses_actual_null_send_and_mode2_postlude(self):
+        communication, backend, _vin = self.manual_ordinary_runtime()
+        session = NativeVehicleSession(communication)
+        selector = NativeVehicleSelector(session, info_ids=(), text_encoding="ascii")
+
+        menu = selector.select_categories((), bus_judge=1)
+        self.assertEqual(menu.mode, 2)
+        self.assertEqual((session.shared_category, session.shared_bus), (1, 0x12))
+        self.assertTrue(backend.calls)
+        selected = NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select()
+        self.assertEqual(selected.trailing_words, (0, 0xFFFF))
+        self.assertEqual(
+            (session.current_model, session.model_list), (0xFFFF, [0xFFFF])
+        )
+        assert session.manual_parent_record is not None
+        self.assertEqual(session.manual_parent_record[72], 3)
+
+    def test_manual18_admission_errors_and_native_shortsort_ties(self):
+        communication, backend, _vin = self.manual_ordinary_runtime(
+            module="SelectCarVn10Std_DT.dll"
+        )
+        selector = NativeVehicleSelector(
+            communication, info_ids=(), text_encoding="ascii"
+        )
+        with self.assertRaises(UnsupportedRecorderOperation):
+            selector.select_categories((), bus_judge=0)
+        self.assertEqual(backend.calls, [])
+
+        communication, backend, _vin = self.manual_ordinary_runtime(source_build=12)
+        with self.assertRaises(UnsupportedRecorderOperation):
+            NativeVehicleSelector(
+                communication, info_ids=(), text_encoding="ascii"
+            ).select_categories((), bus_judge=0)
+        self.assertEqual(backend.calls, [])
+
+        communication, _backend, _vin = self.manual_ordinary_runtime()
+        session = NativeVehicleSession(communication)
+        NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select_categories((), bus_judge=0)
+        assert session.manual_identity is not None
+        session.manual_identity = (*session.manual_identity[:-1], 12)
+        with self.assertRaises(UnsupportedRecorderOperation):
+            NativeVehicleSelector(session, info_ids=(), text_encoding="ascii").select()
+
+        with self.assertRaises(NativeDrsError) as raised:
+            NativeVehicleSelector(
+                *self.manual_ordinary_runtime()[:1], info_ids=(), text_encoding="ascii"
+            ).select_categories(((5, 1),), bus_judge=0)
+        self.assertEqual(raised.exception.code, 0xC0040001)
+
+        for count, expected in (
+            (3, [2, 3, 1]),
+            (8, [2, 3, 4, 5, 6, 7, 8, 1]),
+            (9, [5, 2, 3, 4, 1, 6, 7, 8, 9]),
+        ):
+            rows = []
+            for identity in range(1, count + 1):
+                raw = bytearray(52)
+                struct.pack_into("<H", raw, 0, identity)
+                raw[2] = 7
+                rows.append({"raw_hex": raw.hex()})
+            sorted_rows = NativeVehicleSelector._manual_variant_sort(tuple(rows))
+            self.assertEqual(
+                [
+                    struct.unpack_from("<H", bytes.fromhex(row["raw_hex"]))[0]
+                    for row in sorted_rows
+                ],
+                expected,
+            )
+
+    def test_manual18_mode0_and_duplicate_ids_leave_slot17_untouched(self):
+        row = bytearray(52)
+        struct.pack_into("<H", row, 0, 1)
+        row[2] = 0x12
+        struct.pack_into("<4H", row, 40, 1, 1, 1, 1)
+        struct.pack_into("<HH", row, 48, 0, 10001)
+        communication, _backend, _vin = self.automatic_vehicle_runtime(
+            phase=3, section_updates={41: (2, bytes(row) * 2)}
+        )
+        session = NativeVehicleSession(communication)
+        selector = NativeVehicleSelector(session, info_ids=(), text_encoding="ascii")
+        menu = selector.select_categories((), bus_judge=0)
+        self.assertEqual(menu.mode, 0)
+        self.assertEqual(session.category_ids, [])
+        self.assertEqual(session.category_mode, 0)
+
+        communication, _backend, _vin = self.manual_ordinary_runtime()
+        session = NativeVehicleSession(communication)
+        menu = NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select_categories(((1, 0), (1, 1)), bus_judge=0)
+        self.assertEqual(menu.mode, 1)
+        self.assertEqual(session.category_ids[0], (1, 1))
+
+    def test_manual18_rejects_nonempty_multi_owner_cancel_and_dispose(self):
+        communication, backend, _vin = self.manual_ordinary_runtime()
+        session = NativeVehicleSession(communication)
+        NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select_categories((), bus_judge=0)
+        session.option_groups.append(object())
+        selector = NativeVehicleSelector(session, info_ids=(), text_encoding="ascii")
+        with self.assertRaises(UnsupportedRecorderOperation):
+            selector.select()
+        self.assertEqual(backend.calls, [])
+
+        communication, backend, _vin = self.manual_ordinary_runtime()
+        session = NativeVehicleSession(communication)
+        selector = NativeVehicleSelector(session, info_ids=(), text_encoding="ascii")
+        communication.cancelled = lambda: True
+        with self.assertRaises(Cancelled):
+            selector.select_categories((), bus_judge=0)
+        self.assertEqual(backend.calls, [])
+        communication.cancelled = lambda: False
+        session.dispose()
+        with self.assertRaises(SessionError):
+            NativeVehicleSelector(
+                session, info_ids=(), text_encoding="ascii"
+            ).select_categories((), bus_judge=0)
+
+    def test_manual18_option42_terminal_answer_survives_fresh_selector(self):
+        communication, _backend, _vin = self.manual_ordinary_runtime(option=1, model=0)
+        session = NativeVehicleSession(communication)
+        NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select_categories((), bus_judge=0)
+        pending = NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select()
+        self.assertTrue(pending.options)
+        self.assertEqual(pending.trailing_words[0], 1)
+        terminal = NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).answer(1, pending.options[0].values[0])
+        self.assertEqual(terminal.trailing_words[0], 0)
+        self.assertEqual(session.shared_option, 0)
+
+    def test_manual18_formatter_keeps_select_names_out_of_car_info(self):
+        communication, _backend, _vin = self.manual_ordinary_runtime(
+            extra_category_master_id=5, phase=4, p4_category=True
+        )
+        session = NativeVehicleSession(communication)
+        NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select_categories((), bus_judge=0)
+        category_id = 5
+        selected = NativeVehicleSelector(
+            session, info_ids=(4, category_id), text_encoding="ascii"
+        ).select()
+        self.assertEqual(
+            tuple(entry.values for entry in selected.select_names), ((category_id, 1),)
+        )
+        self.assertEqual(tuple(entry.values for entry in selected.car_info), ((4,),))
+        self.assertEqual(NativeVehicleSelection.parse(selected.encode()), selected)
+        self._assert_selected_metadata_capture(communication.profile, selected)
+
+    def test_manual18_option42_zero_model_resume_preserves_shared_option(self):
+        option_records = b"".join(
+            struct.pack("<I6H", 12, 1, group, 1, model, next_group, 0)
+            for group, model, next_group in ((1, 0, 0), (0, 10001, 0))
+        )
+        communication, _backend, _vin = self.manual_ordinary_runtime(
+            option=1, model=0, option_records=option_records
+        )
+        session = NativeVehicleSession(communication)
+        NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select_categories((), bus_judge=0)
+        NativeVehicleSelector(session, info_ids=(), text_encoding="ascii").select()
+        resumed = NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).answer(1, 1)
+        self.assertEqual(resumed.trailing_words, (0, 0xFFFF))
+        self.assertEqual(session.shared_option, 1)
+        self.assertEqual(
+            (session.current_model, session.model_list), (0xFFFF, [0xFFFF])
+        )
+
+    def test_manual18_option42_resume_commits_terminal_provider_state(self):
+        initial = bytearray(52)
+        struct.pack_into("<H", initial, 0, 1)
+        initial[2] = 0x12
+        struct.pack_into("<I", initial, 36, 3)
+        struct.pack_into("<4H", initial, 40, 0, 0, 1, 0)
+        struct.pack_into("<HH", initial, 48, 1, 0)
+        terminal = bytearray(initial)
+        struct.pack_into("<I", terminal, 36, 0x3FF)
+        struct.pack_into("<4H", terminal, 40, 0, 0, 2, 0)
+        struct.pack_into("<HH", terminal, 48, 0, 10001)
+        option_records = b"".join(
+            struct.pack("<I6H", 12, 1, group, 1, model, next_group, 0)
+            for group, model, next_group in ((1, 0, 0), (0, 10001, 0))
+        )
+        protocol_rows = struct.pack("<HBB", 1, 0x12, 0) * 2
+        communication, backend, _vin = self.manual_ordinary_runtime(
+            option=1,
+            model=0,
+            option_records=option_records,
+            section_updates={
+                41: (2, bytes(initial + terminal)),
+                2: (2, protocol_rows),
+                59: (0, b""),
+            },
+        )
+        session = NativeVehicleSession(communication)
+        NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select_categories(((3, 1),), bus_judge=0)
+        pending = NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select()
+        self.assertEqual(pending.trailing_words, (1, 0))
+        selected = NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).answer(1, pending.options[0].values[0])
+        self.assertEqual(selected.trailing_words, (0, 10001))
+        self.assertEqual(
+            (session.shared_category, session.shared_bus, session.shared_protocol),
+            (1, 0x12, 3),
+        )
+        self.assertEqual(session.shared_option, 0)
+        self.assertEqual((session.current_model, session.model_list), (10001, [10001]))
+        assert session.manual_parent_record is not None
+        self.assertEqual(session.manual_parent_record[72], 3)
+        self.assertTrue(backend.calls)
+
+    def test_manual18_resume_model_zero_skips_terminal_formatter(self):
+        initial = bytearray(52)
+        struct.pack_into("<H", initial, 0, 1)
+        initial[2] = 0x12
+        struct.pack_into("<I", initial, 36, 3)
+        struct.pack_into("<4H", initial, 40, 0, 0, 1, 0)
+        struct.pack_into("<HH", initial, 48, 1, 0)
+        terminal = bytearray(initial)
+        struct.pack_into("<I", terminal, 36, 0x3FF)
+        struct.pack_into("<4H", terminal, 40, 0, 0, 2, 0)
+        option_records = b"".join(
+            struct.pack("<I6H", 12, 1, group, 1, model, next_group, 0)
+            for group, model, next_group in ((1, 0, 0), (0, 10001, 0))
+        )
+        protocol_rows = struct.pack("<HBB", 1, 0x12, 0) * 2
+        communication, _backend, _vin = self.manual_ordinary_runtime(
+            option=1,
+            model=0,
+            option_records=option_records,
+            section_updates={
+                41: (2, bytes(initial + terminal)),
+                2: (2, protocol_rows),
+                43: None,
+                59: (0, b""),
+            },
+        )
+        session = NativeVehicleSession(communication)
+        NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select_categories(((3, 1),), bus_judge=0)
+        pending = NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select()
+        resumed = NativeVehicleSelector(
+            session, info_ids=(4, 1, 3), text_encoding="ascii"
+        ).answer(1, pending.options[0].values[0])
+        self.assertEqual(resumed.trailing_words, (1, 0))
+        self.assertEqual(resumed.car_info, ())
+
+    def test_manual18_resume_propagates_missing_db102_query_error(self):
+        option_records = b"".join(
+            struct.pack("<I6H", 12, 1, group, 1, model, next_group, 0)
+            for group, model, next_group in ((1, 0, 0), (0, 10001, 0))
+        )
+        communication, _backend, _vin = self.manual_ordinary_runtime(
+            option=1,
+            model=0,
+            option_records=option_records,
+            section_updates={2: None},
+        )
+        session = NativeVehicleSession(communication)
+        NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select_categories((), bus_judge=0)
+        NativeVehicleSelector(session, info_ids=(), text_encoding="ascii").select()
+        with self.assertRaises(NativeDrsError) as caught:
+            NativeVehicleSelector(session, info_ids=(), text_encoding="ascii").answer(
+                1, 1
+            )
+        self.assertEqual(caught.exception.code, 0xA0030107)
+        self.assertEqual(session.shared_option, 1)
+
+    def test_manual18_option42_next_group_and_terminal_cross_fresh_selectors(self):
+        option_records = b"".join(
+            struct.pack("<I6H", 12, 1, group, 1, model, next_group, 0)
+            for group, model, next_group in ((1, 0, 2), (2, 10001, 0))
+        )
+        communication, _backend, _vin = self.manual_ordinary_runtime(
+            option=1, model=0, option_records=option_records
+        )
+        session = NativeVehicleSession(communication)
+        NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select_categories((), bus_judge=0)
+        pending = NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).select()
+        next_group = NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).answer(1, pending.options[0].values[0])
+        self.assertEqual(next_group.trailing_words[0], 2)
+        self.assertEqual(next_group.select_names, ())
+        terminal = NativeVehicleSelector(
+            session, info_ids=(), text_encoding="ascii"
+        ).answer(2, next_group.options[0].values[0])
+        self.assertEqual(terminal.trailing_words, (0, 10001))
+        self.assertEqual(session.shared_option, 0)
 
     def test_automatic_selected_producer_uses_six_regional_protocol_providers(self):
         row = bytearray(32)
