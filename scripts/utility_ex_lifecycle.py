@@ -2421,9 +2421,7 @@ class UtilityExSelectedCMNWorker:
             )
         comm = self.communication
         self.status, self.error, self.iterations = 0, None, 0
-        previous = self.context.state.get(f"native_global:{self.native_status:x}", 0)
-        unsigned(previous)
-        global_status = previous
+        status_key = f"native_global:{self.native_status:x}"
         try:
             self._wait(interval)
             while not self.context.is_cancelled():
@@ -2453,7 +2451,7 @@ class UtilityExSelectedCMNWorker:
                         self.status = 3
                     if self.status:
                         if stop_plain if plain else fields.stop_on_error == 1:
-                            global_status = self.status
+                            self.context.state[status_key] = self.status
                             break
                         if self.context.is_cancelled():
                             break
@@ -2467,13 +2465,6 @@ class UtilityExSelectedCMNWorker:
                 if now < end:
                     duration = interval if plain else fields.interval_ms
                     self._wait((start - now + duration) & 0xFFFFFFFF)
-            status_key = f"native_global:{self.native_status:x}"
-            current = self.context.state.get(status_key)
-            # A cancelled worker has no new result to publish. Restore the entry
-            # snapshot only when no other owner (for example the timer callback)
-            # has published a newer shared status in the meantime.
-            if global_status != previous or current is None or current == previous:
-                self.context.state[status_key] = global_status
             comm.configure(f"native_rva:{self.busy_setter:x}", 100)
             comm.configure(f"native_rva:{self.no_response_setter:x}", 3)
             self.context.state[f"native_global:{self.native_result:x}"] = self.status
