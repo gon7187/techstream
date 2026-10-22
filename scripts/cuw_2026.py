@@ -52,6 +52,23 @@ _RKS_SOFTWARE_TOKEN = object()
 _GATEWAY_AUTH_TOKEN = object()
 
 
+@dataclass(frozen=True)
+class _PersistenceCPUTransition2026:
+    producer: str
+    origin: object
+    worker: object
+    persistence: object
+    state: object
+    metadata: object
+    file_sources: object
+    container: object
+    digest: str
+    node: int
+    persisted_cpu: int
+    before_cpu: int
+    after_cpu: int
+
+
 def _aes128_ecb_block(key: bytes, block: bytes) -> bytes:
     """15520/157c0 gateway use of the shared concrete AES128 ECB primitive."""
     from scripts.programming_2026_common import native_aes128_ecb_block
@@ -1217,6 +1234,7 @@ class CUWEngine2026:
         self._worker_target_sources = {}
         self._pending_worker_cid_selection = None
         self._prepare_prefix_owner = None
+        self._prepare_prefix_vbf_request2026 = None
         self._cleanup_controller = None
         self._cleanup_retired_dh_state = None
         self._gateway_startup = None
@@ -1237,6 +1255,9 @@ class CUWEngine2026:
         self._working_identifier_records: tuple[bytes, ...] = ()
         self._working_contact_buffer = bytes(33)
         self._persistence = None
+        self._persistence_cpu_transition2026: _PersistenceCPUTransition2026 | None = (
+            None
+        )
         if persistence is not None:
             self.bind_persistence(persistence)
 
@@ -1290,10 +1311,87 @@ class CUWEngine2026:
         expected_cpu = native2026_global_cpu_index(metadata)
         if self._worker is not None:
             expected_cpu = self.worker.source_state.current_global_cpu_index
-        if state.write_cpu_index != expected_cpu:
+        if state.write_cpu_index != expected_cpu and not (
+            self._persistence_cpu_transition_valid2026(
+                metadata,
+                state,
+                sources,
+                expected_cpu,
+                state_snapshot=state_snapshot,
+            )
+        ):
             raise ValueError(
                 "Persistence current CPU differs from the actual engine target"
             )
+
+    def _invalidate_persistence_cpu_transition2026(self) -> None:
+        self._persistence_cpu_transition2026 = None
+
+    def _persistence_cpu_transition_valid2026(
+        self, metadata, state, sources, expected_cpu, *, state_snapshot=None
+    ) -> bool:
+        record = self._persistence_cpu_transition2026
+        persistence = self._persistence
+        worker = self._worker
+        snapshot = state if state_snapshot is None else state_snapshot
+        if (
+            record is None
+            or persistence is None
+            or worker is None
+            or record.producer not in ("141-reset", "vbf-prefix")
+            or record.persistence is not persistence
+            or record.state is not persistence.state
+            or record.metadata is not metadata
+            or metadata is not self._metadata
+            or record.file_sources is not sources
+            or sources is not self._file_sources
+            or record.worker is not worker
+            or record.container is not metadata.source_container
+            or record.digest != metadata.source_sha256
+            or record.node != metadata.node
+            or record.persisted_cpu != persistence.state.write_cpu_index
+            or record.persisted_cpu != snapshot.write_cpu_index
+            or record.after_cpu != expected_cpu
+            or worker.source_state.current_global_cpu_index != record.after_cpu
+        ):
+            return False
+        if record.producer == "141-reset":
+            return record.origin is sources
+        return record.origin is not None
+
+    def _issue_persistence_cpu_transition2026(
+        self,
+        *,
+        producer: str,
+        origin: object,
+        metadata,
+        persisted_cpu: int,
+        before_cpu: int,
+        after_cpu: int,
+    ) -> None:
+        persistence = self._persistence
+        worker = self._worker
+        if persistence is None or worker is None or persisted_cpu == after_cpu:
+            return
+        self._persistence_cpu_transition2026 = _PersistenceCPUTransition2026(
+            producer,
+            origin,
+            worker,
+            persistence,
+            persistence.state,
+            metadata,
+            self._file_sources,
+            metadata.source_container,
+            metadata.source_sha256,
+            metadata.node,
+            persisted_cpu,
+            before_cpu,
+            after_cpu,
+        )
+
+    def _persistence_cpu_changed2026(self, persistence, old_cpu: int, new_cpu: int):
+        if persistence is self._persistence and old_cpu != new_cpu:
+            self._invalidate_persistence_cpu_transition2026()
 
     def validate_persistence_binding(self, persistence, *, state_snapshot=None) -> None:
         if persistence is not self._persistence:
@@ -1495,6 +1593,7 @@ class CUWEngine2026:
                     )
                     if self._persistence is not None:
                         state._notification = self._persistence.notification
+                    self._invalidate_persistence_cpu_transition2026()
                     self._source, self._metadata = sources.selected_source, metadata
                     if type(metadata.source_container) is NativeLargeContainer2026:
                         self._source = None
@@ -1567,6 +1666,15 @@ class CUWEngine2026:
             raise ValueError(
                 "Replacement FILE parser parameters differ from engine source"
             )
+        persistence = self._persistence
+        persisted_cpu = None
+        before_cpu = None
+        if persistence is not None:
+            self._validate_persistence_source(self.native_metadata)
+            persistence.validate_file_source_association(new_sources, metadata)
+            persisted_cpu = persistence.state.write_cpu_index
+            before_cpu = worker.source_state.current_global_cpu_index
+        self._invalidate_persistence_cpu_transition2026()
         self._file_sources = new_sources
         self._source, self._metadata = new_sources.selected_source, metadata
         index = native2026_global_cpu_index(metadata)
@@ -1580,6 +1688,16 @@ class CUWEngine2026:
         self._shrink_flag = metadata.initial_shrink_flag
         worker._file_reset_selected(new_sources)
         self.bind_cleanup_controller().accept_file_reset(old_sources, new_sources)
+        if persistence is not None:
+            assert persisted_cpu is not None and before_cpu is not None
+            self._issue_persistence_cpu_transition2026(
+                producer="141-reset",
+                origin=new_sources,
+                metadata=self.native_metadata,
+                persisted_cpu=persisted_cpu,
+                before_cpu=before_cpu,
+                after_cpu=worker.source_state.current_global_cpu_index,
+            )
 
     def file_general_boolean(self, metadata, name: str) -> bool:
         """5ccf0 reads global General for an actual current/issued output FILE."""
@@ -1847,6 +1965,7 @@ class CUWEngine2026:
             job = _issue_engine_thread_job(self, controller)
             self._thread_job = job
             _finalize_engine_worker_replacement(self, old, replacement)
+            self._invalidate_persistence_cpu_transition2026()
             return job
         except BaseException as error:
             self._thread_job = old_job
@@ -1922,8 +2041,11 @@ class CUWEngine2026:
                     raise ValueError(
                         "Bound pair control differs from the actual controller"
                     )
+            previous_worker = self._worker
             worker = _issue_engine_worker(self, controller)
             worker.validate_source(self)
+            if worker is not previous_worker:
+                self._invalidate_persistence_cpu_transition2026()
             self._worker = worker
             if self._cleanup_controller is None:
                 from scripts.cuw_engine_cleanup import _issue_engine_cleanup
@@ -2259,6 +2381,7 @@ class CUWEngine2026:
             index, size = metadata.logical_blocks[0].cpu_index, 0
         metadata = native2026_metadata_for_cpu(metadata, index)
         self._worker_target_sources[id(metadata.source_container)] = metadata
+        self._invalidate_persistence_cpu_transition2026()
         self._metadata = metadata
         for state in (self.dh_state, self.suzuki_state):
             state.metadata = metadata
@@ -2333,6 +2456,7 @@ class CUWEngine2026:
         if len(result.ordered_to_authored) > self.configuration.cpu_maximum:
             raise ValueError("Native rebuilt CPU vector exceeds configured capacity")
         self._worker_target_sources[id(metadata.source_container)] = metadata
+        self._invalidate_persistence_cpu_transition2026()
         self._metadata = metadata
         for state in (self.dh_state, self.suzuki_state):
             state.metadata = metadata
@@ -2348,9 +2472,26 @@ class CUWEngine2026:
         """36800 tail substitutes actual D30C only when numeric D308 is zero."""
         from scripts.calibration_2026 import native2026_metadata_for_cpu
 
-        self._require_owned_phase()
+        owned_phase = self._active and self._phase_thread == get_ident()
+        prefix_owner = self._prepare_prefix_owner == (
+            get_ident(),
+            worker,
+            self._thread_job,
+        )
+        if not owned_phase and not (
+            prefix_owner and self._prepare_prefix_vbf_request2026 is not None
+        ):
+            self._require_owned_phase()
+        if not owned_phase:
+            job = self._thread_job
+            request = self._prepare_prefix_vbf_request2026
+            if job is None or request is None or request.worker is not worker:
+                raise ValueError("Exact external VBF prepare receipt required")
+            job._validate_vbf_issuer2026(request)
         if worker is not self.worker or self._worker_phase not in (1, 2):
             raise ValueError("Actual preparing worker required for CPU offset")
+        if not owned_phase and self._worker_phase != 1:
+            raise ValueError("External VBF FULL36800 tail requires phase1")
         source = worker.source_state
         if (
             type(index) is not int
@@ -2359,6 +2500,13 @@ class CUWEngine2026:
         ):
             raise ValueError("Native zero-current CPU and issued D30C offset required")
         metadata = native2026_metadata_for_cpu(self.native_metadata, index)
+        persistence = self._persistence
+        persisted_cpu = None
+        before_cpu = source.current_global_cpu_index
+        if persistence is not None:
+            self._validate_persistence_source(self.native_metadata)
+            persisted_cpu = persistence.state.write_cpu_index
+        self._invalidate_persistence_cpu_transition2026()
         self._metadata = metadata
         self._worker_target_sources[id(metadata.source_container)] = metadata
         for state in (self.dh_state, self.suzuki_state):
@@ -2368,6 +2516,16 @@ class CUWEngine2026:
             state.cpu_index = state.global_cpu_index = index
         self.dh_state._dh_flash_size = None
         self._issued_sil_transfer = None
+        if not owned_phase and persistence is not None:
+            assert persisted_cpu is not None
+            self._issue_persistence_cpu_transition2026(
+                producer="vbf-prefix",
+                origin=self._prepare_prefix_vbf_request2026,
+                metadata=metadata,
+                persisted_cpu=persisted_cpu,
+                before_cpu=before_cpu,
+                after_cpu=index,
+            )
 
     def _append_worker_target(self, metadata, cpu_index: int, *, worker):
         """3e710 appends only47's image-derived current target using owned General."""
@@ -2394,6 +2552,7 @@ class CUWEngine2026:
             selected = native2026_metadata_for_cpu(
                 updated, native2026_global_cpu_index(self.native_metadata)
             )
+            self._invalidate_persistence_cpu_transition2026()
             self._metadata = selected
             self.dh_state.metadata = self.suzuki_state.metadata = selected
             self._issued_sil_transfer = None
@@ -2496,6 +2655,7 @@ class CUWEngine2026:
     def _delete_cleanup_target(self, cleanup) -> None:
         """40580 deletes the selected CFE4 target at its literal resource slot."""
         self._validate_cleanup_controller(cleanup)
+        self._invalidate_persistence_cpu_transition2026()
         self._cleanup_retired_dh_state = self._dh_state
         self._metadata = self._source = self._dh_state = self._suzuki_state = None
         self._pending_worker_cid_selection = None
@@ -2866,6 +3026,8 @@ class CUWEngine2026:
         try:
             selected = self.metadata_for(node, cpu_index)
             global_index = native2026_global_cpu_index(selected)
+            if selected is not self._metadata:
+                self._invalidate_persistence_cpu_transition2026()
             self._metadata = selected
             for state in (self.dh_state, self.suzuki_state):
                 state.metadata = selected
@@ -2943,6 +3105,11 @@ class CUWEngine2026:
             raise ValueError("CUW phase is active")
         try:
             index = native2026_global_cpu_index(metadata)
+            if (
+                metadata is not self._metadata
+                or index != worker.source_state.current_global_cpu_index
+            ):
+                self._invalidate_persistence_cpu_transition2026()
             self._metadata = metadata
             from scripts.calibration_2026 import NativeUSBSource2026
             from scripts.cuw_large import NativeLargeContainer2026
@@ -2989,6 +3156,7 @@ class CUWEngine2026:
             metadata = native2026_with_cpu_type(
                 self.native_metadata, cpu_index, cpu_type
             )
+            self._invalidate_persistence_cpu_transition2026()
             self._metadata = metadata
             self.dh_state.metadata = self.suzuki_state.metadata = metadata
         finally:
@@ -3070,6 +3238,7 @@ class CUWEngine2026:
             with self._phase_state_lock:
                 if self._prepare_prefix_owner is not None:
                     raise ValueError("Finish the native prepare prefix before closing")
+            self._invalidate_persistence_cpu_transition2026()
             if self._thread_job is not None:
                 self._thread_job.stop()
             if self._online_controller is not None:
@@ -3710,6 +3879,7 @@ class CUWEngine2026:
             if self._persistence is not None:
                 state._notification = self._persistence.notification
             previous = self._large_container
+            self._invalidate_persistence_cpu_transition2026()
             self._source, self._metadata, self._dh_state = data, metadata, state
             self._file_sources = None
             self._worker_target_sources.clear()
@@ -3770,6 +3940,7 @@ class CUWEngine2026:
             if self._persistence is not None:
                 state._notification = self._persistence.notification
             previous = self._large_container
+            self._invalidate_persistence_cpu_transition2026()
             self._source = None
             self._metadata, self._dh_state, self._suzuki_state = metadata, state, suzuki
             self._file_sources = None
@@ -3835,6 +4006,7 @@ class CUWEngine2026:
             if self._persistence is not None:
                 state._notification = self._persistence.notification
             previous = self._large_container
+            self._invalidate_persistence_cpu_transition2026()
             self._source, self._metadata = source.raw, metadata
             self._dh_state, self._suzuki_state = state, suzuki
             self._large_container, self._file_sources = None, None
@@ -3894,6 +4066,7 @@ class CUWEngine2026:
             if self._persistence is not None:
                 state._notification = self._persistence.notification
             previous = self._large_container
+            self._invalidate_persistence_cpu_transition2026()
             self._source = None
             self._metadata, self._dh_state, self._suzuki_state = metadata, state, suzuki
             self._file_sources = None
@@ -3961,37 +4134,132 @@ class CUWEngine2026:
         return self._cancelled.is_set()
 
     def process_before_reprogramming(self, parameters, device) -> int:
-        """CUW64c00 normal-file branch; VBF worker handoff remains unsupported."""
+        """64c00's normal-file path or bounded source-issued VBF resume."""
         from scripts.calibration_2026 import native2026_cpu_values
-        from scripts.programming_2026_common import NativeGeneralParameters2026
+        from scripts.programming_2026_common import (
+            NativeGeneralParameters2026,
+            is_native_exception2026,
+        )
 
-        if not self._lock.acquire(blocking=False):
-            raise ValueError("CUW phase is active")
+        metadata = self._metadata
+        if metadata is None:
+            return 3008
+        first_cpu = native2026_cpu_values(metadata, 0)
+        is_vbf = ".vbf" in first_cpu.get("cpuimagename", "")
+
+        if not is_vbf:
+            if not self._lock.acquire(blocking=False):
+                raise ValueError("CUW phase is active")
+            try:
+                if (
+                    type(parameters) is not NativeGeneralParameters2026
+                    or type(device) is not J2534Device2026
+                ):
+                    raise TypeError(
+                        "Concrete global parameters and J2534 device required"
+                    )
+                enabled = parameters.boolean_with_keys(
+                    metadata.vehicle.get("kindofecu", ""),
+                    first_cpu.get("cputype", ""),
+                    metadata.vehicle.get("contacttype", ""),
+                    "FlagToChangeWFSE",
+                )
+                if enabled:
+                    if device.device_id is None:
+                        raise ValueError("Open J2534 device required for WFSE voltage")
+                    try:
+                        device.set_programming_voltage(15, 0xFFFFFFFE)
+                    except BaseException as error:
+                        if is_native_exception2026(error):
+                            status = self.check_j2534_connection()
+                            return status if status else 3008
+                        raise
+                return 0
+            finally:
+                self._lock.release()
+
+        if (
+            type(parameters) is not NativeGeneralParameters2026
+            or type(device) is not J2534Device2026
+        ):
+            raise TypeError("Concrete global parameters and J2534 device required")
+        # This lookup throws the native literal2 callback error outside64c00's catch.
+        enabled = parameters.boolean_with_keys(
+            metadata.vehicle.get("kindofecu", ""),
+            first_cpu.get("cputype", ""),
+            metadata.vehicle.get("contacttype", ""),
+            "FlagToChangeWFSE",
+        )
+        job = self._thread_job
+        request = None
+        queued = False
         try:
-            metadata = self._metadata
-            if metadata is None:
-                return 3008
-            if (
-                type(parameters) is not NativeGeneralParameters2026
-                or type(device) is not J2534Device2026
-            ):
-                raise TypeError("Concrete global parameters and J2534 device required")
-            first_cpu = native2026_cpu_values(metadata, 0)
-            enabled = parameters.boolean_with_keys(
-                metadata.vehicle.get("kindofecu", ""),
-                first_cpu.get("cputype", ""),
-                metadata.vehicle.get("contacttype", ""),
-                "FlagToChangeWFSE",
-            )
             if enabled:
+                if device is not self.engine_runtime_device():
+                    raise ValueError("Actual paired engine J2534 device required")
                 if device.device_id is None:
                     raise ValueError("Open J2534 device required for WFSE voltage")
                 device.set_programming_voltage(15, 0xFFFFFFFE)
-            if ".vbf" in first_cpu.get("cpuimagename", ""):
-                raise NotImplementedError("Native VBF worker handoff is not yet ported")
+            if job is None:
+                raise NotImplementedError(
+                    "Cold VBF execution requires the actual persistent native worker"
+                )
+            request = job._begin_vbf_process_before2026()
+            worker = self.worker
+            worker._acknowledge_vbf_process_before2026(job, request)
+            job._wait_vbf_process_before2026(request)
+            with self.prepare_vbf_resume_execution(job, request):
+                request = worker._prepare_vbf_resume2026(job, request)
+            session = request.previous_session._next_vbf_prepare2026(job, request)
+            job._queue_vbf_prepare2026(request, session)
+            queued = True
             return 0
+        except BaseException as error:
+            if job is not None and request is not None and not queued:
+                try:
+                    job._abandon_vbf_process_before2026(request)
+                except BaseException as cleanup_error:  # noqa: BLE001 - preserve the triggering fault
+                    error.add_note(
+                        "VBF request cleanup: " + type(cleanup_error).__name__
+                    )
+            if is_native_exception2026(error):
+                status = self.check_j2534_connection()
+                return status if status else 3008
+            raise
+
+    @contextmanager
+    def prepare_vbf_resume_execution(self, job, request):
+        """Authorize only114's FULL36800 body on the external receipt issuer."""
+        from scripts.cuw_engine_threads import (
+            EngineThreadJob2026,
+            validate_vbf_process_before2026,
+        )
+
+        if type(job) is not EngineThreadJob2026 or job is not self._thread_job:
+            raise TypeError("Actual issued native thread job required")
+        job.validate_owner(self)
+        request = validate_vbf_process_before2026(request, job, states=("parked",))
+        job._validate_vbf_issuer2026(request)
+        worker = self.worker
+        if (
+            job.worker is not worker
+            or not job.native_worker_exists
+            or job.is_native_thread
+        ):
+            raise ValueError("Actual external parked-child VBF resume required")
+        with self._phase_state_lock:
+            if self._prepare_prefix_owner is not None:
+                raise ValueError("Native prepare prefix is already executing")
+            owner = (get_ident(), worker, job)
+            self._prepare_prefix_owner = owner
+            self._prepare_prefix_vbf_request2026 = request
+        try:
+            yield worker
         finally:
-            self._lock.release()
+            with self._phase_state_lock:
+                if self._prepare_prefix_owner is owner:
+                    self._prepare_prefix_owner = None
+                    self._prepare_prefix_vbf_request2026 = None
 
     def judge_usb_repro_suzuki(self) -> tuple[int, bool]:
         """CUW65830 status and Boolean out value, from loaded native metadata."""
@@ -4087,9 +4355,13 @@ class CUWEngine2026:
         if self._thread_job is not None and self._thread_job.native_work_pending:
             raise ValueError("Native worker has not reached its late idle checkpoint")
 
-    def reserve_phase(self, controller, phase: int):
+    def reserve_phase(self, controller, phase: int, *, _vbf_request=None):
         """Reserve the real engine phase before145 starts its native worker thread."""
-        from scripts.cuw_engine_threads import _issue_thread_phase_lease
+        from scripts.cuw_engine_threads import (
+            _has_vbf_request2026,
+            _issue_thread_phase_lease,
+            validate_vbf_process_before2026,
+        )
         from scripts.programming_2026_common import ControlCommPhase2026
 
         if type(controller) is not ControlCommPhase2026:
@@ -4097,13 +4369,33 @@ class CUWEngine2026:
         if type(phase) is not int or phase not in (0, 1, 2):
             raise ValueError("Native outer worker phase must be0..2")
         worker = self.bind_worker(controller)
-        self._require_prepare_dispatch(worker, phase)
+        if _vbf_request is None:
+            job = self._thread_job
+            if job is not None and _has_vbf_request2026(job):
+                raise ValueError(
+                    "Outstanding source-issued VBF resume blocks ordinary phase"
+                )
+            self._require_prepare_dispatch(worker, phase)
+        elif phase != 1:
+            raise ValueError("VBF resume receipt only admits native phase1")
         if not self._lock.acquire(blocking=False):
             raise ValueError("CUW phase is active")
         try:
             self._require_native_phase_idle()
             self._validate_persistence_source(self.native_metadata)
-            lease = _issue_thread_phase_lease(self, controller, phase)
+            if _vbf_request is not None:
+                job = self._thread_job
+                if job is None:
+                    raise ValueError("Actual VBF thread job required for reservation")
+                _vbf_request = validate_vbf_process_before2026(
+                    _vbf_request, job, states=("queued",)
+                )
+            lease = _issue_thread_phase_lease(
+                self,
+                controller,
+                phase,
+                _vbf_request=_vbf_request,
+            )
             with self._phase_state_lock:
                 self._cancelled.clear()
                 self._phase_finished = Event()
@@ -4125,11 +4417,19 @@ class CUWEngine2026:
                 or self._phase_thread is not None
             ):
                 raise ValueError("Unadopted native worker reservation required")
+            request = lease.vbf_request
             lease._release()
-            self._active = False
-            self._worker_phase = None
-            self._phase_finished.set()
-        self._lock.release()
+            try:
+                if request is not None:
+                    job = self._thread_job
+                    if job is None:
+                        raise ValueError("VBF phase lease lost its native job")
+                    job._release_vbf_phase2026(request, lease)
+            finally:
+                self._active = False
+                self._worker_phase = None
+                self._phase_finished.set()
+                self._lock.release()
 
     @contextmanager
     def controller_execution(self, controller, phase: int, *, lease=None):
@@ -4140,8 +4440,15 @@ class CUWEngine2026:
             raise TypeError("Concrete native controller required")
         if type(phase) is not int or phase not in (0, 1, 2):
             raise ValueError("Native outer worker phase must be0..2")
+        from scripts.cuw_engine_threads import _has_vbf_request2026
+
         if lease is None:
             worker = self.bind_worker(controller)
+            job = self._thread_job
+            if job is not None and _has_vbf_request2026(job):
+                raise ValueError(
+                    "Outstanding source-issued VBF resume blocks ordinary phase"
+                )
             self._require_prepare_dispatch(worker, phase)
             if not self._lock.acquire(blocking=False):
                 raise ValueError("CUW phase is active")
@@ -4150,8 +4457,13 @@ class CUWEngine2026:
             except BaseException:
                 self._lock.release()
                 raise
+            request = None
+            job = None
         else:
-            from scripts.cuw_engine_threads import validate_thread_phase_lease
+            from scripts.cuw_engine_threads import (
+                validate_thread_phase_lease,
+                validate_vbf_process_before2026,
+            )
 
             validate_thread_phase_lease(lease, self, controller=controller, phase=phase)
             if not self._active or self._phase_thread is not None:
@@ -4159,11 +4471,30 @@ class CUWEngine2026:
             worker = self._worker
             if worker is None or worker.controller is not controller:
                 raise ValueError("Reserved native worker identity changed")
-            self._require_prepare_dispatch(worker, phase)
-            lease._adopt()
+            job = self._thread_job
+            request = lease.vbf_request
+            if request is None:
+                if job is not None and _has_vbf_request2026(job):
+                    raise ValueError(
+                        "Outstanding source-issued VBF resume blocks ordinary phase"
+                    )
+                self._require_prepare_dispatch(worker, phase)
+            else:
+                if job is None or phase != 1:
+                    raise ValueError("Actual phase1 VBF resume lease required")
+                request = validate_vbf_process_before2026(
+                    request, job, states=("reserved",), lease=lease
+                )
         runtime = controller.runtime
         original_native_cancelled = runtime.native_cancelled
+        primary_error: BaseException | None = None
         try:
+            if lease is not None:
+                lease._adopt()
+                if request is not None:
+                    if job is None:
+                        raise ValueError("VBF phase lease lost its native job")
+                    request = job._consume_vbf_phase2026(request, lease)
             self._validate_persistence_source(self.native_metadata)
             with self._phase_state_lock:
                 if lease is None:
@@ -4182,20 +4513,27 @@ class CUWEngine2026:
                 # 3cb90 copies the requested outer phase into worker BD0;
                 # 59ab0 imports that byte into CONTROL +978 before raw Execute.
                 self.dh_state._native_comm_phase = phase
-                worker._phase_started(phase)
+                if request is None:
+                    worker._phase_started(phase)
+                else:
+                    worker._phase_started(phase, _vbf_request=request)
                 self._import_identifier_context(actual_control_import=True)
                 yield worker
                 self._end_native_control_context2026(controller)
                 worker._phase_finished(phase)
-            except (Exception, KeyboardInterrupt) as error:
+            except BaseException as error:
+                primary_error = error
                 self._end_native_control_context2026(controller, error)
                 try:
                     worker._phase_failed(error)
-                except (Exception, KeyboardInterrupt) as cleanup_error:  # noqa: BLE001 - preserve the original failure
+                except BaseException as cleanup_error:  # noqa: BLE001 - preserve the original failure
                     error.add_note(
                         "Worker failure cleanup: " + type(cleanup_error).__name__
                     )
                 raise
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
             self._end_native_control_context2026(controller)
             self._controller_export_target2026 = None
@@ -4209,8 +4547,22 @@ class CUWEngine2026:
                 self._active, self._phase_thread = False, None
                 self._phase_finished.set()
             if lease is not None:
-                lease._release()
-            self._lock.release()
+                try:
+                    lease._release()
+                    if request is not None:
+                        if job is None:
+                            raise ValueError("VBF phase lease lost its native job")
+                        job._release_vbf_phase2026(request, lease)
+                except BaseException as cleanup_error:
+                    if primary_error is None:
+                        raise
+                    primary_error.add_note(
+                        "Native phase lease cleanup: " + type(cleanup_error).__name__
+                    )
+                finally:
+                    self._lock.release()
+            else:
+                self._lock.release()
 
     def run_bound_phase(self, phase: int, session, runtime):
         """One concrete export within the controller's shared chronological runtime."""

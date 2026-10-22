@@ -2851,6 +2851,8 @@ _TY_THREAD_WRAPPERS = {
     "TYPlus": {
         "Ex2ABS_52_ReadBrakePadResidualThickness": (1, 10000),
         "Ex2ABS_52_WriteBrakePadResidualThickness": (1, 10000),
+        "Ex2ABS_29_SupportCheck": (0, 10000),
+        "Ex2ABS_29_ShiftDealerMode": (0, 10000),
         "Ex2ABS_41_DriveMotor": (1, 10000),
         "Ex2ABS_41_StopMotor": (1, 10000),
         "Ex2ABS_44_SendMessage": (0, 10000),

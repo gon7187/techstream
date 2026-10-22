@@ -35,6 +35,7 @@ from scripts.monitor_variable import (
     selected_variable_monitor_from_cache,
     selected_variable_packet_monitor,
     selected_variable_recording,
+    selected_variable_recording_setup,
     selected_variable_runtime_target,
     selected_variable_system_operation,
     selected_variable_voltage_monitor,
@@ -1322,6 +1323,18 @@ class VariableMonitorTests(unittest.TestCase):
             groups[table.table_id] = tuple(commands)
         self.assertEqual(groups[0x11], (0x101, 0x107, 0x111, 0x10A, 0x10C))
         self.assertEqual(groups[0x12], (0x10E, 0x108, 0x104))
+        assert runtime.targets[0].connection is not None
+        joined_setup, joined_stop = selected_variable_recording_setup(
+            (runtime.targets[0],),
+            runtime.targets[0].connection,
+            connected_device=8,
+        )
+        self.assertEqual(
+            tuple(command.command_id for command in joined_setup), groups[0x11]
+        )
+        self.assertEqual(
+            tuple(command.command_id for command in joined_stop), groups[0x12]
+        )
         with self.assertRaises(MonitorError) as disabled:
             selected_variable_recording(
                 runtime.targets[0],
@@ -1631,11 +1644,13 @@ class VariableMonitorTests(unittest.TestCase):
                 max_reply=12,
             )
             self.assertEqual(iso_plan.packing, plan.packing)
-            self.assertEqual(
-                check_variable_target_from_cache(
-                    iso_cache, (4,), observed, excluded=0
-                ).measurement,
-                VariableMeasurement(65, 6),
+            iso_measurement = check_variable_target_from_cache(
+                iso_cache, (4,), observed, excluded=0
+            )
+            self.assertEqual(iso_measurement.measurement, VariableMeasurement(65, 6))
+            iso_measurement = replace(
+                iso_measurement,
+                measurement=VariableMeasurement(65, 6, 4096),
             )
             iso_record = bytearray(56)
             struct.pack_into("<H", iso_record, 4, 7)
@@ -1651,6 +1666,83 @@ class VariableMonitorTests(unittest.TestCase):
             self.assertEqual(lifecycle.setup[0].values[2:5], (1, 0xC6, 123))
             self.assertNotIn(0x114, [item.command_id for item in lifecycle.setup])
             self.assertNotIn(0x116, [item.command_id for item in lifecycle.setup])
+            recording_iso = selected_variable_recording_setup(
+                (
+                    selected_variable_runtime_target(
+                        iso_plan,
+                        iso_cache,
+                        connection,
+                        measurement=iso_measurement,
+                        diagnostic_mode=bytes(16),
+                        phase=0,
+                        name=b"iso\0",
+                        text_encoding="ascii",
+                    ),
+                ),
+                connection,
+                connected_device=8,
+                iso_record=bytes(iso_record),
+                init_mode=2,
+                parameter_c0=123,
+            )
+            self.assertEqual(recording_iso[0][0].command_id, 0x100)
+
+    def test_flag9_default_length_uses_source_mode1_to20_fallback(self):
+        from scripts.diagnostic_db import Section
+
+        with tempfile.TemporaryDirectory() as directory:
+            profile = authored_profile(Path(directory) / "flag9-fallback")
+            category = bytearray(profile.category_record)
+            category[72] = 9
+            ecu_sections = dict(profile.database.sections)
+            ecu_sections.pop(3, None)
+            ecu_sections[6] = Section(6, 0, 1, False, bytes((0, 0, 9, 3, 1, 3, 0, 0)))
+            profile = replace(
+                profile,
+                category_record=bytes(category),
+                database=replace(profile.database, sections=ecu_sections),
+            )
+            management = profile.catalog.management
+            management_sections = dict(management.sections)
+            management_sections[16] = Section(16, 0, 1, False, bytes(category))
+            management_sections[18] = Section(
+                18, 0, 1, False, struct.pack("<8H", 1, 15, 1, 9, 0, 1, 0, 0)
+            )
+            profile.catalog.management = replace(
+                management, sections=management_sections
+            )
+            queries = []
+
+            def exchange(query):
+                queries.append(query.request)
+                return bytes((query.request[0] + 0x40,)) + query.request[1:] + b"AB"
+
+            cache = MonitorSupportCache(
+                profile, exchange, "flag9-fallback", bus_id=0x12, source_build=18
+            )
+            observed = {
+                key: key in (8, 12)
+                for key in (22, 10, 8, 9, 12, 25, 11, 26, 29, 27, 28, 35)
+            }
+            connection = selected_p4_connection(
+                profile,
+                bus_id=0x12,
+                diagnostic_mode=bytes(16),
+                controller_category_flags=9,
+            )
+            plan = selected_variable_packet_monitor(
+                cache,
+                (4,),
+                observed,
+                communication_protocol=0x12,
+                interface_id=connection.address.request_id,
+                excluded=0,
+                max_request=4,
+                max_reply=12,
+            )
+            self.assertEqual(plan.packing.mode, 0x20)
+            self.assertEqual(plan.attempts, ((1, 0xA0050422), (0x20, 0)))
+            self.assertEqual(plan.packing.setup_requests, (b"\x21\x09", b"\x61\x03"))
 
     def test_actual_voltage_selection_and_native_retry_host_boundaries(self):
         from scripts.monitor_dlc12 import DLC12VoltageState

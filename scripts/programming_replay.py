@@ -1420,6 +1420,63 @@ class ProgrammingReplay:
         following.selected_identity()
         return following
 
+    def _next_vbf_prepare2026(self, job, request):
+        """Build the unused raw prepare root from the authenticated FILE view."""
+        from scripts.cuw_engine_threads import validate_vbf_process_before2026
+
+        validated = validate_vbf_process_before2026(request, job, states=("prepared",))
+        if (
+            validated is not request
+            or self is not request.previous_session
+            or not self.used
+        ):
+            raise ValueError("Actual used previous raw root required")
+        container = request.container
+        digest = container.digest
+        if digest != request.source_sha256:
+            raise ValueError("Prepared FILE digest differs from its container")
+
+        context = dict(self.context)
+        observations = dict(context["observations"])
+        observations["current_cids"] = tuple(
+            identifier.decode("latin1") for identifier in request.received_identifiers
+        )
+        host = dict(observations["host"])
+        host["cpu_index"] = request.cpu_index
+        if "native2026" in host:
+            native = dict(host["native2026"])
+            native.pop("export", None)
+            native.pop("stage", None)
+            native["cpu_index"] = request.cpu_index
+            host["native2026"] = native
+        host.pop("export", None)
+        host.pop("stage", None)
+        observations["host"] = host
+        context.update(
+            operation="prepare",
+            node=request.node,
+            calibration_sha256=digest,
+            observations=observations,
+        )
+        input_hashes = dict(self.input_hashes)
+        input_hashes["calibration"] = digest
+
+        # Preserve owner identities without bind_engine2026's eager module selection.
+        return ProgrammingReplay(
+            container,
+            context,
+            self.catalog,
+            self.modules,
+            self.attachments,
+            self.trace,
+            input_hashes,
+            _engine2026=self._engine2026,
+            _runtime2026=self._runtime2026,
+            _controller2026=self._controller2026,
+            _catalog_sources=self._catalog_sources,
+            _module_files=self._module_files,
+        )
+
     def _next_control_export2026(self, target, export: str):
         """Clone one source-issued CONTROL export onto this exact shared trace."""
         from scripts.cuw_2026 import CUWEngine2026

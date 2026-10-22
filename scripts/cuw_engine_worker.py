@@ -992,10 +992,73 @@ class EngineWorker2026:
             retry._initialize_prepare_state(self, milliseconds)
 
     def _initialize_36800(self, milliseconds: int) -> None:
-        """Run36800 prefix and its later source-gated3e710 continuation."""
+        """Run the normal36800 prefix and source-gated3e710 continuation."""
         self._initialize_36800_prefix(milliseconds)
         self._apply_pending_cid_match_3e710()
         self._reapply_retained_selection_3e710()
+
+    def _acknowledge_vbf_process_before2026(self, job, request) -> bool:
+        """Publish the actual VBF1→2 handshake and its wait requirement."""
+        from scripts.cuw_engine_threads import (
+            EngineThreadJob2026,
+            validate_vbf_process_before2026,
+        )
+
+        if type(job) is not EngineThreadJob2026:
+            raise TypeError("Actual issued native thread job required")
+        job.validate_owner(self._engine, self._controller)
+        validate_vbf_process_before2026(request, job, states=("issued",))
+        job._validate_vbf_issuer2026(request)
+        with self._lock:
+            self.validate_source(self._engine)
+            if self.control_state.recovery_mode:
+                raise ValueError("Recovery-mode VBF phase resume is unsupported")
+            if (
+                native2026_cpu_values(self._engine.native_metadata, 0)
+                .get("cpuimagename", "")
+                .find(".vbf")
+                == -1
+            ):
+                raise ValueError("Actual first-CPU VBF source required")
+            if self._prepare_handshake == 1:
+                wait_required = True
+                self._prepare_handshake = 2
+            else:
+                if not job._child_parked.is_set():
+                    raise ValueError(
+                        "Non-handshake VBF admission requires parked child"
+                    )
+                wait_required = False
+        job._record_vbf_acknowledgement2026(request, wait_required=wait_required)
+        return wait_required
+
+    def _prepare_vbf_resume2026(self, job, request):
+        """Run36800's prepared VBF entry after the actual child has parked."""
+        from scripts.cuw_engine_threads import (
+            EngineThreadJob2026,
+            validate_vbf_process_before2026,
+        )
+        from scripts.cuw_file_services import validate_file_sources_2026
+
+        if type(job) is not EngineThreadJob2026:
+            raise TypeError("Actual issued native thread job required")
+        job.validate_owner(self._engine, self._controller)
+        validate_vbf_process_before2026(request, job, states=("parked",))
+        job._validate_vbf_issuer2026(request)
+        with self._lock:
+            self.validate_source(self._engine)
+            if self.control_state.recovery_mode:
+                raise ValueError("Recovery-mode VBF phase resume is unsupported")
+            self._engine._require_native_prepare_prefix(self)
+            self._engine._validate_persistence_source(self._engine.native_metadata)
+            if self._engine.file_sources is not None:
+                validate_file_sources_2026(self._engine.file_sources, self._engine)
+            self._runtime.check()
+            started = self._runtime.read_local_milliseconds_of_day()
+            self._initialize_36800_prefix(started)
+            self._prepare_handshake = 1
+            self._reapply_retained_selection_3e710()
+        return job._record_vbf_prepared2026(request, started_ms=started)
 
     def _apply_pending_cid_match_3e710(self) -> None:
         """Apply the exact34e10 match only at36800's source-gated3e710 site."""
@@ -1522,34 +1585,38 @@ class EngineWorker2026:
             self._selection_rebuild_pending = selection
 
     def _reapply_retained_selection_3e710(self) -> None:
-        """36800 reapplies the exact cached3e710 result after47e60 restoration."""
+        """Run the shared36800 D308 tail and any cached47e60 selection."""
         from scripts.calibration_2026 import (
             NativeCPUSelection2026,
             native2026_cid_rebuild_allowed,
         )
 
         selection = self._selection_rebuild_pending
-        if selection is None:
-            return
-        if type(selection) is not NativeCPUSelection2026:
+        if selection is not None and type(selection) is not NativeCPUSelection2026:
             raise TypeError("Actual typed34e10 FILE selection required")
         metadata = self._engine.native_metadata
-        if metadata is not selection.rebuilt_metadata:
+        if selection is not None and metadata is not selection.rebuilt_metadata:
             raise ValueError("36800 current FILE differs from cached FILE projection")
         index = self._current_file_index
         current_global_cpu_index = self._current_global_cpu_index
-        if native2026_cid_rebuild_allowed(metadata):
+        if selection is not None and native2026_cid_rebuild_allowed(metadata):
             self._cpu_offset = selection.cpu_offset
         if current_global_cpu_index == 0 and self._cpu_offset != 0:
             self._engine._select_worker_rebuilt_cpu(self._cpu_offset, worker=self)
             current_global_cpu_index = self._cpu_offset
             metadata = self._engine.native_metadata
-            selection = replace(selection, rebuilt_metadata=metadata)
-            selections = list(self._selections_by_file)
-            selections[index] = selection
-            self._selections_by_file = tuple(selections)
-            if self._delta_archive_active and self._delta_archive_clone_match:
-                self._retained_clone_selection = selection
+            if selection is not None:
+                selection = replace(selection, rebuilt_metadata=metadata)
+                selections = list(self._selections_by_file)
+                selections[index] = selection
+                self._selections_by_file = tuple(selections)
+                if self._delta_archive_active and self._delta_archive_clone_match:
+                    self._retained_clone_selection = selection
+        if selection is None:
+            self._current_node = metadata.node
+            self._current_cpu_index = metadata.cpu_index
+            self._current_global_cpu_index = current_global_cpu_index
+            return
         targets = list(self._targets_by_file)
         targets[index] = selection.target_indices
         self._targets_by_file = tuple(targets)
@@ -1611,7 +1678,6 @@ class EngineWorker2026:
             self._current_global_cpu_index = self._cpu_orders_by_file[
                 self._current_file_index
             ].index(actual_cpu_index)
-            self._cpu_offset = 0
             self._progress_base = sum(
                 max(
                     0,
@@ -2302,9 +2368,28 @@ class EngineWorker2026:
                 self._lifecycle = "ready"
             return continuation
 
-    def _phase_started(self, phase: int) -> None:
+    def _phase_started(self, phase: int, *, _vbf_request=None) -> None:
         if type(phase) is not int or phase not in (0, 1, 2, 3):
             raise ValueError("Native worker phase must be0..3")
+        if _vbf_request is not None:
+            job = self._engine.thread_job
+            if phase != 1 or job is None or not job.is_child_thread:
+                raise ValueError("Adopted VBF resume requires the actual child phase1")
+            from scripts.cuw_engine_threads import validate_vbf_process_before2026
+
+            lease = job._lease
+            if lease is None or lease.state != "adopted":
+                raise ValueError("Actual adopted VBF phase-one lease required")
+            request = validate_vbf_process_before2026(
+                _vbf_request,
+                job,
+                states=("adopted",),
+                lease=lease,
+            )
+            with self._lock:
+                self._phase_started_ms = request.started_ms
+                self._lifecycle = "running"
+            return
         with self._lock:
             if (
                 phase == 1

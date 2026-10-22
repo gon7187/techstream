@@ -1507,7 +1507,45 @@ class NativeRamTests(unittest.TestCase):
             raw_section = tse_reports.encode_section(section)
             decoded = tse_reports.decode_section("DDRData", raw_section)
             view = tse_reports.view_section(decoded, encoding="ascii")
-            self.assertEqual(view["ddr_headers"][0]["maximum_recording_count"], 17)
+            self.assertEqual(
+                [
+                    row["maximum_recording_count"]
+                    for row in view["ddr_headers"]
+                    if "maximum_recording_count" in row
+                ],
+                [17],
+            )
+            header_rows = [row for row in view["ddr_headers"] if "key_cycle_raw" in row]
+            pair_path = [
+                0,
+                1 + 2 * (version > 0x1004) + 4 * (version >= 0x1009),
+                0,
+            ]
+            self.assertEqual(len(header_rows), 1)
+            key_cycle = header_rows[0]
+            self.assertEqual(
+                key_cycle,
+                {
+                    "source_path": pair_path,
+                    "key_cycle_raw": 4,
+                    "key_cycle_precision_raw": main_info[12][5],
+                    "key_cycle_invalidity_raw": 2,
+                    "key_cycle_display": "-",
+                    "key_cycle_value_source_path": pair_path + [0, 11],
+                    "key_cycle_precision_source_path": pair_path + [0, 12, 5],
+                    "key_cycle_invalidity_source_path": pair_path + [1, 10],
+                },
+            )
+
+            for raw_name, source_name in (
+                ("key_cycle_raw", "key_cycle_value_source_path"),
+                ("key_cycle_precision_raw", "key_cycle_precision_source_path"),
+                ("key_cycle_invalidity_raw", "key_cycle_invalidity_source_path"),
+            ):
+                value = decoded.records
+                for index in key_cycle[source_name]:
+                    value = value[index]
+                self.assertEqual(value, key_cycle[raw_name])
             self.assertEqual(
                 [
                     (item["normal_logical_id"], item["present_raw"], item["value_raw"])

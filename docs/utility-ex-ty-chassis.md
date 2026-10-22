@@ -32,7 +32,10 @@ stack arguments omitted by the untyped decompiler. Implemented groups:
   neutral/calibration starts and the single native delayed retry
   (`897d0`..`89c10`). Routine cleanup errors do not replace the native result.
 - ABS29: five support mask predicates and dealer-mode/readback with its
-  distinct native status mapping (`88ff0`..`892f0`).
+  distinct native status mapping (`88ff0`..`892f0`). The zero-argument
+  support and shift exports are admitted for the exact TY18 and Plus images;
+  their host-fault path attempts bounded normal-session cleanup after
+  initialization and preserves the original exception through finalization.
 - ABS33/34: selected support DID/routine chain, eleven paired sensor booleans,
   dealer/normal transitions and complete memory clear (`8a110`..`8a710`).
 - ABS41: DID support, two timed selected solenoid phases, motor drive/stop

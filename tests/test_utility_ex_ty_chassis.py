@@ -5219,6 +5219,53 @@ class ChassisTests(unittest.TestCase):
         self.assertEqual(engine().run_body("Ex2ABS_29_ShiftDealerMode", (), ctx), 0)
         self.assertEqual(ctx.sleeps, [4000])
 
+    def test_abs29_checks_echo_without_requiring_positive_sid(self):
+        support = [
+            b"\0\1\1\0\0\x80",
+            b"\0\x10\0\0\0\0\0\0\x08",
+            b"\0\x10\x2d" + bytes(8) + b"\x08",
+            b"\0\1\x10\1\0\0\x40",
+            b"\0\1\x11\0\0\x10",
+        ]
+        comm = Comm([(0, reply) for reply in support], sessions=[0, 0, 47])
+        self.assertEqual(
+            engine().run_body("Ex2ABS_29_SupportCheck", (), Context(comm)), 47
+        )
+
+        comm = Comm([(0, b"\0\1\x11\x0c"), (0, b"\0\x10\x2d" + bytes(9) + b"\x08")])
+        self.assertEqual(
+            engine().run_body("Ex2ABS_29_ShiftDealerMode", (), Context(comm)), 0
+        )
+
+    def test_abs29_host_fault_restores_normal_and_preserves_primary(self):
+        primary = RuntimeError("ABS29 exchange failed")
+        cleanup_fault = RuntimeError("normal cleanup failed")
+        finalize_fault = RuntimeError("finalize failed")
+
+        class FaultingComm(Comm):
+            def exchange(self, request):
+                self.events.append(("exchange", request))
+                raise primary
+
+            def cleanup_session(self, mode, keepalive=1, **kwargs):
+                self.events.append(("cleanup_session", mode, keepalive))
+                raise cleanup_fault
+
+            def finalize(self):
+                self.events.append(("finalize",))
+                raise finalize_fault
+
+        comm = FaultingComm()
+        with self.assertRaises(RuntimeError) as raised:
+            engine().run_body("Ex2ABS_29_SupportCheck", (), Context(comm))
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(
+            [event for event in comm.events if event[0] == "cleanup_session"],
+            [("cleanup_session", 1, 1)],
+        )
+        self.assertEqual(comm.events.count(("finalize",)), 1)
+
     def test_4wd07_support_consumes_exact_native_bitmaps(self):
         first = bytearray(b"\x71\1\x10\1" + bytes(32))
         first[6] = 0x40

@@ -63,6 +63,171 @@ def archive(rows):
 
 
 class ManagedServicesTests(unittest.TestCase):
+    def test_actual141_transition_keeps_recovery_position_while_cpu_resets(self):
+        from scripts.calibration_2026 import native2026_metadata_for_cpu
+        from scripts.cuw_file_services import admit_file_sources_2026
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+        from scripts.programming_2026_common import NativeRuntime2026
+        from tests.test_cuw_engine_worker import calibration, make_controller
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        part = calibration(cpus=2, first_target="PART")
+        whole = calibration(cpus=2, first_target="WHOLE")
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as stream:
+            stream.writestr(
+                "Setting.ini",
+                "[DeltaReproCalFile]\nFileNum=1\nFileName1=part.cuw\n"
+                "[WholeReproCalFile]\nFileName=whole.cuw\n",
+            )
+            stream.writestr("part.cuw", part)
+            stream.writestr("whole.cuw", whole)
+        bundle = (
+            b"[Vehicle]\nContactType=P5-Unified\n[DataCompression]\n"
+            + payload.getvalue()
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(
+                Path(directory),
+                ReproInfoState(
+                    (RecoveryCalibration("source.cuw", calibration(cpus=2)),),
+                    loaded=True,
+                    offset_of_write_cpu_multi_cal_index=1,
+                ),
+            )
+            engine = CUWEngine2026(image.read_bytes())
+            engine.configure(struct.pack("<IIddII", 2, 0, 0, 0, 0, 0))
+            engine.load_cuw(calibration(cpus=2))
+            engine.bind_persistence(persistence)
+            issued = admit_file_sources_2026(engine, "direct.scuw", bundle, region=0)
+            engine.bind_file_sources(issued)
+            self.addCleanup(engine.close)
+            controller = make_controller(NativeRuntime2026(lambda *_args: None))
+            worker = engine.bind_worker(controller)
+
+            with engine.controller_execution(controller, 2):
+                selected = native2026_metadata_for_cpu(engine.native_metadata, 1)
+                engine._select_worker_metadata(
+                    selected, controller=controller, worker=worker
+                )
+                worker._persist_position()
+                self.assertEqual(persistence.state.write_cpu_index, 1)
+                replacement = issued.after_group_reset(0, worker=worker)
+                engine._accept_worker_file_reset(issued, replacement, worker=worker)
+
+            self.assertEqual(worker.source_state.cpu_offset, 1)
+            self.assertEqual(worker.source_state.current_global_cpu_index, 0)
+            self.assertEqual(persistence.state.write_cpu_index, 1)
+            engine._validate_persistence_source(engine.native_metadata)
+            with engine.controller_execution(controller, 2):
+                chained = replacement.after_group_reset(0, worker=worker)
+                engine._accept_worker_file_reset(replacement, chained, worker=worker)
+            transition = engine._persistence_cpu_transition2026
+            assert transition is not None
+            self.assertEqual((transition.before_cpu, transition.after_cpu), (0, 0))
+            engine._validate_persistence_source(engine.native_metadata)
+            snapshot = persistence._snapshot()
+            engine._validate_persistence_source(
+                engine.native_metadata, state_snapshot=snapshot
+            )
+            self.assertIs(engine._persistence_cpu_transition2026, transition)
+            engine._persistence_cpu_transition2026 = None
+            with self.assertRaisesRegex(ValueError, "actual engine target"):
+                engine._validate_persistence_source(engine.native_metadata)
+            engine._persistence_cpu_transition2026 = transition
+            with self.assertRaisesRegex(ValueError, "Finish and release"):
+                engine.bind_file_sources(issued)
+            self.assertIs(engine._persistence_cpu_transition2026, transition)
+            engine._validate_persistence_source(engine.native_metadata)
+            stale_fields = {
+                "origin": object(),
+                "worker": object(),
+                "persistence": object(),
+                "state": object(),
+                "metadata": replace(engine.native_metadata),
+                "file_sources": object(),
+                "container": object(),
+                "digest": "0" * 64,
+                "node": transition.node + 1,
+                "persisted_cpu": 2,
+                "after_cpu": transition.after_cpu + 1,
+            }
+            for field, value in stale_fields.items():
+                with self.subTest(stale_field=field):
+                    engine._persistence_cpu_transition2026 = replace(
+                        transition, **{field: value}
+                    )
+                    with self.assertRaisesRegex(ValueError, "actual engine target"):
+                        engine._validate_persistence_source(engine.native_metadata)
+            engine._persistence_cpu_transition2026 = transition
+            persistence.update_cpu(1)
+            engine._validate_persistence_source(engine.native_metadata)
+            with engine.controller_execution(controller, 2):
+                persistence.update_cpu(2)
+                self.assertIsNone(engine._persistence_cpu_transition2026)
+                with self.assertRaisesRegex(ValueError, "actual engine target"):
+                    engine._validate_persistence_source(engine.native_metadata)
+                worker._persist_position()
+            self.assertEqual(persistence.state.write_cpu_index, 0)
+            engine._validate_persistence_source(engine.native_metadata)
+            with engine.controller_execution(controller, 2):
+                selected = native2026_metadata_for_cpu(engine.native_metadata, 1)
+                engine._select_worker_metadata(
+                    selected, controller=controller, worker=worker
+                )
+                worker._persist_position()
+            self.assertEqual(persistence.state.write_cpu_index, 1)
+            engine._validate_persistence_source(engine.native_metadata)
+            current_sources = engine.file_sources
+            assert current_sources is not None
+            with engine.controller_execution(controller, 2):
+                replacement = current_sources.after_group_reset(0, worker=worker)
+                engine._accept_worker_file_reset(
+                    current_sources, replacement, worker=worker
+                )
+            self.assertIsNotNone(engine._persistence_cpu_transition2026)
+            engine._validate_persistence_source(engine.native_metadata)
+            with engine.controller_execution(controller, 2):
+                selected = native2026_metadata_for_cpu(engine.native_metadata, 1)
+                engine._select_worker_metadata(
+                    selected, controller=controller, worker=worker
+                )
+                worker._persist_position()
+            self.assertIsNone(engine._persistence_cpu_transition2026)
+            engine._validate_persistence_source(engine.native_metadata)
+            current_sources = engine.file_sources
+            assert current_sources is not None
+            with engine.controller_execution(controller, 2):
+                replacement = current_sources.after_group_reset(0, worker=worker)
+                engine._accept_worker_file_reset(
+                    current_sources, replacement, worker=worker
+                )
+            self.assertIsNotNone(engine._persistence_cpu_transition2026)
+            engine._validate_persistence_source(engine.native_metadata)
+            cleanup = engine.bind_cleanup_controller()
+            failing_replacement = replacement.after_group_reset(0, worker=worker)
+            with (
+                engine.controller_execution(controller, 2),
+                patch.object(
+                    cleanup,
+                    "accept_file_reset",
+                    side_effect=RuntimeError("cleanup acceptance fault"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "cleanup acceptance"),
+            ):
+                engine._accept_worker_file_reset(
+                    replacement, failing_replacement, worker=worker
+                )
+            self.assertIsNone(engine._persistence_cpu_transition2026)
+            with self.assertRaisesRegex(ValueError, "actual engine target"):
+                engine._validate_persistence_source(engine.native_metadata)
+
     def test_divided_image_resume_preserves_percentage(self):
         from scripts.demo_calibration import table
         from scripts.programming_2026_common import NativeGeneralParameters2026
@@ -836,6 +1001,7 @@ class ManagedServicesTests(unittest.TestCase):
 
     def test_before_hook_uses_global_parameters_and_actual_voltage(self):
         from scripts.demo_calibration import table
+        from scripts.j2534_2026 import J2534InterfacePair2026
         from scripts.programming_2026_common import (
             NativeCallbackLookupError,
             NativeGeneralParameters2026,
@@ -855,8 +1021,11 @@ class ManagedServicesTests(unittest.TestCase):
             )
 
         device = J2534Device2026(primitive)
+        engine_device = J2534Device2026(primitive)
+        pair = J2534InterfacePair2026(engine_device, device)
         with CUWEngine2026(image.read_bytes()) as engine:
             self.assertEqual(engine.process_before_reprogramming(None, None), 3008)
+            engine.bind_interface_pair(pair)
             engine.configure(struct.pack("<IIddII", 1, 0, 0, 0, 0, 0))
             engine.load_cuw(cuw(cpu_text().replace(".vbf", ".bin")))
             for enabled in ("0", "1"):
@@ -871,8 +1040,12 @@ class ManagedServicesTests(unittest.TestCase):
                 )
                 if enabled == "1":
                     device.open()
+                    engine_device.opened, engine_device.device_id = (
+                        device.opened,
+                        device.device_id,
+                    )
                 self.assertEqual(
-                    engine.process_before_reprogramming(parameters, device), 0
+                    engine.process_before_reprogramming(parameters, engine_device), 0
                 )
             self.assertEqual(
                 calls[-1],
@@ -884,10 +1057,10 @@ class ManagedServicesTests(unittest.TestCase):
                 },
             )
             engine.load_cuw(cuw(cpu_text()))
-            device.set_programming_voltage(15, 0xFFFFFFFF)
+            engine_device.set_programming_voltage(15, 0xFFFFFFFF)
             count = len(calls)
             with self.assertRaises(NotImplementedError):
-                engine.process_before_reprogramming(parameters, device)
+                engine.process_before_reprogramming(parameters, engine_device)
             self.assertEqual(len(calls), count + 1)
             self.assertEqual(calls[-1]["operation"], "passthru_voltage")
             self.assertEqual(calls[-1]["voltage"], 0xFFFFFFFE)
@@ -899,11 +1072,269 @@ class ManagedServicesTests(unittest.TestCase):
                 },
                 encoded=False,
             )
-            with self.assertRaises(NativeCallbackLookupError) as caught:
-                engine.process_before_reprogramming(missing, device)
+            with (
+                patch.object(engine, "check_j2534_connection") as check,
+                self.assertRaises(NativeCallbackLookupError) as caught,
+            ):
+                engine.process_before_reprogramming(missing, engine_device)
+            check.assert_not_called()
             self.assertEqual(caught.exception.code, 2)
             self.assertFalse(engine.native_cancelled())
+        engine_device.close()
         device.close()
+
+    def test_before_hook_normal_native_voltage_errors_use_canonical_catch(self):
+        from scripts.demo_calibration import table
+        from scripts.j2534_2026 import J2534InterfacePair2026, NativeJ2534Error2026
+        from scripts.programming_2026_common import NativeGeneralParameters2026
+        from tests.test_calibration_2026 import cpu_text, cuw
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        parameters = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": table(
+                    ("ParamFileKeySystemProtocolMicon", "FlagToChangeWFSE"),
+                    (("149P5-Unified", "1"),),
+                )
+            },
+            encoded=False,
+        )
+
+        for status, expected in ((0, 3008), (0xFA3, 0xFA3)):
+            with (
+                self.subTest(status=status),
+                CUWEngine2026(image.read_bytes()) as engine,
+            ):
+                engine.configure(struct.pack("<IIddII", 1, 0, 0, 0, 0, 0))
+                engine.load_cuw(cuw(cpu_text().replace(".vbf", ".bin")))
+
+                def native_provider(request, _remaining):
+                    if request["operation"] == "passthru_open":
+                        return PrimitiveResult(value=11)
+                    if request["operation"] == "passthru_voltage":
+                        raise NativeJ2534Error2026(9)
+                    return PrimitiveResult()
+
+                control = J2534Device2026(native_provider)
+                engine_device = J2534Device2026(native_provider)
+                engine.bind_interface_pair(
+                    J2534InterfacePair2026(engine_device, control)
+                )
+                control.open()
+                engine_device.opened, engine_device.device_id = (
+                    control.opened,
+                    control.device_id,
+                )
+                with patch.object(
+                    engine, "check_j2534_connection", return_value=status
+                ) as check:
+                    self.assertEqual(
+                        engine.process_before_reprogramming(parameters, engine_device),
+                        expected,
+                    )
+                check.assert_called_once_with()
+                control.close()
+                engine_device.close()
+
+        with CUWEngine2026(image.read_bytes()) as engine:
+            engine.configure(struct.pack("<IIddII", 1, 0, 0, 0, 0, 0))
+            engine.load_cuw(cuw(cpu_text().replace(".vbf", ".bin")))
+            fault = OSError("host voltage fault")
+
+            def host_provider(request, _remaining):
+                if request["operation"] == "passthru_open":
+                    return PrimitiveResult(value=11)
+                if request["operation"] == "passthru_voltage":
+                    raise fault
+                return PrimitiveResult()
+
+            control = J2534Device2026(host_provider)
+            engine_device = J2534Device2026(host_provider)
+            engine.bind_interface_pair(J2534InterfacePair2026(engine_device, control))
+            control.open()
+            engine_device.opened, engine_device.device_id = (
+                control.opened,
+                control.device_id,
+            )
+            with (
+                patch.object(engine, "check_j2534_connection") as check,
+                self.assertRaises(OSError) as caught,
+            ):
+                engine.process_before_reprogramming(parameters, engine_device)
+            self.assertIs(caught.exception, fault)
+            check.assert_not_called()
+            control.close()
+            engine_device.close()
+
+    def test_vbf_prepare_prefix_rejects_a_forged_receipt(self):
+        from scripts.programming_2026_common import NativeRuntime2026
+        from tests.test_calibration_2026 import cpu_text, cuw
+        from tests.test_cuw_engine_worker import make_controller
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        with CUWEngine2026(image.read_bytes()) as engine:
+            engine.configure(struct.pack("<IIddII", 1, 0, 0, 0, 0, 0))
+            engine.load_cuw(cuw(cpu_text()))
+            controller = make_controller(NativeRuntime2026(lambda *_args: None))
+            job = engine.bind_thread_job(controller)
+            self.addCleanup(job.stop)
+            with (
+                self.assertRaises(TypeError),
+                engine.prepare_vbf_resume_execution(job, object()),
+            ):
+                self.fail("A caller-created receipt must never own36800")
+
+    def test_outstanding_vbf_receipt_blocks_ordinary_engine_admission(self):
+        from scripts.programming_2026_common import NativeRuntime2026
+        from tests.test_calibration_2026 import cpu_text, cuw
+        from tests.test_cuw_engine_worker import make_controller
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        with CUWEngine2026(image.read_bytes()) as engine:
+            engine.configure(struct.pack("<IIddII", 1, 0, 0, 0, 0, 0))
+            engine.load_cuw(cuw(cpu_text()))
+            controller = make_controller(NativeRuntime2026(lambda *_args: None))
+            job = engine.bind_thread_job(controller)
+            self.addCleanup(job.stop)
+            with patch(
+                "scripts.cuw_engine_threads._has_vbf_request2026", return_value=True
+            ):
+                with self.assertRaisesRegex(ValueError, "VBF resume"):
+                    engine.reserve_phase(controller, 0)
+                with (
+                    self.assertRaisesRegex(ValueError, "VBF resume"),
+                    engine.controller_execution(controller, 0),
+                ):
+                    self.fail("Ordinary phase must not bypass a VBF receipt")
+
+            lease = engine.reserve_phase(controller, 0)
+            with (
+                patch(
+                    "scripts.cuw_engine_threads._has_vbf_request2026",
+                    return_value=True,
+                ),
+                self.assertRaisesRegex(ValueError, "VBF resume"),
+                engine.controller_execution(controller, 0, lease=lease),
+            ):
+                self.fail("An old ordinary lease must not bypass a VBF receipt")
+            engine.release_reserved_phase(lease)
+
+    def test_before_hook_vbf_literal_and_native_catch_boundary(self):
+        from scripts.demo_calibration import table
+        from scripts.j2534_2026 import J2534InterfacePair2026, NativeJ2534Error2026
+        from scripts.programming_2026_common import NativeGeneralParameters2026
+        from tests.test_calibration_2026 import cpu_text, cuw
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        parameters = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": table(
+                    ("ParamFileKeySystemProtocolMicon", "FlagToChangeWFSE"),
+                    (("149P5-Unified", "1"),),
+                )
+            },
+            encoded=False,
+        )
+
+        with CUWEngine2026(image.read_bytes()) as engine:
+            engine.configure(struct.pack("<IIddII", 1, 0, 0, 0, 0, 0))
+            engine.load_cuw(cuw(cpu_text().replace(".vbf", ".VBF")))
+            calls = []
+
+            def provider(request, _remaining):
+                calls.append(request["operation"])
+                return PrimitiveResult(
+                    value=11 if request["operation"] == "passthru_open" else None
+                )
+
+            control = J2534Device2026(provider)
+            engine_device = J2534Device2026(provider)
+            engine.bind_interface_pair(J2534InterfacePair2026(engine_device, control))
+            control.open()
+            engine_device.opened, engine_device.device_id = (
+                control.opened,
+                control.device_id,
+            )
+            self.assertEqual(
+                engine.process_before_reprogramming(parameters, engine_device), 0
+            )
+            self.assertEqual(calls.count("passthru_voltage"), 1)
+            control.close()
+            engine_device.close()
+
+        for status, expected in ((0, 3008), (0xFA3, 0xFA3)):
+            with (
+                self.subTest(status=status),
+                CUWEngine2026(image.read_bytes()) as engine,
+            ):
+                engine.configure(struct.pack("<IIddII", 1, 0, 0, 0, 0, 0))
+                engine.load_cuw(cuw(cpu_text()))
+
+                def native_provider(request, _remaining):
+                    if request["operation"] == "passthru_open":
+                        return PrimitiveResult(value=11)
+                    if request["operation"] == "passthru_voltage":
+                        raise NativeJ2534Error2026(9)
+                    return PrimitiveResult()
+
+                control = J2534Device2026(native_provider)
+                engine_device = J2534Device2026(native_provider)
+                engine.bind_interface_pair(
+                    J2534InterfacePair2026(engine_device, control)
+                )
+                control.open()
+                engine_device.opened, engine_device.device_id = (
+                    control.opened,
+                    control.device_id,
+                )
+                with patch.object(
+                    engine, "check_j2534_connection", return_value=status
+                ) as check:
+                    self.assertEqual(
+                        engine.process_before_reprogramming(parameters, engine_device),
+                        expected,
+                    )
+                check.assert_called_once_with()
+                control.close()
+                engine_device.close()
+
+        with CUWEngine2026(image.read_bytes()) as engine:
+            engine.configure(struct.pack("<IIddII", 1, 0, 0, 0, 0, 0))
+            engine.load_cuw(cuw(cpu_text()))
+            sentinel = OSError("native-looking provider failure is still host-owned")
+
+            def host_provider(request, _remaining):
+                if request["operation"] == "passthru_open":
+                    return PrimitiveResult(value=11)
+                if request["operation"] == "passthru_voltage":
+                    raise sentinel
+                return PrimitiveResult()
+
+            control = J2534Device2026(host_provider)
+            engine_device = J2534Device2026(host_provider)
+            engine.bind_interface_pair(J2534InterfacePair2026(engine_device, control))
+            control.open()
+            engine_device.opened, engine_device.device_id = (
+                control.opened,
+                control.device_id,
+            )
+            with (
+                patch.object(engine, "check_j2534_connection") as check,
+                self.assertRaises(OSError) as caught,
+            ):
+                engine.process_before_reprogramming(parameters, engine_device)
+            self.assertIs(caught.exception, sentinel)
+            check.assert_not_called()
+            control.close()
+            engine_device.close()
 
     def test_engine_capacity_and_progress_use_all_native_nodes(self):
         from tests.test_calibration_2026 import cuw

@@ -93,6 +93,110 @@ class ProgrammingReplayTests(unittest.TestCase):
             cancelled=cancelled,
         )
 
+    def test_vbf_resume_root_is_fresh_and_uses_prepared_source_view(self):
+        from scripts.programming_replay import ProgrammingReplay
+
+        session = self.load()
+        session.used = True
+        runtime, controller, engine, job = (object() for _ in range(4))
+        session._runtime2026 = runtime
+        session._controller2026 = controller
+        session._engine2026 = engine
+        session.context["observations"]["host"].update(
+            stage="stale-stage",
+            native2026={"export": "stale-export", "stage": "stale-stage", "keep": 1},
+        )
+        container = SimpleNamespace(digest="a" * 64)
+        request = SimpleNamespace(
+            previous_session=session,
+            container=container,
+            source_sha256=container.digest,
+            node=3,
+            cpu_index=2,
+            received_identifiers=(b"CID\x00", b"\xff"),
+        )
+        trace_position = session.trace.position
+        from scripts import cuw_engine_threads
+
+        with (
+            patch.object(
+                cuw_engine_threads,
+                "validate_vbf_process_before2026",
+                return_value=request,
+                create=True,
+            ) as validate,
+            patch.object(
+                session,
+                "selected_identity",
+                side_effect=AssertionError(
+                    "root construction must not select a module"
+                ),
+            ) as select_identity,
+        ):
+            following = session._next_vbf_prepare2026(job, request)
+
+        validate.assert_called_once_with(request, job, states=("prepared",))
+        select_identity.assert_not_called()
+        self.assertIs(type(following), ProgrammingReplay)
+        self.assertIs(following.container, container)
+        self.assertEqual(following.context["operation"], "prepare")
+        self.assertEqual(following.context["node"], 3)
+        self.assertEqual(following.context["calibration_sha256"], "a" * 64)
+        self.assertEqual(
+            following.context["observations"]["current_cids"], ("CID\x00", "\xff")
+        )
+        host = following.context["observations"]["host"]
+        self.assertEqual(host["cpu_index"], 2)
+        self.assertEqual(host["native2026"], {"keep": 1, "cpu_index": 2})
+        self.assertNotIn("export", host["native2026"])
+        self.assertNotIn("stage", host)
+        self.assertNotIn("export", host)
+        self.assertEqual(following.input_hashes["calibration"], "a" * 64)
+        for name in (
+            "catalog",
+            "modules",
+            "attachments",
+            "trace",
+            "_catalog_sources",
+            "_module_files",
+        ):
+            self.assertIs(getattr(following, name), getattr(session, name))
+        self.assertIs(following._runtime2026, runtime)
+        self.assertIs(following._controller2026, controller)
+        self.assertIs(following._engine2026, engine)
+        self.assertFalse(following.used)
+        for name in (
+            "_selection2026",
+            "_executed_selection2026",
+            "_control_target2026",
+            "_control_export2026",
+            "_retained_export2026",
+            "_alternate_parent2026",
+        ):
+            self.assertIsNone(getattr(following, name))
+        host["native2026"]["keep"] = 2
+        self.assertEqual(
+            session.context["observations"]["host"]["native2026"]["keep"], 1
+        )
+        self.assertEqual(session.trace.position, trace_position)
+
+    def test_vbf_resume_root_rejects_a_different_previous_root(self):
+        session = self.load()
+        session.used = True
+        request = SimpleNamespace(previous_session=object())
+        from scripts import cuw_engine_threads
+
+        with (
+            patch.object(
+                cuw_engine_threads,
+                "validate_vbf_process_before2026",
+                return_value=request,
+                create=True,
+            ),
+            self.assertRaisesRegex(ValueError, "previous raw root"),
+        ):
+            session._next_vbf_prepare2026(object(), request)
+
     def test_fresh_clone_actual_import_metadata_writer_and_identity(self):
         from scripts.calibration_catalog import inspect_module_bytes
 

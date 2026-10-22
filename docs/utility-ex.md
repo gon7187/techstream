@@ -26,6 +26,10 @@ mode22 contracts. MS2 ABS05 and EFI02 retain their native zero-argument ABI.
 MS2 pressure validation runs directly in every mode. STR GetRegKeyNumAfter
 preserves its native pointer-global writes before mode rejection.
 
+ABS29 support and dealer-mode shift are separately admitted as zero-argument
+mode20/21 thread wrappers for exact TY18 and Plus images, both with a10000ms
+deadline. The Plus body selects its own manager and configuration.
+
 `Ex2SMRT_32_EndEraseMode` preserves its actual no-argument NKDS4/NKPlus ABI and
 its older one-argument NK12/NK18 ABI. Source-specific provider admission excludes
 ABS36/37/38 from NK12. Private wrapper and body evidence lives in the imported

@@ -26,6 +26,14 @@ from scripts.signal_display import render_signal
 MAX_BYTES = snapshot.MAX_BYTES
 MAX_NODES = 100_000
 ReportError = snapshot.SnapshotError
+_SEQUENCE_CHECK_BYTES = 384
+
+
+def _charge_sequence_check(budget: list[int]) -> None:
+    if budget[0] + 1 > MAX_NODES or budget[1] + _SEQUENCE_CHECK_BYTES > MAX_BYTES:
+        raise ReportError("DDR sequence admission metadata exceeds aggregate budget")
+    budget[0] += 1
+    budget[1] += _SEQUENCE_CHECK_BYTES
 
 
 @dataclass(frozen=True)
@@ -1460,6 +1468,7 @@ def view_section(
     }
 
     signal_masks: dict[tuple, tuple[tuple, tuple, bool | None]] = {}
+    sequence_masks: dict[tuple, tuple[tuple, tuple]] = {}
 
     def text(raw: bytes) -> str:
         try:
@@ -1539,6 +1548,43 @@ def view_section(
         if layout.kind == "ddr-mask":
             info, masks = value
             ads = layout.flavor == 1
+            value_slot, signal_slot, invalidity_slot = (
+                (8, 9, 7) if ads else (11, 12, 10)
+            )
+            raw = info[value_slot]
+            precision = info[signal_slot][5]
+            invalidity = masks[invalidity_slot]
+            if invalidity or raw >= 0x80000000:
+                display = "-"
+            elif precision > 8:
+                display = None
+            elif precision:
+                scale = 10**precision
+                display = f" {raw // scale}.{raw % scale:0{precision}d}".zfill(5)
+            else:
+                display = str(raw).zfill(5)
+            emit(
+                "ddr_headers",
+                {
+                    "key_cycle_raw": raw,
+                    "key_cycle_precision_raw": precision,
+                    "key_cycle_invalidity_raw": invalidity,
+                    "key_cycle_display": display,
+                    **(
+                        {"key_cycle_display_status": "source-semantics-open"}
+                        if precision > 8 and display is None
+                        else {}
+                    ),
+                    "key_cycle_value_source_path": list(path + (0, value_slot)),
+                    "key_cycle_precision_source_path": list(path + (0, signal_slot, 5)),
+                    "key_cycle_invalidity_source_path": list(
+                        path + (1, invalidity_slot)
+                    ),
+                },
+                path,
+            )
+            if not ads:
+                sequence_masks[path + (0, 24)] = (masks, path)
             side = (20 if layout.version < 0x100A else 19) if ads else 25
             mask_slot = (17 if layout.version < 0x100A else 16) if ads else 22
             for mode in (0, 1):
@@ -1654,6 +1700,38 @@ def view_section(
                             display_source="native-invalid-resource",
                             invalid_display_resource="DISPLAY_VALUE_INVALID",
                         )
+            sequence = sequence_masks.get(path)
+            if sequence is not None:
+                raw_masks, pair_path = sequence
+                for index, sample in enumerate(values):
+                    _charge_sequence_check(budget)
+                    checks = []
+                    for order, slot in enumerate((21, 0, 1)):
+                        if order and (index == 0 or not checks[-1]["passes"]):
+                            break
+                        if order:
+                            _charge_sequence_check(budget)
+                        mask_values = raw_masks[slot]
+                        byte_raw = (
+                            mask_values[index] if index < len(mask_values) else None
+                        )
+                        passes = byte_raw == 0
+                        checks.append(
+                            {
+                                "mask_slot": slot,
+                                "byte_raw": byte_raw,
+                                "source_path": list(pair_path + (1, slot, index))
+                                if byte_raw is not None
+                                else None,
+                                "passes": passes,
+                            }
+                        )
+                        if not passes:
+                            break
+                    sample.update(
+                        sequence_format_admitted=all(item["passes"] for item in checks),
+                        sequence_format_checks=checks,
+                    )
             emit(
                 "parameters",
                 {

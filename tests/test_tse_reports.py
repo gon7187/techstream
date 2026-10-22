@@ -71,6 +71,229 @@ def minimal(layout: Any, expand: int = 0, scope: tuple = ()) -> Any:
 
 
 class ReportTests(unittest.TestCase):
+    def test_normal_ddr3_sequence_admission_is_ordered_and_slot_bound(self):
+        version = 0x1027
+        root = list(
+            minimal(report._section_layout("DDRData", 0xFFFFFF31, version).item)
+        )
+        info = list(minimal(report._layout("b1340", version)))
+        masks = list(minimal(report._layout("b1760", version)))
+
+        def saved_signal(name, samples):
+            value = list(minimal(report._signal(version, 7, False)))
+            value[0], value[1], value[-1] = 303, name.encode(), samples
+            return tuple(value)
+
+        target_samples = tuple(
+            (100 + index, f"target-{index}".encode(), 0xA5) for index in range(5)
+        )
+        info[12] = saved_signal("sibling-12", ((1, b"sibling-12", 2),))
+        info[14] = saved_signal("sibling-14", ((2, b"sibling-14", 3),))
+        info[24] = saved_signal("target", target_samples)
+        masks[21], masks[0], masks[1] = (
+            (0, 1, 0, 0, 0),
+            (0, 0, 0, 0, 1),
+            (0, 0, 255, 0, 0),
+        )
+        root[7] = ((tuple(info), tuple(masks)),)
+
+        ads_info = list(minimal(report._layout("b2190", version)))
+        ads_masks = list(minimal(report._layout("b2560", version)))
+        ads_signal = list(minimal(report._signal(version, 7, False)))
+        ads_signal[0], ads_signal[-1] = 303, ((9, b"ADS text", 4),)
+        ads_info[11] = tuple(ads_signal)
+        ads_masks[8] = (0,)
+        root[20] = ((tuple(ads_info), tuple(ads_masks)),)
+
+        section = report.ReportSection(
+            "DDRData", 7, 0xFFFFFF31, version, (tuple(root),), 1
+        )
+        wire = report.encode_section(section)
+        decoded = report.decode_section("DDRData", wire)
+        self.assertEqual(report.encode_section(decoded), wire)
+        view = report.view_section(decoded, encoding="ascii")
+        target_path = [0, 7, 0, 0, 24]
+        target = next(
+            row for row in view["parameters"] if row["source_path"] == target_path
+        )
+        self.assertEqual(
+            [
+                {
+                    key: sample[key]
+                    for key in ("raw", "display", "flags_raw", "display_source")
+                }
+                for sample in target["values"]
+            ],
+            [
+                {
+                    "raw": raw,
+                    "display": f"target-{index}",
+                    "flags_raw": 0xA5,
+                    "display_source": "stored-native-text",
+                }
+                for index, (raw, _text, _flags) in enumerate(target_samples)
+            ],
+        )
+        expected_checks = (
+            [(21, 0, True)],
+            [(21, 1, False)],
+            [(21, 0, True), (0, 0, True), (1, 255, False)],
+            [(21, 0, True), (0, 0, True), (1, 0, True)],
+            [(21, 0, True), (0, 1, False)],
+        )
+        for index, (sample, expected) in enumerate(
+            zip(target["values"], expected_checks, strict=True)
+        ):
+            self.assertIn("sequence_format_checks", sample)
+            checks = sample["sequence_format_checks"]
+            self.assertEqual(
+                [
+                    (item["mask_slot"], item["byte_raw"], item["passes"])
+                    for item in checks
+                ],
+                expected,
+            )
+            self.assertEqual(
+                [item["source_path"] for item in checks],
+                [[0, 7, 0, 1, slot, index] for slot, _byte, _passes in expected],
+            )
+            self.assertIs(
+                sample["sequence_format_admitted"], all(row[2] for row in expected)
+            )
+
+        controls = [
+            row
+            for row in view["parameters"]
+            if row["source_path"]
+            in ([0, 7, 0, 0, 12], [0, 7, 0, 0, 14], [0, 20, 0, 0, 11])
+        ]
+        self.assertEqual(len(controls), 3)
+        for row in controls:
+            self.assertEqual(row["identifier_raw"], 303)
+            self.assertTrue(
+                all(
+                    "sequence_format_admitted" not in sample
+                    and "sequence_format_checks" not in sample
+                    for sample in row["values"]
+                )
+            )
+
+    def test_ddr_sequence_check_reserves_work_and_memory_budget(self):
+        version = 0x1000
+        root = list(
+            minimal(report._section_layout("DDRData", 0xFFFFFF31, version).item)
+        )
+        info = list(minimal(report._layout("b1340", version)))
+        signal = list(minimal(report._signal(version, 7, False)))
+        signal[0], signal[1], signal[-1] = 303, b"Target", ((1, b"stored", 0xA5),)
+        info[24] = tuple(signal)
+        masks = list(minimal(report._layout("b1760", version)))
+        masks[21] = (0,)
+        root[1] = ((tuple(info), tuple(masks)),)
+        section = report.ReportSection(
+            "DDRData", 7, 0xFFFFFF31, version, (tuple(root),), 1
+        )
+        wire = report.encode_section(section)
+        decoded = report.decode_section("DDRData", wire)
+        self.assertEqual(report.encode_section(decoded), wire)
+
+        charge = report._charge_sequence_check
+        charged_at = []
+
+        def observe_charge(budget):
+            charged_at.append(tuple(budget))
+            charge(budget)
+
+        with patch.object(report, "_charge_sequence_check", side_effect=observe_charge):
+            report.view_section(decoded, encoding="ascii", _budget=[0, 0])
+        self.assertEqual(len(charged_at), 1)
+        nodes, octets = charged_at[0]
+
+        with self.assertRaisesRegex(report.ReportError, "sequence admission metadata"):
+            report.view_section(
+                decoded,
+                encoding="ascii",
+                _budget=[report.MAX_NODES - nodes, 0],
+            )
+        self.assertEqual(report.encode_section(decoded), wire)
+
+        with self.assertRaisesRegex(report.ReportError, "sequence admission metadata"):
+            report.view_section(
+                decoded,
+                encoding="ascii",
+                _budget=[
+                    0,
+                    report.MAX_BYTES - octets - report._SEQUENCE_CHECK_BYTES + 1,
+                ],
+            )
+        self.assertEqual(report.encode_section(decoded), wire)
+
+    def test_ddr_key_cycle_headers_keep_pair_provenance_and_precision_bounds(self):
+        version = 0x1027
+        root = list(
+            minimal(report._section_layout("DDRData", 0xFFFFFF31, version).item)
+        )
+        cases = (
+            (False, 12, 0, 0, "00012"),
+            (False, 12, 1, 0, "0 1.2"),
+            (True, 12, 2, 0, " 0.12"),
+            (True, 12, 9, 0, None),
+            (False, 0x80000000, 255, 0, "-"),
+            (True, 12, 255, 1, "-"),
+        )
+        slots = {False: 7, True: 20}
+        pairs = {False: [], True: []}
+        expected = []
+        for ads, raw, precision, invalidity, display in cases:
+            info = list(minimal(report._layout("b2190" if ads else "b1340", version)))
+            masks = list(minimal(report._layout("b2560" if ads else "b1760", version)))
+            value_slot, signal_slot, mask_slot = (8, 9, 7) if ads else (11, 12, 10)
+            info[value_slot] = raw
+            signal_info = list(info[signal_slot])
+            signal_info[5] = precision
+            info[signal_slot] = tuple(signal_info)
+            masks[mask_slot] = invalidity
+            pair_index = len(pairs[ads])
+            pairs[ads].append((tuple(info), tuple(masks)))
+            path = [0, slots[ads], pair_index]
+            row = {
+                "source_path": path,
+                "key_cycle_raw": raw,
+                "key_cycle_precision_raw": precision,
+                "key_cycle_invalidity_raw": invalidity,
+                "key_cycle_display": display,
+                "key_cycle_value_source_path": path + [0, value_slot],
+                "key_cycle_precision_source_path": path + [0, signal_slot, 5],
+                "key_cycle_invalidity_source_path": path + [1, mask_slot],
+            }
+            if precision > 8 and display is None:
+                row["key_cycle_display_status"] = "source-semantics-open"
+            expected.append(row)
+        root[7], root[20] = tuple(pairs[False]), tuple(pairs[True])
+        section = report.ReportSection(
+            "DDRData", 7, 0xFFFFFF31, version, (tuple(root),), 1
+        )
+        wire = report.encode_section(section)
+        decoded = report.decode_section("DDRData", wire)
+        self.assertEqual(report.encode_section(decoded), wire)
+        headers = report.view_section(decoded, encoding="ascii")["ddr_headers"]
+        self.assertEqual(
+            [row for row in headers if "key_cycle_raw" in row],
+            sorted(expected, key=lambda row: row["source_path"]),
+        )
+
+        root[7], root[20] = (), ()
+        absent = report.ReportSection(
+            "DDRData", 7, 0xFFFFFF31, version, (tuple(root),), 1
+        )
+        absent_view = report.view_section(
+            report.decode_section("DDRData", report.encode_section(absent)),
+            encoding="ascii",
+        )
+        self.assertFalse(
+            any("key_cycle_raw" in row for row in absent_view["ddr_headers"])
+        )
+
     def test_ads_uint64_named_values_survive_full_ddr_section(self):
         version = 0x1009
         layout = report._section_layout("DDRData", 0xFFFFFF31, version)

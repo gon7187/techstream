@@ -3327,6 +3327,7 @@ class SelectedLegacyRuntimeTests(unittest.TestCase):
                 data_comm.close()
 
     def test_recording_completion_rejects_foreign_prepared_message_before_io(self):
+
         from scripts.data_monitor import (
             complete_selected_legacy_recording,
             selected_legacy_monitor_runtime,
@@ -3837,6 +3838,12 @@ def run_selected_variable_multi(
     host_failure=False,
     native_fault=False,
     with_voltage=False,
+    recording_inputs=False,
+    connected_device=8,
+    target_count=2,
+    extra_profile=False,
+    flag9_fallback=False,
+    null_controller=False,
 ):
     """Build authored selected profiles and exercise the real joined factory."""
     import struct
@@ -3872,6 +3879,17 @@ def run_selected_variable_multi(
 
     with tempfile.TemporaryDirectory() as directory:
         base = authored_profile(Path(directory) / "selected")
+        if flag9_fallback:
+            ecu_sections = dict(base.database.sections)
+            ecu_sections.pop(3, None)
+            ecu_sections[6] = Section(6, 0, 1, False, bytes((0, 0, 9, 3, 1, 3, 0, 0)))
+            category = bytearray(base.category_record)
+            category[72] = 9
+            base = replace(
+                base,
+                category_record=bytes(category),
+                database=replace(base.database, sections=ecu_sections),
+            )
         database = base.catalog.management
         sections = dict(database.sections)
         values = [b"\2\12\0", b"\x13", b"\x10\x01", b"\x3e"]
@@ -3887,15 +3905,30 @@ def run_selected_variable_multi(
             False,
             struct.pack("<16H", 9, 1, 0, 0, 10, 2, 0, 0, 11, 3, 0, 0, 12, 4, 0, 0),
         )
-        sections[18] = Section(
-            18,
-            0,
-            3,
-            False,
-            struct.pack("<8H", 1, 0x13, 1, 10, 0, 1, 0, 0)
-            + struct.pack("<8H", 1, 0x67, 1, 11, 0, 0, 0, 0)
-            + struct.pack("<8H", 1, 0x7F, 1, 12, 0, 0, 0, 0),
-        )
+        if flag9_fallback:
+            sections[18] = Section(
+                18,
+                0,
+                4,
+                False,
+                struct.pack("<8H", 1, 0x13, 1, 10, 0, 1, 0, 0)
+                + struct.pack("<8H", 1, 0x67, 1, 11, 0, 0, 0, 0)
+                + struct.pack("<8H", 1, 0x7F, 1, 12, 0, 0, 0, 0)
+                + struct.pack("<8H", 1, 15, 1, 9, 0, 1, 0, 0),
+            )
+            protocol = bytearray(sections[13].payload)
+            struct.pack_into("<HH", protocol, 14, 4, 12)
+            sections[13] = replace(sections[13], payload=bytes(protocol))
+        else:
+            sections[18] = Section(
+                18,
+                0,
+                3,
+                False,
+                struct.pack("<8H", 1, 0x13, 1, 10, 0, 1, 0, 0)
+                + struct.pack("<8H", 1, 0x67, 1, 11, 0, 0, 0, 0)
+                + struct.pack("<8H", 1, 0x7F, 1, 12, 0, 0, 0, 0),
+            )
         if build == 12:
             protocol = sections[13].payload
             sections[13] = replace(
@@ -3908,7 +3941,17 @@ def run_selected_variable_multi(
         )
 
         profiles = []
-        category_ids = (42, 43, 0x68) if with_voltage else (42, 43)
+        if type(target_count) is not int or target_count not in (1, 2, 3):
+            raise ValueError("Selected fixture target count must be1..3")
+        category_ids = (
+            (42, 43, 0x68)
+            if with_voltage
+            else (
+                (43, 44, 45)[:target_count]
+                if null_controller
+                else (42, 43, 44, 45)[: target_count + int(extra_profile)]
+            )
+        )
         for category_id in category_ids:
             selected_sections = dict(manager.sections)
             for slot, width, key_offset in (
@@ -3927,10 +3970,95 @@ def run_selected_variable_multi(
             catalog.management = replace(manager, sections=selected_sections)
             record = bytearray(base.category_record)
             struct.pack_into("<H", record, 68, category_id)
-            if category_id == 43:
+            if flag9_fallback:
+                record[72] = 9
+            elif category_id == 43:
                 record[72] = 6
             profiles.append(
                 replace(base, catalog=catalog, category_record=bytes(record))
+            )
+
+        if recording_inputs:
+            for index, profile in enumerate(profiles):
+                sections = dict(profile.catalog.management.sections)
+                values = (
+                    b"\2\12\0",
+                    b"\x13",
+                    b"\x10\x01",
+                    b"\x3e",
+                    b"\x09\x02",
+                    b"\xff\xff",
+                    b"\x49\x02",
+                    b"\x50\x01",
+                )
+                directory, body = bytearray(), bytearray()
+                for value in values:
+                    directory += struct.pack("<IH", len(body), len(value))
+                    body += value
+                sections[0] = replace(
+                    sections[0], count=len(values), payload=bytes(directory + body)
+                )
+                sections[17] = replace(
+                    sections[17],
+                    count=6,
+                    payload=sections[17].payload
+                    + struct.pack("<8H", 13, 5, 6, 7, 14, 3, 6, 8),
+                )
+                vin_functions = tuple(range(27, 40)) if flag9_fallback else ()
+                additions = tuple((function, 14) for function in (3, 5)) + tuple(
+                    (function, 13)
+                    for function in (
+                        *vin_functions,
+                        *range(40, 53),
+                        54,
+                        55,
+                        56,
+                        53,
+                        57,
+                    )
+                )
+                rows = [
+                    sections[18].payload[offset : offset + 16]
+                    for offset in range(0, len(sections[18].payload), 16)
+                ]
+                rows += [
+                    struct.pack("<8H", profile.category, function, 1, frame, 0, 0, 0, 0)
+                    for function, frame in additions
+                ]
+                sections[18] = replace(
+                    sections[18],
+                    count=len(rows),
+                    payload=b"".join(
+                        sorted(rows, key=lambda row: struct.unpack_from("<HH", row))
+                    ),
+                )
+                catalog = copy(profile.catalog)
+                catalog.management = replace(catalog.management, sections=sections)
+                profiles[index] = replace(profile, catalog=catalog)
+
+        controller_profile = None
+        if null_controller:
+            controller_catalog = copy(profiles[0].catalog)
+            controller_sections = dict(controller_catalog.management.sections)
+            for slot, width, key_offset in (
+                (13, 24 if build == 12 else 28, 0),
+                (16, 76, 68),
+                (18, 16, 0),
+            ):
+                section = controller_sections[slot]
+                payload = bytearray(section.payload)
+                for row_offset in range(0, len(payload), width):
+                    struct.pack_into("<H", payload, row_offset + key_offset, 42)
+                controller_sections[slot] = replace(section, payload=bytes(payload))
+            controller_catalog.management = replace(
+                controller_catalog.management, sections=controller_sections
+            )
+            category_record = bytearray(profiles[0].category_record)
+            struct.pack_into("<H", category_record, 68, 42)
+            controller_profile = replace(
+                profiles[0],
+                catalog=controller_catalog,
+                category_record=bytes(category_record),
             )
 
         class Backend:
@@ -3985,15 +4113,31 @@ def run_selected_variable_multi(
                 f"engine{profile.category}",
                 first_request=b"\x13",
                 driver=driver,
-                device_kind=8,
+                device_kind=connected_device,
                 bus_id=0x12,
                 source_build=build,
                 clock=lambda: 0,
             )
             for profile in profiles
         )
+        controller_communication = (
+            NativeCommunication.from_backend(
+                controller_profile,
+                backend,
+                "command-ecu",
+                first_request=b"\x13",
+                driver=driver,
+                device_kind=connected_device,
+                bus_id=0x12,
+                source_build=build,
+                clock=lambda: 0,
+            )
+            if controller_profile is not None
+            else None
+        )
         observed = {
-            key: key == 12 for key in (22, 10, 8, 9, 12, 25, 11, 26, 29, 27, 28, 35)
+            key: key in ((8, 12) if flag9_fallback else (12,))
+            for key in (22, 10, 8, 9, 12, 25, 11, 26, 29, 27, 28, 35)
         }
         check_targets = tuple(
             selected_legacy_check_target(communication, (4,), observed)
@@ -4014,7 +4158,7 @@ def run_selected_variable_multi(
                 native_build=cast(Literal[12, 18], build),
                 bus_id=operations.bus_id,
                 driver=operations.driver,
-                device_kind=8,
+                device_kind=connected_device,
                 diagnostic_mode=operations.diagnostic_mode,
                 clock=lambda: 0,
             )
@@ -4031,9 +4175,10 @@ def run_selected_variable_multi(
             runtime = selected_variable_monitor_runtime(
                 check_targets,
                 selected_operations,
-                connected_device=8,
+                connected_device=connected_device,
                 command_kind=0x42,
                 command_ecu=42,
+                controller_communication=controller_communication,
                 allocation=4096,
                 standard_values=tuple(() for _ in check_targets),
                 names=tuple(
@@ -4237,7 +4382,633 @@ def run_selected_variable_multi(
         }
 
 
+def valid_variable_recording_inputs(*, trigger_type=1, enable_mode=0xFFFF):
+    from scripts.drive_recorder import (
+        NativeCoreString,
+        NativeTriggerInfo,
+        NativeTriggerParameters,
+        NativeVehicleSelection,
+    )
+
+    return {
+        "selection": NativeVehicleSelection(
+            (1, 0),
+            NativeCoreString((1, 0), b"\0"),
+            ((1, 0), (1, 0), (1, 0)),
+            (),
+            (),
+            (),
+            (0, 0),
+        ),
+        "system_information": {
+            "identifier": 0,
+            "strings": [{"core": [1, 0], "data_hex": "00"}] * 2,
+            "value_raw": 0,
+        },
+        "trigger": NativeTriggerInfo((1, 0), trigger_type, 1, 0),
+        "parameters": NativeTriggerParameters((1, 0), 1, 0, (1, 0), (), (1, 0), ()),
+        "enable_mode": enable_mode,
+    }
+
+
 class DeferredVariableMultiMonTests(unittest.TestCase):
+    def test_recording_factory_preserves_run87_status_order_and_end12_override(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import (
+            MonitorError,
+            selected_variable_monitor_recording,
+        )
+        from scripts.monitor_legacy import LegacyDrsWriter
+
+        class Finished(BaseException):
+            pass
+
+        events = []
+        primary = MonitorError("authored native preparation status", 0xA0050422)
+
+        class RecordingWriter(LegacyDrsWriter):
+            def begin(self, group):
+                events.append(("begin", group))
+                return super().begin(group)
+
+            def end(self):
+                group = self.current
+                events.append(("end", group))
+                super().end()
+                if group == 0x12:
+                    raise MonitorError("authored final End12 status", 0xA0050431)
+
+        captured = {}
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(valid_variable_recording_inputs())
+            with self.assertRaises(MonitorError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            raise Finished
+
+        with (
+            patch("scripts.monitor_legacy.LegacyDrsWriter", RecordingWriter),
+            patch(
+                "scripts.monitor_variable.selected_variable_monitor_from_cache",
+                side_effect=primary,
+            ),
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertEqual(
+            events,
+            [("begin", 0x11), ("end", 0x11), ("begin", 0x12), ("end", 0x12)],
+        )
+        self.assertIs(captured["error"], primary)
+        self.assertEqual(primary.code, 0xA0050431)
+
+    def test_end11_status_does_not_suppress_later_run87_stages(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import (
+            MonitorError,
+            selected_variable_monitor_recording,
+        )
+        from scripts.monitor_legacy import LegacyDrsWriter
+
+        class Finished(BaseException):
+            pass
+
+        events = []
+        primary = MonitorError("authored preparation status", 0xA0050422)
+
+        class End11Writer(LegacyDrsWriter):
+            def begin(self, group):
+                events.append(("begin", group))
+                return super().begin(group)
+
+            def end(self):
+                group = self.current
+                events.append(("end", group))
+                super().end()
+                if group == 0x11:
+                    raise MonitorError("authored End11 status", 0xC0050503)
+
+        captured = {}
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(valid_variable_recording_inputs())
+            with self.assertRaises(MonitorError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            raise Finished
+
+        with (
+            patch("scripts.monitor_legacy.LegacyDrsWriter", End11Writer),
+            patch(
+                "scripts.monitor_variable.selected_variable_monitor_from_cache",
+                side_effect=primary,
+            ),
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertEqual(
+            events,
+            [("begin", 0x11), ("end", 0x11), ("begin", 0x12), ("end", 0x12)],
+        )
+        self.assertIs(captured["error"], primary)
+        self.assertEqual(primary.code, 0xA0050422)
+
+    def test_recording_writer_host_fault_keeps_identity_and_stops_constructed_state(
+        self,
+    ):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import selected_variable_monitor_recording
+        from scripts.monitor_legacy import LegacyDrsWriter
+
+        class Finished(BaseException):
+            pass
+
+        primary = OSError("injected group11 writer storage fault")
+        events = []
+        captured = {}
+
+        class FaultWriter(LegacyDrsWriter):
+            def command(self, command):
+                events.append(command.command_id)
+                if command.command_id == 0x10A:
+                    raise primary
+                return super().command(command)
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(valid_variable_recording_inputs())
+            with self.assertRaises(OSError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            raise Finished
+
+        with (
+            patch("scripts.monitor_legacy.LegacyDrsWriter", FaultWriter),
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertIs(captured["error"], primary)
+        self.assertEqual(events, [0x101, 0x107, 0x111, 0x10A, 0x10E, 0x108, 0x104])
+
+    def test_run87_end12_failure_does_not_repeat_stop_or_end(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import (
+            MonitorError,
+            selected_variable_monitor_recording,
+        )
+        from scripts.monitor_legacy import LegacyDrsWriter
+
+        class Finished(BaseException):
+            pass
+
+        events = []
+        commands = []
+
+        class End12Writer(LegacyDrsWriter):
+            def begin(self, group):
+                events.append(("begin", group))
+                return super().begin(group)
+
+            def command(self, command):
+                commands.append(command.command_id)
+                return super().command(command)
+
+            def end(self):
+                group = self.current
+                events.append(("end", group))
+                if group == 0x12:
+                    raise MonitorError("authored End12 status", 0xA0050431)
+                return super().end()
+
+        captured = {}
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(valid_variable_recording_inputs())
+            with self.assertRaises(MonitorError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            raise Finished
+
+        with (
+            patch("scripts.monitor_legacy.LegacyDrsWriter", End12Writer),
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertEqual(
+            events,
+            [("begin", 0x11), ("end", 0x11), ("begin", 0x12), ("end", 0x12)],
+        )
+        self.assertEqual(
+            commands,
+            [0x101, 0x107, 0x111, 0x10A, 0x111, 0x10A, 0x10C, 0x10E, 0x108, 0x104],
+        )
+        self.assertEqual(captured["error"].code, 0xA0050431)
+
+    def test_run87_stop_status_continues_remaining_stop_and_end12_once(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import (
+            MonitorError,
+            selected_variable_monitor_recording,
+        )
+        from scripts.monitor_legacy import LegacyDrsWriter
+
+        class Finished(BaseException):
+            pass
+
+        events = []
+        primary = MonitorError("authored stop status", 0xC0050503)
+
+        class StopWriter(LegacyDrsWriter):
+            def begin(self, group):
+                events.append(("begin", group))
+                return super().begin(group)
+
+            def command(self, command):
+                events.append(("command", command.command_id))
+                if command.command_id == 0x10E:
+                    raise primary
+                return super().command(command)
+
+            def end(self):
+                events.append(("end", self.current))
+                return super().end()
+
+        captured = {}
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(valid_variable_recording_inputs())
+            with self.assertRaises(MonitorError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            raise Finished
+
+        with (
+            patch("scripts.monitor_legacy.LegacyDrsWriter", StopWriter),
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertIs(captured["error"], primary)
+        self.assertEqual(
+            events,
+            [
+                ("begin", 0x11),
+                ("command", 0x101),
+                ("command", 0x107),
+                ("command", 0x111),
+                ("command", 0x10A),
+                ("command", 0x111),
+                ("command", 0x10A),
+                ("command", 0x10C),
+                ("end", 0x11),
+                ("begin", 0x12),
+                ("command", 0x10E),
+                ("command", 0x108),
+                ("command", 0x104),
+                ("end", 0x12),
+            ],
+        )
+
+    def test_run87_begin11_status_still_attempts_remaining_groups_once(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import (
+            MonitorError,
+            selected_variable_monitor_recording,
+        )
+        from scripts.monitor_legacy import LegacyDrsWriter
+
+        class Finished(BaseException):
+            pass
+
+        events = []
+        primary = MonitorError("authored Begin11 status", 0xC0050503)
+
+        class Begin11Writer(LegacyDrsWriter):
+            def begin(self, group):
+                events.append(("begin", group))
+                if group == 0x11:
+                    super().begin(group)
+                    raise primary
+                return super().begin(group)
+
+            def command(self, command):
+                events.append(("command", command.command_id))
+                return super().command(command)
+
+            def end(self):
+                events.append(("end", self.current))
+                return super().end()
+
+        captured = {}
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(valid_variable_recording_inputs())
+            with self.assertRaises(MonitorError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            raise Finished
+
+        with (
+            patch("scripts.monitor_legacy.LegacyDrsWriter", Begin11Writer),
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertIs(captured["error"], primary)
+        self.assertEqual(
+            events,
+            [
+                ("begin", 0x11),
+                ("command", 0x101),
+                ("command", 0x107),
+                ("command", 0x111),
+                ("command", 0x10A),
+                ("command", 0x111),
+                ("command", 0x10A),
+                ("command", 0x10C),
+                ("end", 0x11),
+                ("begin", 0x12),
+                ("command", 0x10E),
+                ("command", 0x108),
+                ("command", 0x104),
+                ("end", 0x12),
+            ],
+        )
+
+    def test_begin11_status_precedes_later_packing_status(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import (
+            MonitorError,
+            selected_variable_monitor_recording,
+        )
+        from scripts.monitor_legacy import LegacyDrsWriter
+
+        class Finished(BaseException):
+            pass
+
+        begin_status = MonitorError("authored Begin11 status", 0xA0050101)
+        packing_status = MonitorError("authored packing status", 0x90051001)
+        calls = []
+
+        class BeginStatusWriter(LegacyDrsWriter):
+            def begin(self, group):
+                result = super().begin(group)
+                if group == 0x11:
+                    raise begin_status
+                return result
+
+        captured = {}
+
+        def fail_packing(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise packing_status
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(valid_variable_recording_inputs())
+            with self.assertRaises(MonitorError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            raise Finished
+
+        with (
+            patch("scripts.monitor_legacy.LegacyDrsWriter", BeginStatusWriter),
+            patch(
+                "scripts.monitor_variable.selected_variable_monitor_from_cache",
+                side_effect=fail_packing,
+            ),
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertEqual(len(calls), 1)
+        self.assertIs(captured["error"], packing_status)
+        self.assertEqual(captured["error"].code, 0xA0050101)
+
+    def test_begin11_status_precedes_later_end11_status(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import (
+            MonitorError,
+            selected_variable_monitor_recording,
+        )
+        from scripts.monitor_legacy import LegacyDrsWriter
+
+        class Finished(BaseException):
+            pass
+
+        begin_status = MonitorError("authored Begin11 status", 0xA0050101)
+        end11_status = MonitorError("authored End11 status", 0xC0050503)
+
+        class CombinedStatusWriter(LegacyDrsWriter):
+            def begin(self, group):
+                result = super().begin(group)
+                if group == 0x11:
+                    raise begin_status
+                return result
+
+            def end(self):
+                group = self.current
+                super().end()
+                if group == 0x11:
+                    raise end11_status
+
+        captured = {}
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(valid_variable_recording_inputs())
+            with self.assertRaises(MonitorError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            raise Finished
+
+        with (
+            patch("scripts.monitor_legacy.LegacyDrsWriter", CombinedStatusWriter),
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertIs(captured["error"], end11_status)
+        self.assertEqual(captured["error"].code, 0xA0050101)
+
+    def test_run87_begin12_status_attempts_stop_and_end12_once(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import (
+            MonitorError,
+            selected_variable_monitor_recording,
+        )
+        from scripts.monitor_legacy import LegacyDrsWriter
+
+        class Finished(BaseException):
+            pass
+
+        events = []
+        primary = MonitorError("authored Begin12 status", 0xA0050422)
+
+        class Begin12Writer(LegacyDrsWriter):
+            def begin(self, group):
+                events.append(("begin", group))
+                if group == 0x12:
+                    raise primary
+                return super().begin(group)
+
+            def command(self, command):
+                events.append(("command", command.command_id))
+                return super().command(command)
+
+            def end(self):
+                events.append(("end", self.current))
+                return super().end()
+
+        captured = {}
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(valid_variable_recording_inputs())
+            with self.assertRaises(MonitorError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            raise Finished
+
+        with (
+            patch("scripts.monitor_legacy.LegacyDrsWriter", Begin12Writer),
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertIs(captured["error"], primary)
+        self.assertEqual(
+            events,
+            [
+                ("begin", 0x11),
+                ("command", 0x101),
+                ("command", 0x107),
+                ("command", 0x111),
+                ("command", 0x10A),
+                ("command", 0x111),
+                ("command", 0x10A),
+                ("command", 0x10C),
+                ("end", 0x11),
+                ("begin", 0x12),
+                ("command", 0x10E),
+                ("command", 0x108),
+                ("command", 0x104),
+                ("end", None),
+            ],
+        )
+
+    def test_recording_factory_rejects_malformed_drs_metadata_before_io(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import selected_variable_monitor_recording
+
+        class Finished(BaseException):
+            pass
+
+        captured = {}
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(valid_variable_recording_inputs())
+            kwargs["selection"] = None
+            with self.assertRaises(MonitorError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            captured["calls"] = tuple(operations.backend.calls)
+            raise Finished
+
+        with (
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertIn("typed caller metadata", str(captured["error"]))
+        self.assertEqual(captured["calls"], ())
+
+    def test_recording_factory_does_not_take_ownership_of_foreign_controller(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import selected_variable_monitor_recording
+        from scripts.native_communication import NativeCommunication
+
+        class Finished(BaseException):
+            pass
+
+        class ForeignBackend:
+            def __init__(self):
+                self.calls = []
+
+            def invoke(self, operation, fields, *, deadline, cancelled):
+                self.calls.append(operation)
+                raise AssertionError("foreign backend must not be used")
+
+        captured = {}
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(valid_variable_recording_inputs())
+            foreign_backend = ForeignBackend()
+            selected = targets[0].transaction
+            foreign = NativeCommunication.from_backend(
+                selected.profile,
+                foreign_backend,
+                "foreign-engine",
+                first_request=b"\x13",
+                driver=operations.driver,
+                device_kind=8,
+                bus_id=selected.bus_id,
+                source_build=selected.source_build,
+                clock=lambda: 0,
+            )
+            kwargs["controller_communication"] = foreign
+            with self.assertRaises(MonitorError):
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["foreign"] = foreign
+            captured["calls"] = tuple(foreign_backend.calls)
+            captured["target_closed"] = tuple(
+                target.transaction.closed for target in targets
+            )
+            raise Finished
+
+        with (
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertFalse(captured["foreign"].closed)
+        self.assertEqual(captured["calls"], ())
+        self.assertTrue(all(captured["target_closed"]))
+
     def test_real_selected_support_factory_reaches_multi_and_reparsed_samples(self):
         for build in (12, 18):
             with self.subTest(build=build):
@@ -4307,6 +5078,583 @@ class DeferredVariableMultiMonTests(unittest.TestCase):
         result = run_selected_variable_multi(live_source_channel=True)
         self.assertEqual(result["boundary"], "live-source-channel-retained")
         self.assertTrue(result["channels_closed"])
+
+    def test_recording_factory_preserves_backend_host_identity_and_closes_channels(
+        self,
+    ):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import selected_variable_monitor_recording
+
+        class Finished(BaseException):
+            pass
+
+        primary = TimeoutError("injected recording support read failure")
+        captured = {}
+
+        def recording(targets, operations, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(
+                **valid_variable_recording_inputs(),
+            )
+            invoke = operations.backend.invoke
+
+            def fail_read(operation, fields, *, deadline, cancelled):
+                if operation == "read_messages":
+                    raise primary
+                return invoke(
+                    operation,
+                    fields,
+                    deadline=deadline,
+                    cancelled=cancelled,
+                )
+
+            operations.backend.invoke = fail_read
+            with self.assertRaises(TimeoutError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            captured["communications"] = tuple(target.transaction for target in targets)
+            raise Finished
+
+        with (
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertIs(captured["error"], primary)
+        self.assertTrue(all(item.closed for item in captured["communications"]))
+
+    def test_recording_factory_applies_enable_complement_before_child_selection(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import selected_variable_monitor_recording
+
+        class Finished(BaseException):
+            pass
+
+        captured = {}
+
+        def recording(targets, operations, *, captured=captured, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(
+                **valid_variable_recording_inputs(enable_mode=1),
+            )
+            with self.assertRaises(MonitorError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            captured["communications"] = tuple(target.transaction for target in targets)
+            raise Finished
+
+        with (
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18)
+        self.assertEqual(captured["error"].code, 0x90051001)
+        self.assertTrue(all(item.closed for item in captured["communications"]))
+
+    def test_recording_factory_rejects_foreign_controller_before_backend_io(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import selected_variable_monitor_recording
+
+        class Finished(BaseException):
+            pass
+
+        captured = {}
+
+        def recording(targets, operations, *, captured=captured, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(
+                **valid_variable_recording_inputs(),
+            )
+            with self.assertRaises(MonitorError):
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["foreign_calls"] = tuple(operations.backend.calls)
+            captured["communications"] = tuple(target.transaction for target in targets)
+            raise Finished
+
+        with (
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18, foreign_context=True)
+        self.assertEqual(captured["foreign_calls"], ())
+        self.assertTrue(all(item.closed for item in captured["communications"]))
+
+    def test_recording_factory_full_cardinality_matrix_and_real_outer_vin(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import selected_variable_monitor_recording
+        from scripts.drive_recorder import (
+            DrsFile,
+            DrsTable,
+            NativeCoreString,
+            NativeDmciCommand,
+            NativeDrsExecutor,
+            NativeMessage,
+            NativeTriggerInfo,
+            NativeTriggerParameters,
+            NativeVehicleSelection,
+            decode_command,
+        )
+
+        class Finished(BaseException):
+            pass
+
+        class ProtocolBackend:
+            def __init__(self):
+                self.calls = []
+                self.last = bytes(6)
+
+            def invoke(self, operation, fields, **kwargs):
+                self.calls.append(operation)
+                if operation == "connect":
+                    return 17
+                if operation == "write_messages":
+                    message = fields["message"]
+                    payload = message.data[4:]
+                    self.last = message.data[:4] + (
+                        bytes((payload[0] | 0x40,)) + payload[1:] if payload else b""
+                    )
+                if operation == "read_messages":
+                    return NativeMessage(6, 0, 0, 0, 0, self.last)
+                return None
+
+        for build in (12, 18):
+            for connected_device in (4, 8):
+                for trigger_type in (1, 7):
+                    for target_count, null_slot in (
+                        (1, False),
+                        (2, False),
+                        (3, False),
+                        (1, True),
+                        (2, True),
+                    ):
+                        with self.subTest(
+                            build=build,
+                            connected_device=connected_device,
+                            trigger_type=trigger_type,
+                            target_count=target_count,
+                            null_slot=null_slot,
+                        ):
+                            captured = {}
+
+                            def recording(
+                                targets,
+                                operations,
+                                *,
+                                captured=captured,
+                                trigger_type=trigger_type,
+                                **kwargs,
+                            ):
+                                kwargs.pop("ticks")
+                                kwargs.pop("voltage_state")
+                                kwargs.update(
+                                    selection=NativeVehicleSelection(
+                                        (1, 0),
+                                        NativeCoreString((1, 0), b"\0"),
+                                        ((1, 0), (1, 0), (1, 0)),
+                                        (),
+                                        (),
+                                        (),
+                                        (0, 0),
+                                    ),
+                                    system_information={
+                                        "identifier": 0,
+                                        "strings": [{"core": [1, 0], "data_hex": "00"}]
+                                        * 2,
+                                        "value_raw": 0,
+                                    },
+                                    trigger=NativeTriggerInfo(
+                                        (1, 0), trigger_type, 1, 0
+                                    ),
+                                    parameters=NativeTriggerParameters(
+                                        (1, 0), 1, 0, (1, 0), (), (1, 0), ()
+                                    ),
+                                    enable_mode=0xFFFF,
+                                )
+                                result = selected_variable_monitor_recording(
+                                    targets, operations, **kwargs
+                                )
+                                captured["result"] = DrsFile.parse(result.encode())
+                                captured["communications"] = tuple(
+                                    target.transaction for target in targets
+                                )
+                                captured["controller"] = kwargs.get(
+                                    "controller_communication"
+                                )
+                                raise Finished
+
+                            with (
+                                patch(
+                                    "scripts.data_monitor.selected_variable_monitor_runtime",
+                                    recording,
+                                ),
+                                self.assertRaises(Finished),
+                            ):
+                                run_selected_variable_multi(
+                                    build=build,
+                                    connected_device=connected_device,
+                                    target_count=target_count,
+                                    recording_inputs=True,
+                                    null_controller=null_slot,
+                                )
+                            tables = captured["result"].tables
+                            groups = {
+                                table.table_id: decode_command(table)
+                                for table in tables
+                            }
+                            self.assertIn(0x27, groups)
+                            children = groups[0x11]["children"]
+                            assert isinstance(children, tuple)
+                            setup_ids = []
+                            for child in children:
+                                assert isinstance(child, DrsTable)
+                                command = decode_command(child)["dmci"]
+                                assert isinstance(command, NativeDmciCommand)
+                                setup_ids.append(command.command_id)
+                            setup = tuple(setup_ids)
+                            expected_setup = (0x101, 0x107)
+                            if null_slot:
+                                expected_setup += (0x111,)
+                            expected_setup += (0x111, 0x10A) * target_count
+                            expected_setup += (0x10C,)
+                            self.assertEqual(setup, expected_setup)
+                            stop_children = groups[0x12]["children"]
+                            assert isinstance(stop_children, tuple)
+                            stop_ids = []
+                            for child in stop_children:
+                                assert isinstance(child, DrsTable)
+                                command = decode_command(child)["dmci"]
+                                assert isinstance(command, NativeDmciCommand)
+                                stop_ids.append(command.command_id)
+                            self.assertEqual(tuple(stop_ids), (0x10E, 0x108, 0x104))
+                            self.assertEqual(
+                                0x23 in groups and 0x24 in groups, trigger_type == 7
+                            )
+                            backend = ProtocolBackend()
+                            executor = NativeDrsExecutor(
+                                captured["result"], backend, clock=lambda: 0
+                            )
+                            executor.execute_group(0x27)
+                            self.assertIsNone(executor.channel)
+                            self.assertEqual(backend.calls[0], "connect")
+                            self.assertEqual(backend.calls[-1], "disconnect")
+                            self.assertIn("write_messages", backend.calls)
+                            self.assertIn("read_messages", backend.calls)
+                            self.assertTrue(
+                                all(item.closed for item in captured["communications"])
+                            )
+                            if null_slot:
+                                self.assertIsNotNone(captured["controller"])
+                                self.assertTrue(captured["controller"].closed)
+
+    def test_joined_recording_flag9_default_pid_falls_back_to_mode20(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import selected_variable_monitor_recording
+        from scripts.drive_recorder import (
+            DrsFile,
+            DrsTable,
+            NativeDmciCommand,
+            NativeDrsExecutor,
+            NativeMessage,
+            decode_command,
+        )
+        from scripts.monitor_variable import selected_variable_packet_monitor
+
+        class Finished(BaseException):
+            pass
+
+        class ProtocolBackend:
+            def __init__(self):
+                self.calls = []
+                self.last = bytes(6)
+
+            def invoke(self, operation, fields, **kwargs):
+                self.calls.append(operation)
+                if operation == "connect":
+                    return 17
+                if operation == "write_messages":
+                    message = fields["message"]
+                    payload = message.data[4:]
+                    self.last = message.data[:4] + (
+                        bytes((payload[0] | 0x40,)) + payload[1:] if payload else b""
+                    )
+                if operation == "read_messages":
+                    return NativeMessage(6, 0, 0, 0, 0, self.last)
+                return None
+
+        for build in (12, 18):
+            for trigger_type in (1, 7):
+                with self.subTest(build=build, trigger_type=trigger_type):
+                    captured = {}
+                    original_packet = selected_variable_packet_monitor
+
+                    def observe_packet(
+                        *args, _original=original_packet, _captured=captured, **kwargs
+                    ):
+                        plan = _original(*args, **kwargs)
+                        _captured["plan"] = plan
+                        return plan
+
+                    def recording(
+                        targets,
+                        operations,
+                        *,
+                        _captured=captured,
+                        _trigger=trigger_type,
+                        **kwargs,
+                    ):
+                        kwargs.pop("ticks")
+                        kwargs.pop("voltage_state")
+                        kwargs.update(
+                            valid_variable_recording_inputs(trigger_type=_trigger)
+                        )
+                        result = selected_variable_monitor_recording(
+                            targets, operations, **kwargs
+                        )
+                        _captured["drs"] = DrsFile.parse(result.encode())
+                        _captured["communications"] = tuple(
+                            target.transaction for target in targets
+                        )
+                        raise Finished
+
+                    with (
+                        patch(
+                            "scripts.data_monitor.selected_variable_monitor_runtime",
+                            recording,
+                        ),
+                        patch(
+                            "scripts.monitor_variable.selected_variable_packet_monitor",
+                            observe_packet,
+                        ),
+                        self.assertRaises(Finished),
+                    ):
+                        run_selected_variable_multi(
+                            build=build,
+                            connected_device=4,
+                            target_count=1,
+                            recording_inputs=True,
+                            flag9_fallback=True,
+                        )
+                    plan = captured["plan"]
+                    self.assertEqual(plan.packing.mode, 0x20)
+                    self.assertEqual(plan.attempts, ((1, 0xA0050422), (0x20, 0)))
+                    self.assertEqual(
+                        plan.packing.setup_requests, (b"\x21\x09", b"\x61\x03")
+                    )
+                    groups = {
+                        table.table_id: decode_command(table)
+                        for table in captured["drs"].tables
+                    }
+                    self.assertIn(0x27, groups)
+                    commands = groups[0x11]["children"]
+                    assert isinstance(commands, tuple)
+                    command_ids = []
+                    for item in commands:
+                        assert isinstance(item, DrsTable)
+                        command = decode_command(item)["dmci"]
+                        assert isinstance(command, NativeDmciCommand)
+                        command_ids.append(command.command_id)
+                    self.assertEqual(
+                        tuple(command_ids), (0x101, 0x107, 0x111, 0x10A, 0x10C)
+                    )
+                    vin_backend = ProtocolBackend()
+                    vin_executor = NativeDrsExecutor(
+                        captured["drs"], vin_backend, clock=lambda: 0
+                    )
+                    vin_executor.execute_group(0x27)
+                    self.assertIsNone(vin_executor.channel)
+                    self.assertEqual(vin_backend.calls[0], "connect")
+                    self.assertEqual(vin_backend.calls[-1], "disconnect")
+                    self.assertIn("write_messages", vin_backend.calls)
+                    self.assertIn("read_messages", vin_backend.calls)
+                    self.assertTrue(
+                        all(item.closed for item in captured["communications"])
+                    )
+
+    def test_recording_factory_rejects_fourth_distinct_registered_slot(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import selected_variable_monitor_recording
+
+        class Finished(BaseException):
+            pass
+
+        captured = {}
+
+        def recording(targets, operations, *, captured=captured, **kwargs):
+            kwargs["controller_communication"] = targets[0].transaction
+            kwargs["standard_values"] = kwargs["standard_values"][1:]
+            kwargs["names"] = kwargs["names"][1:]
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(
+                **valid_variable_recording_inputs(),
+            )
+            with self.assertRaises(MonitorError) as raised:
+                selected_variable_monitor_recording(targets[1:], operations, **kwargs)
+            captured["code"] = raised.exception.code
+            captured["communications"] = tuple(target.transaction for target in targets)
+            raise Finished
+
+        with (
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(
+                build=18,
+                target_count=3,
+                extra_profile=True,
+            )
+        self.assertEqual(captured["code"], 0xC0050001)
+        self.assertTrue(all(item.closed for item in captured["communications"]))
+
+    def test_recording_factory_preserves_finalize_exception_and_cleanup_note(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import selected_variable_monitor_recording
+        from scripts.native_communication import NativeCommunication
+
+        class Finished(BaseException):
+            pass
+
+        primary = OSError("injected DRS finalize storage failure")
+        cleanup = OSError("injected secondary support cleanup failure")
+        captured = {}
+        original_close = NativeCommunication.close
+        failed_close = [False]
+
+        def close_with_secondary(self):
+            status = original_close(self)
+            if not failed_close[0]:
+                failed_close[0] = True
+                raise cleanup
+            return status
+
+        def recording(targets, operations, *, captured=captured, **kwargs):
+            kwargs.pop("ticks")
+            kwargs.pop("voltage_state")
+            kwargs.update(
+                **valid_variable_recording_inputs(trigger_type=7),
+            )
+            with self.assertRaises(OSError) as raised:
+                selected_variable_monitor_recording(targets, operations, **kwargs)
+            captured["error"] = raised.exception
+            captured["communications"] = tuple(target.transaction for target in targets)
+            raise Finished
+
+        with (
+            patch("scripts.drive_recorder.build_native_drs", side_effect=primary),
+            patch.object(NativeCommunication, "close", close_with_secondary),
+            patch("scripts.data_monitor.selected_variable_monitor_runtime", recording),
+            self.assertRaises(Finished),
+        ):
+            run_selected_variable_multi(build=18, recording_inputs=True)
+        self.assertIs(captured["error"], primary)
+        self.assertTrue(
+            any("cleanup also failed" in note for note in primary.__notes__)
+        )
+        self.assertTrue(all(item.closed for item in captured["communications"]))
+
+    def test_recording_factory_supports_one_three_and_null_plus_two_slots(self):
+        from unittest.mock import patch
+
+        from scripts.data_monitor import selected_variable_monitor_recording
+        from scripts.drive_recorder import (
+            DrsFile,
+            DrsTable,
+            NativeCoreString,
+            NativeDmciCommand,
+            NativeTriggerInfo,
+            NativeTriggerParameters,
+            NativeVehicleSelection,
+            decode_command,
+        )
+
+        class Finished(BaseException):
+            pass
+
+        for layout, count in (("one", 1), ("three", 3), ("null_plus_two", 3)):
+            with self.subTest(layout=layout):
+                captured = {}
+
+                def recording(
+                    targets, operations, *, layout=layout, captured=captured, **kwargs
+                ):
+                    chosen = targets[1:] if layout == "null_plus_two" else targets
+                    if layout == "null_plus_two":
+                        kwargs["controller_communication"] = targets[0].transaction
+                        kwargs["standard_values"] = kwargs["standard_values"][1:]
+                        kwargs["names"] = kwargs["names"][1:]
+                    kwargs.pop("ticks")
+                    kwargs.pop("voltage_state")
+                    kwargs.update(
+                        selection=NativeVehicleSelection(
+                            (1, 0),
+                            NativeCoreString((1, 0), b"\0"),
+                            ((1, 0), (1, 0), (1, 0)),
+                            (),
+                            (),
+                            (),
+                            (0, 0),
+                        ),
+                        system_information={
+                            "identifier": 0,
+                            "strings": [{"core": [1, 0], "data_hex": "00"}] * 2,
+                            "value_raw": 0,
+                        },
+                        trigger=NativeTriggerInfo((1, 0), 1, 1, 0),
+                        parameters=NativeTriggerParameters(
+                            (1, 0), 1, 0, (1, 0), (), (1, 0), ()
+                        ),
+                        enable_mode=0xFFFF,
+                    )
+                    result = selected_variable_monitor_recording(
+                        chosen, operations, **kwargs
+                    )
+                    captured["result"] = DrsFile.parse(result.encode())
+                    captured["communications"] = tuple(
+                        target.transaction for target in targets
+                    )
+                    raise Finished
+
+                with (
+                    patch(
+                        "scripts.data_monitor.selected_variable_monitor_runtime",
+                        recording,
+                    ),
+                    self.assertRaises(Finished),
+                ):
+                    run_selected_variable_multi(
+                        build=18,
+                        target_count=count,
+                        recording_inputs=True,
+                    )
+                groups = {
+                    table.table_id: decode_command(table)
+                    for table in captured["result"].tables
+                }
+                self.assertIn(0x27, groups)
+                children = groups[0x11]["children"]
+                assert isinstance(children, tuple)
+                command_ids = []
+                for child in children:
+                    assert isinstance(child, DrsTable)
+                    command = decode_command(child)["dmci"]
+                    assert isinstance(command, NativeDmciCommand)
+                    command_ids.append(command.command_id)
+                self.assertEqual(command_ids[0:2], [0x101, 0x107])
+                self.assertEqual(command_ids[-1], 0x10C)
+                self.assertEqual(command_ids.count(0x111), count)
+                expected_children = {"one": 1, "three": 3, "null_plus_two": 2}
+                self.assertEqual(command_ids.count(0x10A), expected_children[layout])
+                self.assertTrue(all(item.closed for item in captured["communications"]))
 
 
 if __name__ == "__main__":
