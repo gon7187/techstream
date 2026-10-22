@@ -710,15 +710,53 @@ class DirectJ2534Worker:
         cancelled: Callable[[], bool] | None = None,
         packet_sink: Callable[[NativeMonitorPacket], None] | None = None,
         disable_packet_ecu: Callable[[int], None] | None = None,
+        communication: NativeCommunication | None = None,
     ):
         if not isinstance(operations, NativeFrameOperations):
             raise MonitorError(
                 "Concrete selected NativeFrameOperations required", INVALID
             )
-        if operations.channel is not None or operations.poisoned:
+        if communication is None and (
+            operations.channel is not None or operations.poisoned
+        ):
             raise MonitorError(
                 "Native worker requires a fresh owned transport", INVALID
             )
+        if communication is not None:
+            controller = getattr(communication, "operations", None)
+            if (
+                type(communication) is not NativeCommunication
+                or not isinstance(controller, NativeFrameController)
+                or controller.operations is not operations
+                or communication.closed
+                or communication.profile is not operations.profile
+                or communication.source_build != operations.native_build
+                or communication.bus_id != operations.bus_id
+                or operations.native_variant != "normal"
+                or operations.poisoned
+                or controller._context_failed
+                or (operations.channel is not None and not operations.owns_channel)
+                or self._allow_century
+                or native_worker_class not in (None, "base", "packet")
+                or isinstance(event, CenturyMonitorEvent)
+            ):
+                raise MonitorError(
+                    "Retained native communication context mismatch", INVALID
+                )
+            retained_controller = controller
+        else:
+            retained_controller = None
+        retained_context = (
+            (
+                retained_controller.current_category,
+                retained_controller.current_bus,
+                retained_controller.session_state,
+                retained_controller.current_service,
+                retained_controller._context_failed,
+            )
+            if retained_controller is not None
+            else None
+        )
         if event is not None and not isinstance(event, DataMonitorEvent):
             raise MonitorError("Native data slot requires a typed event", INVALID)
         if active is not None and not isinstance(active, ActiveMonitorEvent):
@@ -777,7 +815,39 @@ class DirectJ2534Worker:
             "packet" if isinstance(event, PacketMonitorEvent) else "base"
         )
         self.operations = operations
-        self.controllers = {operations: NativeFrameController(operations)}
+        self.communication = communication
+        self._retained_controller: NativeFrameController | None = retained_controller
+        self._retained_channel = operations.channel
+        self._retained_ownership = operations.owns_channel
+        self._retained_source = (
+            operations.profile,
+            operations.plan,
+            operations.backend,
+            operations.driver,
+            operations.diagnostic_mode,
+            operations.native_build,
+            operations.native_variant,
+            operations.bus_id,
+            operations.device_kind,
+        )
+        self._retained_communication_source = (
+            (
+                communication.profile,
+                communication.source_build,
+                communication.bus_id,
+                communication.ecu,
+                communication.cache.identity,
+                communication._context_first_request,
+            )
+            if communication is not None
+            else None
+        )
+        self._retained_context = retained_context
+        self.controllers = {
+            operations: retained_controller
+            if retained_controller is not None
+            else NativeFrameController(operations)
+        }
         self.controller = self.controllers[operations]
         self.oscilloscope = oscilloscope
         self._instrument_guard: (
@@ -833,8 +903,23 @@ class DirectJ2534Worker:
             operations.defer_cancel_cleanup = True
         self.operations = operations
         if operations not in self.controllers:
-            self.controllers[operations] = NativeFrameController(operations)
+            self.controllers[operations] = (
+                self._retained_controller
+                if self._retained_controller is not None
+                else NativeFrameController(operations)
+            )
         self.controller = self.controllers[operations]
+
+    def _sync_controller_operations(self) -> None:
+        if self.communication is not None:
+            controller = self._retained_controller
+            assert controller is not None
+            operations = controller.operations
+            if not isinstance(operations, NativeFrameOperations):
+                raise MonitorError(
+                    "Retained controller changed to an unsupported lower", INVALID
+                )
+            self._activate_operations(operations)
 
     def _restore_operation_guards(self) -> None:
         for operations, (previous, defer_cancel) in self._operation_guards.items():
@@ -948,16 +1033,66 @@ class DirectJ2534Worker:
     def start(self) -> int:
         if self.state != "configured":
             raise MonitorError("Native worker start requires configured state", INVALID)
-        if self.operations.channel is not None or self.operations.poisoned:
+        if self.communication is None and (
+            self.operations.channel is not None or self.operations.poisoned
+        ):
             raise MonitorError(
                 "Native worker requires a fresh owned transport", INVALID
             )
+        if self.communication is not None and (
+            self.communication.closed
+            or self.communication.operations is not self._retained_controller
+            or self._retained_controller is None
+            or self._retained_controller.operations is not self.operations
+            or (
+                self.operations.profile,
+                self.operations.plan,
+                self.operations.backend,
+                self.operations.driver,
+                self.operations.diagnostic_mode,
+                self.operations.native_build,
+                self.operations.native_variant,
+                self.operations.bus_id,
+                self.operations.device_kind,
+            )
+            != self._retained_source
+            or (
+                self.communication.profile,
+                self.communication.source_build,
+                self.communication.bus_id,
+                self.communication.ecu,
+                self.communication.cache.identity,
+                self.communication._context_first_request,
+            )
+            != self._retained_communication_source
+            or self.operations.channel != self._retained_channel
+            or self.operations.owns_channel != self._retained_ownership
+            or self.operations.poisoned
+            or self._retained_controller._context_failed
+            or (
+                self._retained_controller.current_category,
+                self._retained_controller.current_bus,
+                self._retained_controller.session_state,
+                self._retained_controller.current_service,
+                self._retained_controller._context_failed,
+            )
+            != self._retained_context
+        ):
+            raise MonitorError(
+                "Retained communication changed before worker start", INVALID
+            )
+        if self.communication is not None:
+            self.communication._check()
         self.deadline = self._now() + self.timeout
         self._check()
         self.owned = True
         self._activate_operations(self.operations)
         try:
-            status = self.operations.open(deadline=self.deadline)
+            if self.communication is None:
+                status = self.operations.open(deadline=self.deadline)
+            else:
+                status = 0
+                self.operations.apply_temporary_config(deadline=self.deadline)
         except BaseException:
             self._restore_operation_guards()
             self.state = "fault"
@@ -1051,6 +1186,7 @@ class DirectJ2534Worker:
     def step(self) -> int:
         if self.state not in ("select", "send", "receive", "idle"):
             raise MonitorError("Native worker is not running", INVALID)
+        self._sync_controller_operations()
         self._check()
         tick = self._tick()
         if self.state == "idle":
@@ -1242,30 +1378,44 @@ class DirectJ2534Worker:
         failure: BaseException | None = None
         status = 0
         until: float | None = None
+        poisoned_retained = False
         try:
+            self._sync_controller_operations()
             self.deadline = self._now() + self.timeout
             self._check(cleanup=True)
             until = self.deadline
-            if self.interrupt:
+            poisoned_retained = (
+                self.communication is not None and self.operations.poisoned
+            )
+            if self.interrupt and not poisoned_retained:
                 self._mode(0x10500, 0)
-            if self.burst:
+            if self.burst and not poisoned_retained:
                 self._mode(0x10400, 0)
         except BaseException as error:  # noqa: BLE001 - release despite mode failure
             failure = error
         finally:
-            try:
-                instrument_status = self._stop_instrument()
-                if instrument_status:
-                    failure = failure or MonitorError(
-                        "Native oscillator stop failed", instrument_status
-                    )
-            except BaseException as error:  # noqa: BLE001 - transport still needs release
-                failure = failure or error
-            try:
-                status = self.controller.disconnect(0, deadline=until)
-            except BaseException as error:  # noqa: BLE001 - preserve earlier cleanup fault
-                failure = failure or error
-            self.state = "closed" if self.operations.channel is None else "fault"
+            if not poisoned_retained:
+                try:
+                    instrument_status = self._stop_instrument()
+                    if instrument_status:
+                        failure = failure or MonitorError(
+                            "Native oscillator stop failed", instrument_status
+                        )
+                except BaseException as error:  # noqa: BLE001 - transport still needs release
+                    failure = failure or error
+            if self.communication is not None:
+                try:
+                    if not self.operations.poisoned:
+                        self.operations.restore_temporary_config(deadline=until)
+                except BaseException as error:  # noqa: BLE001 - preserve cleanup failure
+                    failure = failure or error
+                self.state = "closed"
+            else:
+                try:
+                    status = self.controller.disconnect(0, deadline=until)
+                except BaseException as error:  # noqa: BLE001 - preserve earlier cleanup fault
+                    failure = failure or error
+                self.state = "closed" if self.operations.channel is None else "fault"
             self._restore_operation_guards()
         if failure is not None:
             raise failure
@@ -1366,9 +1516,16 @@ class DirectJ2534Worker:
             primary = error
             raise
         finally:
+            if self.communication is not None:
+                try:
+                    self._sync_controller_operations()
+                except BaseException as error:  # noqa: BLE001 - preserve acquisition fault
+                    self.cleanup_error = error
             if (
                 self.owned
+                and self.cleanup_error is None
                 and self.operations.channel is not None
+                and not self.operations.poisoned
                 and self.state in ("select", "send", "receive", "idle")
             ):
                 previous_cancelled = self.operations.cancelled

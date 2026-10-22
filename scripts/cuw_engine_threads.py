@@ -148,6 +148,7 @@ class EngineThreadJob2026:
         self._callback_error: BaseException | None = None
         self._callback_kind: str | None = None
         self._callback_argument: int | None = None
+        self._callback_context = None
         self._outer: threading.Thread | None = None
         self._child: threading.Thread | None = None
         self._lease: ThreadPhaseLease2026 | None = None
@@ -375,7 +376,12 @@ class EngineThreadJob2026:
                                     "programming_completed": False,
                                 }
                             else:
-                                session.bind_engine2026(self.engine)
+                                if self._controller_entry == "TCUWControlCommPhase.dll":
+                                    # The authenticated raw CONTROL Execute binds its
+                                    # held family target after it issues the raw token.
+                                    session.bind_controller2026(self.controller)
+                                else:
+                                    session.bind_engine2026(self.engine)
                                 self.controller.bind_startup_session(
                                     self.engine, session
                                 )
@@ -400,6 +406,18 @@ class EngineThreadJob2026:
                                     result = self.controller.execute(
                                         self.engine, session
                                     )
+                                    if lease.phase == 0:
+                                        from scripts import programming_2026_common
+
+                                        context = (
+                                            self.controller.native_control_context2026(
+                                                self.engine
+                                            )
+                                        )
+                                        if programming_2026_common._control_has_ordinary_getter_return2026(
+                                            context
+                                        ):
+                                            self.dispatch_control_getter_return()
                             self.dispatch_worker_tail()
                         with self._lock:
                             self._result = result
@@ -520,6 +538,18 @@ class EngineThreadJob2026:
                                     self.worker.notify_logical_cpu_boundary(
                                         self._callback_argument
                                     )
+                                elif self._callback_kind == "control_progress_count":
+                                    self.worker.publish_control_count2026(
+                                        self._callback_context
+                                    )
+                                elif self._callback_kind == "control_progress_percent":
+                                    self.worker.publish_control_percent2026(
+                                        self._callback_context
+                                    )
+                                elif self._callback_kind == "control_getter_return":
+                                    self.worker.import_control_getter_return2026(
+                                        self._callback_context
+                                    )
                                 else:
                                     raise ValueError("Unknown native outer callback")
                         except BaseException as error:  # noqa: BLE001 - restore exact outer callback failure to child
@@ -527,6 +557,7 @@ class EngineThreadJob2026:
                         finally:
                             self._callback_kind = None
                             self._callback_argument = None
+                            self._callback_context = None
                             self._callback_requested.clear()
                             self._callback_returned.set()
                 if self._prepare_pending.is_set():
@@ -603,7 +634,48 @@ class EngineThreadJob2026:
         """5b1b0 publishes the source-issued native fatal input on the outer thread."""
         self._dispatch_outer_callback("tail")
 
-    def _dispatch_outer_callback(self, kind: str, argument: int | None = None) -> None:
+    def dispatch_control_progress(self, context, kind: str) -> None:
+        """Publish the worker-owned CONTROL vector at its real child callback."""
+        from scripts.programming_2026_common import NativeControlContext2026
+
+        if type(kind) is not str or kind not in ("count", "percent"):
+            raise ValueError("CONTROL progress kind must be count or percent")
+        if threading.current_thread() is not self._child:
+            raise ValueError("CONTROL progress belongs to the actual child")
+        self.engine._require_owned_phase()
+        self.validate_owner(self.engine)
+        if (
+            type(context) is not NativeControlContext2026
+            or self.controller.native_control_context2026(self.engine) is not context
+        ):
+            raise ValueError("Current issued CONTROL context required")
+        self.worker._validate_control_output_context2026(context)
+        target = self.engine._controller_export_target2026
+        if target is None or target._context is not context:
+            raise ValueError("Active CONTROL export target required")
+        target.validate(self.engine, self.controller)
+        self._dispatch_outer_callback(f"control_progress_{kind}", context=context)
+
+    def dispatch_control_getter_return(self) -> None:
+        """Import the actual ordinary getter return after raw Execute returns."""
+        from scripts.programming_2026_common import NativeControlContext2026
+
+        if threading.current_thread() is not self._child:
+            raise ValueError("CONTROL getter return belongs to the actual child")
+        self.engine._require_owned_phase()
+        self.validate_owner(self.engine)
+        context = self.controller.native_control_context2026(self.engine)
+        if (
+            type(context) is not NativeControlContext2026
+            or context._capture._phase != 0
+        ):
+            raise ValueError("Ordinary CONTROL getter context required")
+        self.worker._validate_control_output_context2026(context)
+        self._dispatch_outer_callback("control_getter_return", context=context)
+
+    def _dispatch_outer_callback(
+        self, kind: str, argument: int | None = None, *, context=None
+    ) -> None:
         if threading.current_thread() is not self._child:
             raise ValueError("Native callback publication belongs to the actual child")
         self.engine._require_owned_phase()
@@ -611,6 +683,7 @@ class EngineThreadJob2026:
         self._callback_error = None
         self._callback_kind = kind
         self._callback_argument = argument
+        self._callback_context = context
         self._callback_returned.clear()
         self._callback_requested.set()
         self._activity.set()

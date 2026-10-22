@@ -17,8 +17,8 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from types import MappingProxyType
-from typing import Self
-from weakref import WeakValueDictionary
+from typing import TYPE_CHECKING, Self, cast
+from weakref import WeakValueDictionary, ref
 
 from scripts.calibration_2026 import (  # noqa: F401 - compatibility exports for family consumers
     Native2026Metadata,
@@ -39,6 +39,9 @@ from scripts.j2534_2026 import (  # noqa: F401 - compatibility export
 )
 from scripts.native_modules import NativeModuleIdentity, identify_native_module
 from scripts.programming import NativeTransportError
+
+if TYPE_CHECKING:
+    from scripts.cuw_parameter_pool import ControlParameterPool2026
 
 DIAG_COMM_PROTOCOL_CANFD = "02"
 DIAG_COMM_PROTOCOL_ETHERNET = "03"
@@ -559,6 +562,15 @@ class NativeRuntime2026:
                 raise ValueError("Host primitive call budget exceeded")
         started = self.clock()
         try:
+            # CONTROL's native callback10/11 publishes the complete worker-owned
+            # vector before the provider observes the corresponding notification.
+            # The ordinary runtime path remains unchanged outside an authenticated
+            # lexical export target.
+            if operation in (
+                "notify_progress_count",
+                "notify_progress_percent",
+            ):
+                self._publish_scoped_control_progress2026(operation)
             provider = self._provider(operation, cleanup)
             if (
                 not cleanup
@@ -577,6 +589,30 @@ class NativeRuntime2026:
         else:
             self.check()
         return result
+
+    def _publish_scoped_control_progress2026(self, operation: str) -> None:
+        active = getattr(self._device_calls, "control_export", None)
+        if active is None:
+            return
+        engine, controller, target = active
+        controller = engine._controller_execution
+        target.validate(engine, controller)
+        context = controller.native_control_context2026(engine)
+        kind = "count" if operation == "notify_progress_count" else "percent"
+        job = self._thread_job_host
+        if job is not None:
+            job.dispatch_control_progress(context, kind)
+        else:
+            publish = getattr(
+                engine.worker,
+                "publish_control_count2026"
+                if kind == "count"
+                else "publish_control_percent2026",
+                None,
+            )
+            if not callable(publish):
+                raise NotImplementedError("114 CONTROL publication API is pending")
+            publish(context)
 
     def acquire(
         self,
@@ -3389,33 +3425,44 @@ class NativeParameter2026:
         self.headers, self.rows = (), ()
 
 
-_empty_control_parameters: WeakValueDictionary[
-    int, "NativeEmptyControlParameter2026"
+_control_base_parameters2026: WeakValueDictionary[
+    int, "NativeControlParameterBase2026"
 ] = WeakValueDictionary()
 
 
 @dataclass(frozen=True, init=False)
-class NativeEmptyControlParameter2026:
-    """b980's first constructor-zero CParameter before any LoadParameter call."""
+class NativeControlParameterBase2026:
+    """Issued pool BASE; constructor-zero until the first native row load."""
 
     def __init__(self):
-        raise TypeError("Empty native control parameter must be controller-issued")
+        raise TypeError("Native control parameter base must be controller-issued")
 
     def validate(self, engine) -> None:
         from scripts.cuw_2026 import CUWEngine2026
 
         if (
-            _empty_control_parameters.get(id(self)) is not self
+            _control_base_parameters2026.get(id(self)) is not self
             or type(engine) is not CUWEngine2026
             or self._engine is not engine
             or engine.worker.controller is not self._controller
-            or self._controller._retained_parameter_pool
-            or engine.native_metadata is not self.metadata
         ):
-            raise ValueError(
-                "Current constructor-issued empty control parameter required"
-            )
+            raise ValueError("Current issued control parameter base required")
         engine._require_owned_phase()
+        if self._pool is None:
+            if (
+                self._controller._has_loaded_control_parameters2026()
+                or engine.native_metadata is not self.metadata
+            ):
+                raise ValueError("Current constructor-issued empty parameter required")
+        else:
+            self._pool.validate(engine, self._controller)
+            context = self._controller.native_control_context2026(engine)
+            if (
+                context is not self._context
+                or self.metadata.source_container
+                is not context._capture.metadata.source_container
+            ):
+                raise ValueError("Actual held CONTROL base parameter view required")
         native2026_validate_runtime_metadata(self.metadata)
 
     @property
@@ -3424,14 +3471,18 @@ class NativeEmptyControlParameter2026:
 
         engine = self._engine
         if type(engine) is not CUWEngine2026:
-            raise ValueError("Actual issued empty parameter engine required")
+            raise ValueError("Actual issued control parameter base engine required")
         self.validate(engine)
         return engine
 
     @property
     def parameter(self) -> NativeParameter2026:
         self.validate(self._engine)
-        return NativeParameter2026()
+        return (
+            NativeParameter2026()
+            if self._pool is None
+            else self._pool.slot(0).parameter
+        )
 
     def value(self, name: str) -> str:
         # Native2470 returns false for the absent column and leaves output alone.
@@ -3440,14 +3491,16 @@ class NativeEmptyControlParameter2026:
     _engine: object = field(repr=False)
     _controller: "ControlCommPhase2026" = field(repr=False)
     metadata: Native2026Metadata = field(repr=False)
+    _pool: "ControlParameterPool2026 | None" = field(default=None, repr=False)
+    _context: "NativeControlContext2026 | None" = field(default=None, repr=False)
 
 
 class ControlCommPhase2026:
-    """Exact ControlCommPhase exports and one-phase Execute boundary.
+    """Exact ControlCommPhase exports and the raw same-Execute stage machine.
 
     The controller retains one explicit module-runtime address history. Its
-    `execute` method dispatches one bound engine/session phase over the optional
-    interface pair and public parameter pool; the thread job owns the surrounding
+    `execute` method runs live native phases over one held FILE/interface view
+    and retained parameter array; the thread job owns the surrounding
     orchestration and the outer host owns final shared-trace validation.
     """
 
@@ -3465,19 +3518,326 @@ class ControlCommPhase2026:
         # One host controller represents one explicit loaded module runtime.
         self.address_history = []
         self.alternate_cid_used = False
-        self._retained_parameter_pool: tuple[NativeParameterBinding2026, ...] = ()
         self._parameter_session = None
+        self._native_control_context2026 = None
+        self._native_control_raw_execution2026 = None
+        self._native_control_helper_entry2026 = None
+        self._native_control_export_lease2026 = None
+        self._control_parameter_pool2026: ControlParameterPool2026 | None = None
 
-    def empty_control_parameter(self, engine) -> NativeEmptyControlParameter2026:
+    def _begin_native_control_context2026(self, engine, capture):
+        """Install the once-imported raw CONTROL context for the owned phase."""
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.cuw_engine_worker import ControlFileCapture2026
+
+        if type(engine) is not CUWEngine2026 or engine.worker.controller is not self:
+            raise ValueError("Actual controller-owned engine required")
+        engine._require_owned_phase()
+        if type(capture) is not ControlFileCapture2026:
+            raise TypeError("Actual once-imported CONTROL FILE capture required")
+        capture.validate(engine, self)
+        if self._native_control_context2026 is not None:
+            raise ValueError("A CONTROL context is already active for this controller")
+        context = NativeControlContext2026._issue(engine, self, capture)
+        self._native_control_context2026 = context
+        return context
+
+    def _end_native_control_context2026(self, engine, context) -> None:
+        """Expire the capability before its owned phase releases the held FILE."""
+        if (
+            self._native_control_context2026 is not context
+            or type(context) is not NativeControlContext2026
+            or context._engine is not engine
+            or context._controller is not self
+            or _NATIVE_CONTROL_CONTEXTS_2026.get(id(context)) is not context
+        ):
+            raise ValueError("Exact active CONTROL context required for expiration")
+        _NATIVE_CONTROL_CONTEXTS_2026.pop(id(context), None)
+        _NATIVE_CONTROL_RETURN_SNAPSHOTS_2026.pop(id(context), None)
+        _NATIVE_CONTROL_GETTER_RESULTS_2026.pop(id(context), None)
+        self._native_control_context2026 = None
+        object.__setattr__(context, "_expired", True)
+
+    def native_control_context2026(self, engine):
+        """Return only this controller's active source-issued CONTROL context."""
+        context = self._native_control_context2026
+        if type(context) is not NativeControlContext2026:
+            raise ValueError("No active source-issued CONTROL context")
+        context.validate(engine, self)
+        return context
+
+    def _begin_native_control_raw_execution2026(self, engine):
+        """Authorize helper leases only while the actual Execute driver runs."""
+        context = self.native_control_context2026(engine)
+        if self._native_control_raw_execution2026 is not None:
+            raise ValueError("A raw CONTROL Execute driver is already active")
+        token = object()
+        _NATIVE_CONTROL_RAW_EXECUTIONS_2026[id(token)] = (token, engine, self, context)
+        self._native_control_raw_execution2026 = token
+        return token
+
+    def _end_native_control_raw_execution2026(self, engine, token) -> None:
+        if (
+            self._native_control_raw_execution2026 is not token
+            or _NATIVE_CONTROL_RAW_EXECUTIONS_2026.get(id(token))
+            != (token, engine, self, self._native_control_context2026)
+            or self._native_control_export_lease2026 is not None
+            or self._native_control_helper_entry2026 is not None
+        ):
+            raise ValueError("Exact idle raw CONTROL Execute authority required")
+        _NATIVE_CONTROL_RAW_EXECUTIONS_2026.pop(id(token), None)
+        self._native_control_raw_execution2026 = None
+
+    def _begin_native_control_helper_entry2026(self, engine, *, helper: str):
+        """Open the exact source-helper boundary before any row load or preflight."""
+        context = self.native_control_context2026(engine)
+        if (
+            helper not in ("6f20", "8990", "a250", "9370", "4c10", "5c30")
+            or self._native_control_raw_execution2026 is None
+            or self._native_control_helper_entry2026 is not None
+            or self._native_control_export_lease2026 is not None
+            or _NATIVE_CONTROL_RAW_EXECUTIONS_2026.get(
+                id(self._native_control_raw_execution2026)
+            )
+            != (
+                self._native_control_raw_execution2026,
+                engine,
+                self,
+                context,
+            )
+        ):
+            raise ValueError("Active raw CONTROL driver and exact helper required")
+        lease = object()
+        state = {
+            "context": context,
+            "controller": self,
+            "engine": engine,
+            "helper": helper,
+            "saved_raw": False,
+            "primary_return_seen": False,
+        }
+        _NATIVE_CONTROL_HELPER_ENTRIES_2026[id(lease)] = (lease, state)
+        self._native_control_helper_entry2026 = lease
+        return lease
+
+    def _end_native_control_helper_entry2026(self, engine, *, lease) -> None:
+        record = _NATIVE_CONTROL_HELPER_ENTRIES_2026.get(id(lease))
+        if (
+            self._native_control_helper_entry2026 is not lease
+            or record is None
+            or record[0] is not lease
+            or record[1]["engine"] is not engine
+            or record[1]["controller"] is not self
+            or self._native_control_export_lease2026 is not None
+        ):
+            raise ValueError("Exact completed CONTROL helper entry required")
+        _NATIVE_CONTROL_HELPER_ENTRIES_2026.pop(id(lease), None)
+        self._native_control_helper_entry2026 = None
+
+    def _begin_native_control_helper2026(
+        self,
+        engine,
+        *,
+        target,
+        stage,
+        export: str,
+        helper: str,
+        required_exports: tuple[str, ...],
+        _addresses: tuple = (),
+    ):
+        """Issue an export lease after the actual raw helper's module preflight."""
+        from scripts.calibration_catalog import inspect_module_bytes
+        from scripts.native_modules import identify_native_module
+        from scripts.programming_replay import ProgrammingReplay
+
+        context = self.native_control_context2026(engine)
+        entry = _NATIVE_CONTROL_HELPER_ENTRIES_2026.get(
+            id(self._native_control_helper_entry2026)
+        )
+        if (
+            type(target) is not NativeControlExportTarget2026
+            or type(stage) is not ProgrammingReplay
+            or self._native_control_raw_execution2026 is None
+            or _NATIVE_CONTROL_RAW_EXECUTIONS_2026.get(
+                id(self._native_control_raw_execution2026)
+            )
+            != (
+                self._native_control_raw_execution2026,
+                engine,
+                self,
+                context,
+            )
+            or self._native_control_export_lease2026 is not None
+            or self._native_control_helper_entry2026 is None
+            or entry is None
+            or entry[0] is not self._native_control_helper_entry2026
+            or entry[1]["engine"] is not engine
+            or entry[1]["controller"] is not self
+            or entry[1]["context"] is not context
+            or entry[1]["helper"] != helper
+            or helper not in ("6f20", "8990", "a250", "9370", "4c10", "5c30")
+            or type(export) is not str
+            or not export
+            or type(required_exports) is not tuple
+            or not required_exports
+            or any(type(name) is not str or not name for name in required_exports)
+            or len(set(required_exports)) != len(required_exports)
+            or export not in required_exports
+            or stage._engine2026 is not engine
+            or stage._controller2026 is not self
+            or stage._control_target2026 is not target
+            or stage._control_export2026 != export
+        ):
+            raise ValueError("Exact active raw CONTROL helper preflight required")
+        target.validate(engine, self)
+        from scripts.j2534_2026 import NativeCommunicationAddress
+
+        if type(_addresses) is not tuple or any(
+            type(address) is not NativeCommunicationAddress for address in _addresses
+        ):
+            raise TypeError("Source-preflighted immutable address vector required")
+        if target._context is not context or (
+            target.entry_cpu_index != context.cpu_index
+            and not (
+                helper == "5c30"
+                and entry[1]["primary_return_seen"]
+                and target.entry_cpu_index < context.cpu_index
+            )
+        ):
+            raise ValueError("CONTROL helper target differs from its live entry cursor")
+        operation_for_export = {
+            "StartGetCID": "get_cid",
+            "StartPrepareWrite": "prepare",
+            "ChangeToReprogGatewayMode": "change_gateway",
+            "StartFlashWrite": "write",
+            "PrepareRetry": "write",
+            "IsFinishReprogramming": "write",
+            "ProcessBeforeIGOffOnAtRetry": target.binding.operation,
+        }
+        operation = operation_for_export.get(export)
+        if operation is None or target.binding.operation != operation:
+            raise ValueError("CONTROL helper export differs from its exact loaded row")
+        module_name = target.module_binding.module_name
+        module = stage.modules.get(module_name)
+        module_data = stage._module_files.get(module_name)
+        if module is None or module_data is None:
+            raise _control_preflight_failure2026(
+                helper, "version_read", target.binding.alternate_cid
+            )
+        if (
+            type(module_data) is not bytes
+            or hashlib.sha256(module_data).hexdigest() != module.sha256
+            or module.native_identity is None
+        ):
+            raise ValueError("Selected CONTROL module bytes are unavailable")
+        identity = identify_native_module(module.sha256, module_name)
+        module_version = inspect_module_bytes(module_data, module_name)["version"]
+        if (
+            type(module.native_identity) is not type(identity)
+            or module.native_identity != identity
+            or module.file_version != module_version
+        ):
+            raise ValueError("Selected CONTROL module authentication changed")
+        module_state = _pooled_binding_state2026(target.module_binding)
+        if module_state is None:
+            raise ValueError("Actual loaded module row lineage required")
+        preflight_key = (
+            id(module_state["slot"]),
+            module_state["revision"],
+            module_name,
+            target.binding.alternate_cid,
+        )
+        checked = entry[1].setdefault("module_preflights", set())
+        if preflight_key not in checked:
+            version_binding = (
+                target.binding
+                if target.binding.alternate_cid
+                else target.module_binding
+            )
+            version_name = (
+                "EnableAlternateDLLVersionsInformationForGetCID"
+                if target.binding.alternate_cid
+                else "EnableDLLVersionInformation"
+            )
+            versions = version_binding.lines(version_name)
+            expected_count = 1 if target.binding.alternate_cid else 4
+            if (
+                len(versions) != expected_count
+                or type(module.file_version) is not str
+                or not module.file_version
+                or "\0" in module.file_version
+            ):
+                raise _control_preflight_failure2026(
+                    helper, "version_compare", target.binding.alternate_cid
+                )
+            phase_index = 0 if target.binding.alternate_cid else engine.comm_phase
+            if module.file_version.encode("latin1") < versions[phase_index].encode(
+                "latin1"
+            ):
+                raise _control_preflight_failure2026(
+                    helper, "version_compare", target.binding.alternate_cid
+                )
+            checked.add(preflight_key)
+        for required in required_exports:
+            if (
+                required not in identity.callable_exports
+                or required not in module.exports
+            ):
+                if helper == "5c30" and required in (
+                    "PrepareRetry",
+                    "IsFinishReprogramming",
+                ):
+                    # 8780(false,false,Phase6) permits a NULL optional entry;
+                    # 3b90's later indirect call is not a new loader CPass catch.
+                    raise NotImplementedError(
+                        "Native3b90 optional entry is NULL: " + required
+                    )
+                raise _control_loader_failure2026(helper, required)
+        lease = object()
+        state = {
+            "controller": self,
+            "addresses": _addresses,
+            "context": context,
+            "engine": engine,
+            "export": export,
+            "helper": helper,
+            "identity": identity,
+            "module": module_name,
+            "module_binding": target.module_binding,
+            "module_version_checked": True,
+            "required_exports": required_exports,
+            "revision": target.entry_revision,
+            "slot": target.entry_slot,
+            "stage": stage,
+            "target": target,
+        }
+        _NATIVE_CONTROL_HELPER_LEASES_2026[id(lease)] = (lease, state)
+        self._native_control_export_lease2026 = lease
+        return lease
+
+    def _end_native_control_helper2026(self, engine, *, lease) -> None:
+        record = _NATIVE_CONTROL_HELPER_LEASES_2026.get(id(lease))
+        if (
+            self._native_control_export_lease2026 is not lease
+            or record is None
+            or record[0] is not lease
+            or record[1]["engine"] is not engine
+            or record[1]["controller"] is not self
+        ):
+            raise ValueError("Exact active raw CONTROL helper lease required")
+        _NATIVE_CONTROL_HELPER_LEASES_2026.pop(id(lease), None)
+        self._native_control_export_lease2026 = None
+
+    def empty_control_parameter(self, engine) -> NativeControlParameterBase2026:
         """Issue the literal initial pool element; never synthesize a selected row."""
         from scripts.cuw_2026 import CUWEngine2026
 
         if type(engine) is not CUWEngine2026 or engine.worker.controller is not self:
             raise ValueError("Actual controller-owned engine required")
         engine._require_owned_phase()
-        if self._retained_parameter_pool:
+        if self._has_loaded_control_parameters2026():
             raise ValueError("The native parameter pool has already been loaded")
-        result = object.__new__(NativeEmptyControlParameter2026)
+        result = object.__new__(NativeControlParameterBase2026)
         object.__setattr__(result, "_engine", engine)
         object.__setattr__(result, "_controller", self)
         object.__setattr__(
@@ -3485,7 +3845,25 @@ class ControlCommPhase2026:
             "metadata",
             native2026_validate_runtime_metadata(engine.native_metadata),
         )
-        _empty_control_parameters[id(result)] = result
+        _control_base_parameters2026[id(result)] = result
+        return result
+
+    def _control_base_parameter2026(self, engine):
+        """b280/DH tail receive pool BASE, including rows retained from older FILEs."""
+        context = self.native_control_context2026(engine)
+        pool = self._control_pool2026()
+        pool.validate(engine, self)
+        result = object.__new__(NativeControlParameterBase2026)
+        for name, value in (
+            ("_engine", engine),
+            ("_controller", self),
+            ("_pool", pool),
+            ("_context", context),
+            ("metadata", context._capture.metadata),
+        ):
+            object.__setattr__(result, name, value)
+        _control_base_parameters2026[id(result)] = result
+        result.validate(engine)
         return result
 
     def runtime_device(self) -> J2534Device2026:
@@ -3557,7 +3935,10 @@ class ControlCommPhase2026:
                 self.runtime._forget_disconnected_children()
             caught = False
             try:
-                metadata = engine.native_metadata
+                context = self._native_control_context2026
+                metadata = (
+                    context.metadata if context is not None else engine.native_metadata
+                )
                 contact = metadata.vehicle.get("contacttype", "")
                 protocol = (
                     3
@@ -3609,71 +3990,171 @@ class ControlCommPhase2026:
             raise ValueError("Host native address history capacity exceeded")
         self.address_history.append(address)
 
-    def run_bound_export(self, engine, session) -> dict:
-        """Run one concrete export on this controller's shared timeline.
-
-        This is the export invocation boundary, not the complete b3e0 CPU/retry
-        orchestration. The outer caller still owns final trace validation.
-        """
+    def _run_control_export2026(self, engine, session) -> dict:
+        """Run one staged family export without replacing raw CONTROL phase state."""
         from scripts.cuw_2026 import CUWEngine2026
         from scripts.programming_replay import ProgrammingReplay
 
-        if type(engine) is not CUWEngine2026 or type(session) is not ProgrammingReplay:
-            raise TypeError("Concrete native engine and programming replay required")
-        phase = {
-            "get_cid": 0,
-            "prepare": 1,
-            "write": 2,
-            "recovery": 2,
-            "probe": 2,
-            "change_gateway": 3,
-        }.get(session.operation)
-        if phase is None:
-            raise ValueError("Known actual native export stage required")
-        session.bind_controller2026(self)
-        return engine.run_bound_phase(phase, session, self.runtime)
-
-    def _retain_parameter(self, session, binding) -> None:
-        """Retain the exact loaded row in the public one-entry pool.
-
-        The public binding currently exposes one selected CParameter row per
-        LoadParameter call. Keeping a tuple preserves the native array boundary
-        without inventing extra rows; native multi-row cardinality and source
-        review remain open. A later CPU or phase replaces the retained entry.
-        """
-        binding.require_control_versions()
-        self._retained_parameter_pool = (binding,)
-        self._parameter_session = session
-
-    def _load_parameter_pool(self, engine, session):
-        """Load the exact row consumed by this phase into the public pool.
-
-        The public Execute chronology selects the row before the family export.
-        The retained row is also the source for the constructor-empty fallback
-        check and must be the same immutable binding the replay executes.
-        """
-        from scripts.cuw_2026 import CUWEngine2026
-        from scripts.programming_replay import ProgrammingReplay
-
-        if type(engine) is not CUWEngine2026 or type(session) is not ProgrammingReplay:
-            raise TypeError("Concrete native engine and programming replay required")
+        if (
+            type(engine) is not CUWEngine2026
+            or type(session) is not ProgrammingReplay
+            or engine._controller_execution is not self
+            or engine.worker.controller is not self
+            or self._native_control_raw_execution2026 is None
+        ):
+            raise ValueError("Actual raw CONTROL helper execution required")
         engine._require_owned_phase()
-        if engine.worker.controller is not self:
-            raise ValueError("Native parameter pool belongs to another controller")
-        expected = (
-            "write" if session.operation in ("recovery", "probe") else session.operation
-        )
-        if expected not in ("get_cid", "prepare", "write", "change_gateway"):
-            raise ValueError("Known actual native parameter stage required")
         session.bind_controller2026(self)
         session.bind_engine2026(engine)
-        binding = session.selected_binding2026()
-        if not isinstance(binding, NativeParameterBinding2026):
-            raise TypeError("Source-bound native2026 parameter selection required")
-        if binding.operation != expected:
-            raise ValueError("Loaded parameter row differs from the execute phase")
-        self._retain_parameter(session, binding)
-        return binding
+        session.bind_runtime2026(self.runtime)
+        session._validate_control_stage2026()
+        current = getattr(self.runtime._device_calls, "control_export", None)
+        if current is not None:
+            raise ValueError("Nested scoped CONTROL runtime export is forbidden")
+        self.runtime._device_calls.control_export = (
+            engine,
+            self,
+            session._control_target2026,
+        )
+        try:
+            return session.run_bound2026(self.runtime)
+        finally:
+            self.runtime._device_calls.control_export = current
+
+    def _invoke_control_export2026(
+        self,
+        engine,
+        root_session,
+        target,
+        export: str,
+        *,
+        helper: str,
+        required_exports: tuple[str, ...],
+    ) -> dict:
+        """Clone, lease and run exactly one source-selected CONTROL export."""
+        if self._native_control_raw_execution2026 is None:
+            raise ValueError("CONTROL exports require the active raw Execute driver")
+        stage = root_session._next_control_export2026(target, export)
+        entry = _NATIVE_CONTROL_HELPER_ENTRIES_2026[
+            id(_control_helper_entry2026(target._context))
+        ][1]
+        addresses = entry.get("addresses", {}).get(target.entry_index)
+        if addresses is None:
+            addresses = self._preflight_control_helper2026(engine, target, helper)
+            entry.setdefault("addresses", {})[target.entry_index] = addresses
+        lease = self._begin_native_control_helper2026(
+            engine,
+            target=target,
+            stage=stage,
+            export=export,
+            helper=helper,
+            required_exports=required_exports,
+            _addresses=addresses,
+        )
+        try:
+            return self._run_control_export2026(engine, stage)
+        finally:
+            self._end_native_control_helper2026(engine, lease=lease)
+
+    def _preflight_control_helper2026(self, engine, target, helper: str):
+        """Resolve source-selected helper addresses before issuing its export lease."""
+        from scripts.calibration_2026 import (
+            native2026_global_cpu_index,
+            native2026_location_id,
+            native2026_node_count,
+            native2026_node_values,
+        )
+        from scripts.j2534_2026 import CommunicationAddress2026
+
+        if type(target) is not NativeControlExportTarget2026:
+            raise TypeError("Exact issued CONTROL target required")
+        target.validate(engine, self)
+        binding = target.binding
+        selectors = binding.selector_functions
+        if helper == "3b90":
+            selectors = binding.lines("GetCANIDFunctionNameForPrepareWrite")
+            if len(selectors) > 4:
+                raise ValueError("Native retry selector vector exceeds four slots")
+        if not selectors:
+            return ()
+        parameter = binding.parameter
+        address_parameters = {
+            name: values
+            for name in (
+                "CanIDForGetCID",
+                "CanIDForPrepareWrite",
+                "CanIDForReprogGateway",
+                "CanIDMatchedPartOfCID",
+                "CIDForCalcCpuNum",
+            )
+            if (values := parameter.values(name)) is not None
+        }
+        metadata = target.metadata
+        node_diag_ids = tuple(
+            native2026_node_values(metadata, index).get("diagid", "")
+            for index in range(native2026_node_count(metadata))
+        )
+        frontend = engine.frontend_parameters
+        callback_aware = helper in ("6f20", "a250", "9370", "5c30")
+
+        class LazyResponseLookup(dict):
+            def get(self, key, default=None):
+                # Native callback17 resolves only when its selector is reached.
+                # Classic8990/4c10 construct CCommunicationAddress with NULL callbacks.
+                if not callback_aware:
+                    return default
+                target.validate(engine, target._controller)
+                if frontend is None:
+                    raise NativeCallbackLookupError()
+                value = frontend.parameter("CanIDTable.ini").string_with_keys(
+                    "ResponseCANID", key, "", ""
+                )
+                if value is None:
+                    raise NativeCallbackLookupError()
+                return value
+
+        cids = (
+            tuple(value.decode("latin1") for value in target._context.identifiers)
+            if helper in ("6f20", "8990", "a250", "3b90")
+            else ()
+        )
+        load_metadata = binding.loaded_parameter_metadata or binding.metadata
+        location_id = (
+            native2026_location_id(
+                load_metadata, native2026_global_cpu_index(load_metadata)
+            )
+            if helper == "4c10"
+            else None
+        )
+        resolver = CommunicationAddress2026(
+            address_parameters,
+            node_diag_ids=node_diag_ids,
+            response_canids={},
+            suzuki_ids=(
+                metadata.vehicle.get("canidtx_phys_usdt", ""),
+                metadata.vehicle.get("canidrx_phys_usdt", ""),
+            )
+            if metadata.format_version in (10, 12)
+            else None,
+            history=self.address_history,
+        )
+        resolver.response_canids = cast(MappingProxyType, LazyResponseLookup())
+        success, addresses = resolver.resolve(
+            selectors, cids=cids, location_id=location_id
+        )
+        if not success:
+            failures = {
+                "6f20": ("TCUWControlCommPhase.dll:RVA6f20", 0x6D1),
+                "8990": ("TCUWControlCommPhase.dll:RVA8990", 0x79E),
+                "a250": ("TCUWControlCommPhase.dll:RVAa250", 0x837),
+                "9370": ("TCUWControlCommPhase.dll:RVA9370", 0xA67),
+                "4c10": ("TCUWControlCommPhase.dll:RVA4c10", 0x8FF),
+                "5c30": ("TCUWControlCommPhase.dll:RVA5c30", 0xB9C),
+                "3b90": ("TCUWControlCommPhase.dll:RVA3b90", 0x4AE),
+            }
+            source, line = failures[helper]
+            raise NativePassThruException2026(9999, source, line)
+        return addresses
 
     def _begin_execute_pair(self, engine):
         """Apply the source-issued engine→CONTROL ImportData view transition."""
@@ -3689,157 +4170,543 @@ class ControlCommPhase2026:
         pair.import_into(control, wire)
         return pair, wire
 
-    @staticmethod
-    def _finish_execute_pair(pair_context) -> None:
-        """Return the control view's exact ExportData snapshot to the engine."""
-        if pair_context is None:
-            return
-        pair, wire = pair_context
-        returned = pair.export_from(pair.control, previous=wire)
-        pair.import_into(pair.engine, returned)
-
-    @staticmethod
-    def _execute_result(report, phase: int, exports, **extra) -> dict:
-        """Compose one b3e0 phase report without promoting native completion."""
-        return {
-            **report,
-            "native_phase": phase,
-            "exports": tuple(exports),
-            "programming_completed": False,
-            **extra,
-        }
-
     def execute(self, engine, session) -> dict:
-        """Dispatch one actual b3e0 phase over the bound engine/control context.
-
-        The thread job reserves exactly one worker phase per invocation. This
-        method therefore dispatches the session's real export, the classic
-        prepare transition, the loaded-writer retry loop and the post-write
-        consumers. It never chains a second host phase or promotes completion.
-        """
+        """b3e0: one imported FILE, shared primitive cursor and live phase tests."""
         from scripts.cuw_2026 import CUWEngine2026
+        from scripts.cuw_parameter_pool import ControlParameterPool2026
         from scripts.programming_replay import ProgrammingReplay
 
         if type(engine) is not CUWEngine2026 or type(session) is not ProgrammingReplay:
-            raise TypeError("Concrete native engine and programming replay required")
-        phases = {
-            "get_cid": 0,
-            "prepare": 1,
-            "write": 2,
-            "recovery": 2,
-            "probe": 2,
-            "change_gateway": 3,
-        }
-        phase = phases.get(session.operation)
-        if phase is None:
-            raise ValueError("Known actual native execute phase required")
-        engine._require_owned_phase()
-        if engine._controller_execution is not self:
-            raise ValueError("Execute requires its active controller execution")
-        worker = engine.worker
-        if worker.controller is not self:
-            raise ValueError("Execute belongs to another native worker")
-        expected_worker_phase = 1 if phase == 3 else phase
-        if engine.worker_phase != expected_worker_phase:
-            raise ValueError("Execute phase differs from the native worker phase")
+            raise TypeError("Concrete native engine and replay required")
+        context = self.native_control_context2026(engine)
         if session.used:
-            raise ValueError("Unused native replay required for Execute")
-        session.bind_controller2026(self)
-        session.bind_engine2026(engine)
-        binding = None
-        if session.operation != "get_cid":
-            binding = self._load_parameter_pool(engine, session)
-
-        pair_context = self._begin_execute_pair(engine)
-        retry_decision = None
-        if session.operation == "get_cid":
-            report = self.receive_cids(engine, session)
-            exports = report.get("exports")
-            if not isinstance(exports, (tuple, list)):
-                exports = (report,)
-        else:
-            report = self.run_bound_export(engine, session)
-            exports = [report]
-            executed = session.executed_binding2026(engine=engine, controller=self)
-            if binding is None or executed != binding:
-                raise ValueError("Executed native row differs from the loaded pool")
-            if session.operation == "write" and report.get("native_return") is False:
-                retry = self.retry_failed_write(engine, session)
-                exports.extend(retry["exports"])
-                retry_decision = retry["retry_decision"]
-        self._finish_execute_pair(pair_context)
-
-        # Native8990 runs after the classic prepare export regardless of its
-        # callback Boolean. Modern P5/P6/Ethernet phases use their own transition.
-        if session.operation == "prepare" and engine.native_metadata.vehicle.get(
-            "contacttype", ""
-        ) not in ("P5-Unified", "Phase6", "Ethernet"):
-            worker.finish_classic_prepare()
-        elif (
-            session.operation in ("write", "recovery")
-            and report.get("native_return") is True
-        ):
-            worker.clear_post_write_state()
-        elif session.operation == "probe" and report.get("native_return") is True:
-            worker.finish_recovery_probe(self)
-
-        extra = {}
-        if retry_decision is not None:
-            extra["retry_decision"] = retry_decision
-        return self._execute_result(report, phase, exports, **extra)
-
-    def retry_failed_write(self, engine, session) -> dict:
-        """3b90's actual loaded-writer retry loop, retaining the original source row."""
-        from scripts.calibration_2026 import native2026_cpu_file_list_flag
-        from scripts.cuw_2026 import CUWEngine2026
-        from scripts.j2534_2026 import communication_addresses_from_parameter
-        from scripts.programming_replay import ProgrammingReplay
-
-        if type(engine) is not CUWEngine2026 or type(session) is not ProgrammingReplay:
-            raise TypeError("Concrete engine and executed writer replay required")
-        engine._require_owned_phase()
-        if (
-            engine.worker.controller is not self
-            or session.operation != "write"
-            or engine.worker_phase not in (1, 2)
-        ):
-            raise ValueError("Actual controller-owned preparation/write phase required")
-        selection = session.executed_binding2026(engine=engine, controller=self)
-        if selection.operation != "write":
-            raise ValueError("Actual loaded writer parameter row required")
-        selection.require_control_versions()
-        selection.rebind_writer_metadata(engine.native_metadata)
-        parameter = selection.parameter
-        worker, errors = engine.worker, engine.dh_state
-        retry = engine.bind_retry_controller()
-        saved_primary, saved_passthru = errors.primary_error, errors.passthru_error
-        ig_retriable = parameter.boolean("IGOffRetriableFlag") or False
-        checkpoint = False
+            raise ValueError("Unused raw CONTROL recording required")
+        token = self._begin_native_control_raw_execution2026(engine)
         reports = []
+        try:
+            session._bind_control_root2026(engine, self, self.runtime)
+            self._parameter_session = session
+            pool = ControlParameterPool2026.issue(
+                engine, self, session._catalog_sources, encoded=True
+            )
+            self._control_parameter_pool2026 = pool
+            pair = self._begin_execute_pair(engine)
+            entry_phase = engine.comm_phase
+            returned = False
+            if entry_phase == 0:
+                returned = self._run_control_helper2026(
+                    engine, session, "6f20", reports
+                )
+            elif context.metadata.vehicle.get("contacttype", "") in (
+                "P5-Unified",
+                "Phase6",
+                "Ethernet",
+            ):
+                if engine.comm_phase == 1:
+                    returned = self._run_control_helper2026(
+                        engine, session, "9370", reports
+                    )
+                if engine.comm_phase == 2:
+                    returned = self._run_control_helper2026(
+                        engine, session, "5c30", reports
+                    )
+            else:
+                # b3e0 reads the existing slot before8990 overwrites the pool.
+                parameter = pool.slot(context.cpu_index).parameter
+                start = context.cpu_index
+                end = (
+                    len(context.target_indices)
+                    if parameter.boolean("CpuLoopBetweenPrepareAndWriteFlag")
+                    else start + 1
+                )
+                for outer_index in range(start, end):
+                    self.runtime.check()
+                    returned = True
+                    if engine.comm_phase == 1:
+                        returned = self._run_control_helper2026(
+                            engine, session, "8990", reports
+                        )
+                    if engine.comm_phase == 3:
+                        returned = self._run_control_helper2026(
+                            engine, session, "a250", reports, incoming=returned
+                        )
+                    if engine.comm_phase == 2:
+                        returned = self._run_control_helper2026(
+                            engine, session, "4c10", reports
+                        )
+                    if not returned:
+                        break
+                    if outer_index + 1 < end:
+                        if self._control_general2026(
+                            engine,
+                            outer_index + 1,
+                            "FlagToDoIGOFFONAtCPUTypeChange",
+                        ):
+                            break
+                        engine.set_comm_phase(1, controller=self)
+                if (
+                    self.dh_mode_could_be_changed
+                    and returned
+                    and engine.comm_phase == 2
+                ):
+                    self._control_dh_tail2026(engine, session)
+            # Only ordinary flow reaches4be0; a host/non-CPass exception bypasses it.
+            snapshot = _record_control_return2026(engine, self, pair)
+            session.used = True
+            return {
+                "native_phase": entry_phase,
+                "native_return": returned,
+                "exports": tuple(reports),
+                "control_snapshot": snapshot,
+                "identifiers": _control_getter_return_values2026(context)
+                if entry_phase == 0
+                else (),
+                "programming_completed": False,
+            }
+        finally:
+            # Expire host capabilities only. Never import interfaces or write native
+            # outputs here: native unwind is not the ordinary4be0 return path.
+            self._end_native_control_raw_execution2026(engine, token)
+
+    def _run_control_helper2026(
+        self, engine, session, helper, reports, *, incoming=False
+    ):
+        from scripts.j2534_2026 import NativePassThruError2026
+
+        context = self.native_control_context2026(engine)
+        entry = self._begin_native_control_helper_entry2026(engine, helper=helper)
+        state = _NATIVE_CONTROL_HELPER_ENTRIES_2026[id(entry)][1]
+        state.update(addresses={}, getter_al=False, identifiers=context.identifiers)
+        try:
+            try:
+                returned = {
+                    "6f20": self._control_getter2026,
+                    "8990": self._control_classic_prepare2026,
+                    "a250": self._control_gateway2026,
+                    "9370": self._control_modern_prepare2026,
+                    "4c10": self._control_classic_write2026,
+                    "5c30": self._control_modern_write2026,
+                }[helper](engine, session, entry, reports, incoming)
+            except (NativePassThruException2026, NativePassThruError2026) as error:
+                engine.worker._record_control_helper_cpass2026(context, error, entry)
+                returned = (
+                    state["getter_al"]
+                    if helper == "6f20"
+                    else False
+                    if helper == "a250"
+                    else _control_saved_family_return2026(context, entry)
+                )
+            if helper == "6f20":
+                _record_control_getter_result2026(
+                    context, entry, returned, state["identifiers"]
+                )
+            return returned
+        finally:
+            self._end_native_control_helper_entry2026(engine, lease=entry)
+
+    def _has_loaded_control_parameters2026(self) -> bool:
+        pool = self._control_parameter_pool2026
+        return pool is not None and any(
+            pool.slot(i).loaded for i in range(pool.capacity)
+        )
+
+    def _control_pool2026(self) -> "ControlParameterPool2026":
+        pool = self._control_parameter_pool2026
+        if pool is None:
+            raise ValueError("Raw CONTROL parameter array has not been issued")
+        return pool
+
+    def _close_control_pool2026(self, engine) -> None:
+        """b980 detach: destroy only this engine's inactive loaded module array."""
+        pool = self._control_parameter_pool2026
+        if pool is None or pool._state.engine is not engine:
+            return
+        if (
+            engine.active
+            or self._native_control_context2026 is not None
+            or self._native_control_raw_execution2026 is not None
+            or self._native_control_helper_entry2026 is not None
+            or self._native_control_export_lease2026 is not None
+        ):
+            raise ValueError("Active CONTROL module array cannot be detached")
+        pool._require_state(engine, self, active=False, check_capacity=False)
+        pool.close()
+        self._control_parameter_pool2026 = None
+
+    def _control_target2026(self, engine, index, operation):
+        target = NativeControlExportTarget2026.issue(
+            engine, self, self._control_pool2026(), index, operation
+        )
+        return target
+
+    def _control_call2026(self, engine, session, target, export, helper, reports):
+        required = self._control_required_exports2026(engine, target, helper)
+        report = self._invoke_control_export2026(
+            engine,
+            session,
+            target,
+            export,
+            helper=helper,
+            required_exports=tuple(dict.fromkeys((*required, export))),
+        )
+        reports.append(report)
+        return report
+
+    def _control_required_exports2026(self, engine, target, helper):
+        parameter = target.binding.parameter
+        if helper == "6f20":
+            return ("StartGetCID",)
+        if helper == "a250":
+            return ("ChangeToReprogGatewayMode",)
+        phase6 = target.metadata.vehicle.get("contacttype", "") == "Phase6"
+        if helper in ("8990", "9370"):
+            return ("StartPrepareWrite",) + (
+                ("ProcessBeforeIGOffOnAtRetry",) if helper == "9370" and phase6 else ()
+            )
+        required = ["StartFlashWrite"]
+        if helper == "4c10":
+            if parameter.boolean("PrepareRetryFlag"):
+                required.append("PrepareRetry")
+            current = (
+                self._control_pool2026()
+                .slot(self.native_control_context2026(engine).cpu_index)
+                .parameter
+            )
+            if current.boolean("ConfirmAfterEndOfFlashingFlag"):
+                required.append("IsFinishReprogramming")
+        elif phase6:
+            required.append("ProcessBeforeIGOffOnAtRetry")
+        return tuple(required)
+
+    def _control_bool2026(self, report):
+        returned = report.get("native_return")
+        if type(returned) is not bool:
+            raise NotImplementedError("Concrete family native BOOL is source-unknown")
+        return returned
+
+    def _control_getter2026(self, engine, session, entry, reports, _incoming):
+        pool = self._control_pool2026()
+        pool.load_for(engine, self, "get_cid")
+        target = self._control_target2026(engine, 0, "get_cid")
+        report = self._control_call2026(
+            engine, session, target, "StartGetCID", "6f20", reports
+        )
+        values = self._cid_vector(report)
+        self.alternate_cid_used = False
+        state = _NATIVE_CONTROL_HELPER_ENTRIES_2026[id(entry)][1]
+        state["getter_al"] = _control_alternate_getter_byte2026(target, report)
+        if not values:
+            alternate = target._alternate_getter2026()
+            if alternate is not None:
+                engine.dh_state.record_native_error(None, 0, 0)
+                report = self._control_call2026(
+                    engine, session, alternate, "StartGetCID", "6f20", reports
+                )
+                state["getter_al"] = _control_alternate_getter_byte2026(
+                    alternate, report
+                )
+                values = self._cid_vector(report)
+                self.alternate_cid_used = bool(values)
+        engine._publish_control_alternate_cache2026(worker=engine.worker)
+        state["identifiers"] = values
+        return state["getter_al"]
+
+    def _control_classic_prepare2026(self, engine, session, entry, reports, _incoming):
+        self._control_pool2026().load_for(engine, self, "prepare")
+        target = self._control_target2026(
+            engine, self.native_control_context2026(engine).cpu_index, "prepare"
+        )
+        self._control_bool2026(
+            self._control_call2026(
+                engine, session, target, "StartPrepareWrite", "8990", reports
+            )
+        )
+        engine.worker.finish_classic_prepare()
+        engine._publish_control_ssmid_cache2026(worker=engine.worker)
+        engine._publish_control_dh_type_cache2026(worker=engine.worker)
+        return _control_saved_family_return2026(target._context, entry)
+
+    def _control_gateway2026(self, engine, session, entry, reports, incoming):
+        if incoming:
+            self._control_pool2026().load_for(engine, self, "change_gateway")
+            name = (
+                self._control_pool2026()
+                .slot(0)
+                .parameter.string("DLLFileNameForChangeToReprogGatewayMode")
+            )
+            if name:
+                target = self._control_target2026(engine, 0, "change_gateway")
+                report = self._control_call2026(
+                    engine,
+                    session,
+                    target,
+                    "ChangeToReprogGatewayMode",
+                    "a250",
+                    reports,
+                )
+                # This exact field is *param7 in original Body export100010d0.
+                if (
+                    target.module_binding.module_name
+                    != "TCUWP4CanBodyPrepareWriter.dll"
+                ):
+                    raise NotImplementedError(
+                        "a250 gateway out-byte source adapter unavailable"
+                    )
+                changed = report.get("gateway_mode_changed")
+                if type(changed) is not bool:
+                    raise NotImplementedError(
+                        "Actual gateway out-byte is source-unknown"
+                    )
+                if changed:
+                    incoming = self._control_bool2026(report)
+            if incoming:
+                engine.set_comm_phase(2, controller=self)
+                return True
+        self._retry_control2026(engine, session, None, "a250", reports)
+        if not engine.worker.control_state.failed:
+            engine.worker._fatal = True
+        return False
+
+    def _control_modern_prepare2026(self, engine, session, entry, reports, _incoming):
+        self._control_pool2026().load_for(engine, self, "prepare")
+        target = self._control_target2026(engine, 0, "prepare")
+        report = self._control_call2026(
+            engine, session, target, "StartPrepareWrite", "9370", reports
+        )
+        returned = self._control_bool2026(report)
+        engine.worker.record_callback_24(engine.repro_gateway_node)
+        if returned:
+            engine.set_comm_phase(2, controller=self)
+        else:
+            self._retry_control2026(engine, session, target, "9370", reports)
+            self._control_retry_tail2026(engine, session, target, "9370", reports)
+        return returned
+
+    def _control_retry_tail2026(self, engine, session, target, helper, reports):
+        if not engine.worker.control_state.failed:
+            engine.worker._fatal = True
+        elif target.metadata.vehicle.get("contacttype", "") == "Phase6":
+            self._control_call2026(
+                engine, session, target, "ProcessBeforeIGOffOnAtRetry", helper, reports
+            )
+
+    def _control_general2026(self, engine, index, name):
+        metadata = self.native_control_context2026(engine).metadata_for_cpu(index)
+        return engine.general_parameter_boolean(
+            metadata.vehicle.get("kindofecu", ""),
+            native2026_cpu_type(metadata, native2026_global_cpu_index(metadata)),
+            metadata.vehicle.get("contacttype", ""),
+            name,
+            controller=self,
+        )
+
+    def _control_write_success2026(self, engine, index, end, *, logical):
+        context = self.native_control_context2026(engine)
+        engine.dh_state.record_native_error(None, 0, 0)
+        engine.dh_state._native_context_964 = False
+        engine.worker._failed = False
+        persistence = engine.persistence
+        if persistence is not None:
+            if index == end:
+                persistence.notification.assign(False)
+            persistence.last_block_notification.assign(False)
+        if not logical:
+            entry = _control_helper_entry2026(context)
+            state = _NATIVE_CONTROL_HELPER_ENTRIES_2026[id(entry)][1]
+            if (
+                state["helper"] not in ("4c10", "5c30")
+                or not state["primary_return_seen"]
+            ):
+                raise ValueError(
+                    "Actual successful source writer cursor store required"
+                )
+            if index != context.cpu_index + 1 or index > len(context.target_indices):
+                raise ValueError("Source writer cursor must advance by exactly one")
+            object.__setattr__(context, "_cpu_index", index)
+
+    def _control_before_write2026(self, engine, entry, *, modern):
+        context = self.native_control_context2026(engine)
+        if not engine.worker.control_state.recovery_mode:
+            return False
+        _clear_control_saved_family_return2026(context, entry)
+        if modern:
+            engine.worker.publish_callback_25_gateway_node()
+        else:
+            engine.set_comm_phase(
+                engine.native_control_phase_cache2026, controller=self
+            )
+            self.alternate_cid_used = engine.native_control_alternate_cache2026
+            engine.worker.read_control_callback_29_2026(context)
+            engine.dh_state._divided_image_index = (
+                engine.native_control_divided_index2026
+            )
+            engine.worker.publish_control_callback_30_2026(context)
+        return True
+
+    def _control_classic_write2026(self, engine, session, entry, reports, _incoming):
+        from scripts.cuw_2026 import set_communication_log_mode
+
+        context = self.native_control_context2026(engine)
+        pool = self._control_pool2026()
+        # 151 must yield one row, then that row's full preflight, before next load.
+        for index in pool.load_steps_for(engine, self, "write"):
+            target = self._control_target2026(engine, index, "write")
+            self._control_preflight_only2026(engine, session, target, "4c10")
+        parameter = pool.slot(context.cpu_index).parameter
+        end = (
+            context.cpu_index + 1
+            if parameter.boolean("CpuLoopBetweenPrepareAndWriteFlag")
+            else len(context.target_indices)
+        )
+        while context.cpu_index < end:
+            self.runtime.check()
+            target = self._control_target2026(engine, context.cpu_index, "write")
+            while True:
+                if self._control_before_write2026(engine, entry, modern=False):
+                    returned = False
+                else:
+                    set_communication_log_mode(self.runtime, 2)
+                    returned = self._control_bool2026(
+                        self._control_call2026(
+                            engine, session, target, "StartFlashWrite", "4c10", reports
+                        )
+                    )
+                    set_communication_log_mode(self.runtime, int(not returned))
+                    engine._publish_control_retry_cache2026(worker=engine.worker)
+                    engine._publish_control_phase_cache2026(worker=engine.worker)
+                if returned:
+                    break
+                self._retry_control2026(engine, session, target, "4c10", reports)
+                state = engine.worker.control_state
+                if not state.failed:
+                    return not state.fatal
+                if engine.comm_phase == 1 or target.binding.parameter.boolean(
+                    "IGOffRetriableFlag"
+                ):
+                    return False
+            self._control_write_success2026(
+                engine, context.cpu_index + 1, end, logical=False
+            )
+            if context.cpu_index < end and self._control_general2026(
+                engine, context.cpu_index, "FlagToDoIGOFFONAtCPUTypeChange"
+            ):
+                break
+        return _control_saved_family_return2026(context, entry)
+
+    def _control_modern_write2026(self, engine, session, entry, reports, _incoming):
+        from scripts.calibration_2026 import native2026_node_logical_block_count
+
+        context = self.native_control_context2026(engine)
+        loaded = self._control_pool2026().load_for(engine, self, "write")
+        target = self._control_target2026(engine, context.cpu_index, "write")
+        end = max(loaded, default=context.cpu_index - 1) + 1
+        metadata = context.metadata
+        logical = (
+            native2026_node_logical_block_count(
+                metadata,
+                native2026_node_index(metadata, native2026_global_cpu_index(metadata)),
+            )
+            > 0
+        )
+        local_index = context.cpu_index
+        while local_index < end:
+            self.runtime.check()
+            if self._control_before_write2026(engine, entry, modern=True):
+                returned = False
+            else:
+                returned = self._control_bool2026(
+                    self._control_call2026(
+                        engine, session, target, "StartFlashWrite", "5c30", reports
+                    )
+                )
+            if not returned:
+                self._retry_control2026(engine, session, target, "5c30", reports)
+                if not engine.worker.control_state.failed:
+                    return not engine.worker.control_state.fatal
+                self._control_retry_tail2026(engine, session, target, "5c30", reports)
+                break
+            local_index += 1
+            self._control_write_success2026(engine, local_index, end, logical=logical)
+            if logical:
+                break
+            if local_index < end:
+                target = target._next_writer_cpu2026()
+        return _control_saved_family_return2026(context, entry)
+
+    def _control_preflight_only2026(self, engine, session, target, helper):
+        stage = session._next_control_export2026(target, "StartFlashWrite")
+        addresses = self._preflight_control_helper2026(engine, target, helper)
+        lease = self._begin_native_control_helper2026(
+            engine,
+            target=target,
+            stage=stage,
+            export="StartFlashWrite",
+            helper=helper,
+            required_exports=self._control_required_exports2026(engine, target, helper),
+            _addresses=addresses,
+        )
+        self._end_native_control_helper2026(engine, lease=lease)
+        state = _NATIVE_CONTROL_HELPER_ENTRIES_2026[
+            id(_control_helper_entry2026(target._context))
+        ][1]
+        state["addresses"][target.entry_index] = addresses
+
+    def _control_dh_tail2026(self, engine, session):
+        from scripts.programming_2026_dh import DHGateway2026
+
+        selection = self._control_base_parameter2026(engine)
+        dependency = session.modules.get("TCUWDHUtils.dll")
+        composer = self.runtime._security_composer
+        if dependency is None or dependency.native_identity is None or composer is None:
+            raise ValueError("Actual final DHUtils source dependencies required")
+        gateway = DHGateway2026(
+            self.runtime,
+            selection,
+            dependency.native_identity,
+            composer.client,
+            engine_state=engine.dh_state,
+        )
+        try:
+            gateway.end_reprogramming_mode(0x3FC)
+        except BaseException as error:
+            if not is_native_exception2026(error):
+                raise
+        self.dh_mode_could_be_changed = False
+
+    def _retry_control2026(self, engine, session, target, helper, reports):
+        """3b90 uses the live held pool row while retaining its loaded DLL."""
+        from scripts.calibration_2026 import native2026_cpu_file_list_flag
+
+        context = self.native_control_context2026(engine)
+        pool = self._control_pool2026()
+        parameter = pool.slot(context.cpu_index).parameter
+        contact = context.metadata.vehicle.get("contacttype", "")
+        retry_parameter = (
+            pool.slot(0).parameter if contact == "P5-Unified" else parameter
+        )
+        ig_retriable = retry_parameter.boolean("IGOffRetriableFlag") or False
+        state, worker = engine.dh_state, engine.worker
+        saved_primary, saved_status = state.primary_error, state.passthru_error
+        retry = engine.bind_retry_controller()
+        checkpoint = False
 
         def query():
             self.query_control_error(engine)
             worker.copy_control_retry_decision(retry)
 
         def general(name):
-            metadata = engine.native_metadata
-            return engine.general_parameter_boolean(
-                metadata.vehicle.get("kindofecu", ""),
-                native2026_cpu_type(metadata, native2026_global_cpu_index(metadata)),
-                metadata.vehicle.get("contacttype", ""),
-                name,
-                controller=self,
-            )
+            return self._control_general2026(engine, context.cpu_index, name)
 
-        if not ig_retriable and engine.comm_phase == 2 and errors.error_kind == 2:
+        if not ig_retriable and engine.comm_phase == 2 and state.error_kind == 2:
             worker.set_control_error_kind(4)
         query()
         while worker.control_state.failed and engine.comm_phase == 2:
             self.runtime.check()
             proceed = ig_retriable
             if not ig_retriable:
-                proceed = not general("FlagToCancelAutomaticIGOFF") or (
-                    engine.bind_gateway_startup().callback29()
+                proceed = (
+                    not general("FlagToCancelAutomaticIGOFF")
+                    or engine.bind_gateway_startup().callback29()
                 )
                 if proceed and worker.control_state.initial_command_retry:
                     if engine.repro_gateway_node == 1:
@@ -3853,75 +4720,57 @@ class ControlCommPhase2026:
             if not proceed:
                 query()
                 continue
-            errors.mark_native_retry()
-            if not (parameter.boolean("PrepareRetryFlag") or False):
+            state.mark_native_retry()
+            if not parameter.boolean("PrepareRetryFlag"):
                 break
+            if target is None or target.binding.operation != "write":
+                raise NotImplementedError(
+                    "3b90 PrepareRetry requires its actual loaded writer"
+                )
             if not ig_retriable and (
                 worker.control_state.source_mode == 2
-                or native2026_cpu_file_list_flag(engine.native_metadata, 0)
+                or native2026_cpu_file_list_flag(context.metadata, 0)
             ):
                 retry.record_callback30(1)
                 checkpoint = True
-            errors.record_native_error(None, saved_primary, saved_passthru)
+            state.record_native_error(None, saved_primary, saved_status)
             timeout = parameter.long("ReceiveTimeoutBeforePrepareRetry") or 0
             if timeout > 0:
                 self.runtime.call("set_timeout", milliseconds=timeout)
-            report = self.run_bound_export(engine, session.next_retry2026())
-            returned = report.get("native_return")
-            if type(returned) is not bool:
-                raise ValueError("Actual PrepareRetry native BOOL required")
-            reports.append(report)
-            if returned:
-                errors.record_native_error(None, 0, 0)
+            report = self._control_call2026(
+                engine, session, target, "PrepareRetry", helper, reports
+            )
+            if self._control_bool2026(report):
+                state.record_native_error(None, 0, 0)
                 break
-            if not (parameter.boolean("FlagToNonSetEerrorKindConnect") or False):
+            if not parameter.boolean("FlagToNonSetEerrorKindConnect"):
                 worker.set_control_error_kind(5 if checkpoint else 3)
             engine.notify_native_error_kind()
             query()
-
         if (
             worker.control_state.failed
             and engine.comm_phase == 2
-            and (parameter.boolean("ConfirmAfterEndOfFlashingFlag") or False)
+            and parameter.boolean("ConfirmAfterEndOfFlashingFlag")
         ):
-            tail_ig_retriable = parameter.boolean("IGOffRetriableFlag") or False
             ended = worker.control_state.native_context_970
-            if not tail_ig_retriable or ended:
+            if not parameter.boolean("IGOffRetriableFlag") or ended:
                 self.runtime.call("wait", milliseconds=5000)
                 if ended:
-                    functions = parameter.parameters(
-                        "GetCANIDFunctionNameForPrepareWrite", 4
-                    )
-                    selectors = ("",) * 4 if functions is None else functions[0]
-                    if functions is not None and functions[1] > 4:
-                        raise ValueError(
-                            "Native retry prepare selector output exceeds four slots"
+                    if target is None or target.binding.operation != "write":
+                        raise NotImplementedError(
+                            "3b90 IsFinish requires its actual loaded writer"
                         )
-                    resolver = communication_addresses_from_parameter(
-                        selection.metadata.source_container,
-                        parameter,
-                        history=self.address_history,
+                    # 4ae uses prepare selectors, current row and original CID list.
+                    self._preflight_control_helper2026(engine, target, "3b90")
+                    report = self._control_call2026(
+                        engine,
+                        session,
+                        target,
+                        "IsFinishReprogramming",
+                        helper,
+                        reports,
                     )
-                    success, _ = resolver.resolve(
-                        selectors,
-                        cids=tuple(
-                            value.decode("latin1")
-                            for value in engine.received_identifiers
-                        ),
-                        location_id=None,
-                    )
-                    if not success:
-                        raise NativePassThruException2026(
-                            9999, "TCUWControlCommPhase.dll:RVA3b90", 0x4AE
-                        )
-                    report = self.run_bound_export(engine, session.next_finish2026())
-                    returned = report.get("native_return")
-                    if type(returned) is not bool:
-                        raise ValueError(
-                            "Actual IsFinishReprogramming native BOOL required"
-                        )
-                    reports.append(report)
-                    if returned:
+                    if self._control_bool2026(report):
                         worker.finish_recovery_probe(self)
         if (
             not checkpoint
@@ -3930,47 +4779,6 @@ class ControlCommPhase2026:
             and engine.comm_phase == 2
         ):
             retry.record_callback30(1)
-        return {
-            "exports": tuple(reports),
-            "retry_decision": worker.control_state.failed,
-        }
-
-    def receive_cids(self, engine, session) -> dict:
-        """6f20/7c20: try alternate only for an empty vector, then commit final IDs."""
-        from scripts.cuw_2026 import CUWEngine2026
-        from scripts.programming_replay import ProgrammingReplay
-
-        if type(engine) is not CUWEngine2026 or type(session) is not ProgrammingReplay:
-            raise TypeError("Concrete native engine and replay required")
-        if session.operation != "get_cid":
-            raise ValueError("Native CID reception export required")
-        session.bind_controller2026(self)
-        session.bind_engine2026(engine)
-        primary = session.selected_binding2026()
-        self._retain_parameter(session, primary)
-        reports = [self.run_bound_export(engine, session)]
-        self.alternate_cid_used = False
-        values = self._cid_vector(reports[0])
-        if not values:
-            alternate = session.next_alternate_getter2026(primary)
-            if alternate is not None:
-                alternate_binding = alternate.selected_binding2026()
-                self._retain_parameter(alternate, alternate_binding)
-                reports.append(self.run_bound_export(engine, alternate))
-                values = self._cid_vector(reports[-1])
-                if values:
-                    self.alternate_cid_used = True
-        engine.commit_received_identifiers(values, controller=self)
-        target_selection = None
-        if engine.active:
-            target_selection = engine.worker.mark_cid_reception_complete()
-        return {
-            **reports[-1],
-            "identifiers": values,
-            "alternate_getter_used": self.alternate_cid_used,
-            "target_selection_return": target_selection,
-            "exports": tuple(reports),
-        }
 
     @staticmethod
     def _cid_vector(report: dict) -> tuple[bytes, ...]:
@@ -3994,7 +4802,7 @@ class ControlCommPhase2026:
             raise TypeError(
                 "Concrete DHUtils binding on the controller device required"
             )
-        if type(gateway.selection) is NativeEmptyControlParameter2026:
+        if type(gateway.selection) is NativeControlParameterBase2026:
             if gateway.selection.engine.worker.controller is not self:
                 raise ValueError("Empty parameter pool belongs to another controller")
         elif not isinstance(gateway.selection, NativeParameterBinding2026):
@@ -4009,6 +4817,7 @@ class ControlCommPhase2026:
     def bind_startup_session(self, engine, session) -> None:
         """59710 retains actual loaded module dependencies before 5a835 startup."""
         from scripts.cuw_2026 import CUWEngine2026
+        from scripts.cuw_parameter_pool import ControlParameterPool2026
         from scripts.programming_replay import ProgrammingReplay
 
         if type(engine) is not CUWEngine2026 or type(session) is not ProgrammingReplay:
@@ -4017,11 +4826,26 @@ class ControlCommPhase2026:
         if engine.worker.controller is not self:
             raise ValueError("Startup dependencies belong to another controller")
         module = session.modules.get("TCUWControlCommPhase.dll")
-        if module is None or module.native_identity != self.identity:
+        module_data = session._module_files.get("TCUWControlCommPhase.dll")
+        if (
+            module is None
+            or module.native_identity != self.identity
+            or type(module_data) is not bytes
+            or hashlib.sha256(module_data).hexdigest() != self.identity.sha256
+        ):
             raise ValueError("Actual selected control module source required")
-        session.bind_controller2026(self)
-        session.bind_engine2026(engine)
+        session._bind_control_prelude2026(engine, self, self.runtime)
         self._parameter_session = session
+        self._control_parameter_pool2026 = ControlParameterPool2026.issue(
+            engine, self, session._catalog_sources, encoded=True
+        )
+        secret, cuw = (
+            session._module_files.get(name) for name in ("SecretInfo.dll", "CUW.dll")
+        )
+        if secret is not None and cuw is not None:
+            self.runtime.bind_security_composer(
+                NativeSecurityComposer2026.from_native_modules(secret, cuw)
+            )
 
     def gateway_startup_fallback(self, engine) -> bool | None:
         """Optional59710 +30 binding invokes b280 with the retained parameter pool."""
@@ -4039,27 +4863,7 @@ class ControlCommPhase2026:
         session = self._parameter_session
         if type(session) is not ProgrammingReplay:
             raise ValueError("Native DH fallback module dependencies are not bound")
-        if self._retained_parameter_pool:
-            selection = self._retained_parameter_pool[0]
-            if not isinstance(selection, NativeParameterBinding2026):
-                raise TypeError("Actual loaded native parameter row required")
-            if selection.operation not in ("get_cid", "prepare", "write"):
-                raise ValueError("DH fallback requires a loaded writer/getter row")
-            if selection.metadata != engine.native_metadata:
-                if selection.operation == "get_cid":
-                    selection = selection.rebind_getter_metadata(engine.native_metadata)
-                elif selection.operation == "prepare":
-                    selection = selection.rebind_prepare_metadata(
-                        engine.native_metadata
-                    )
-                elif selection.operation == "write":
-                    selection = selection.rebind_writer_metadata(engine.native_metadata)
-                else:
-                    raise ValueError(
-                        "Retained DH parameter target differs from the engine"
-                    )
-        else:
-            selection = self.empty_control_parameter(engine)
+        selection = self._control_base_parameter2026(engine)
         dependency = session.modules.get("TCUWDHUtils.dll")
         composer = self.runtime._security_composer
         if dependency is None or dependency.native_identity is None or composer is None:
@@ -4214,6 +5018,201 @@ _PARAMETER_STAGES_2026 = {
 }
 
 
+_NATIVE_CONTROL_CONTEXTS_2026: dict[int, "NativeControlContext2026"] = {}
+_NATIVE_CONTROL_RAW_EXECUTIONS_2026: dict[int, tuple] = {}
+_NATIVE_CONTROL_HELPER_ENTRIES_2026: dict[int, tuple] = {}
+_NATIVE_CONTROL_HELPER_LEASES_2026: dict[int, tuple] = {}
+_NATIVE_CONTROL_RETURN_SNAPSHOTS_2026: dict[int, tuple] = {}
+_NATIVE_CONTROL_GETTER_RESULTS_2026: dict[int, tuple] = {}
+_POOLED_PARAMETER_BINDINGS_2026: dict[
+    int, tuple[Callable[[], object | None], dict]
+] = {}
+_NATIVE_CONTROL_EXPORT_TARGETS_2026: WeakValueDictionary[
+    int, "NativeControlExportTarget2026"
+] = WeakValueDictionary()
+
+
+def _register_pooled_binding2026(binding, state: dict) -> None:
+    key = id(binding)
+
+    def retire(_reference):
+        _POOLED_PARAMETER_BINDINGS_2026.pop(key, None)
+
+    _POOLED_PARAMETER_BINDINGS_2026[key] = (ref(binding, retire), state)
+
+
+class NativeControlContext2026:
+    """CONTROL-local FILE/order/target authority captured at the real59ab0 import."""
+
+    __slots__ = (
+        "__weakref__",
+        "_capture",
+        "_controller",
+        "_cpu_index",
+        "_engine",
+        "_expired",
+        "_identifiers",
+        "_runtime",
+        "_worker",
+    )
+
+    def __new__(cls, *args, **kwargs):
+        raise TypeError("Native CONTROL contexts are issued by their controller")
+
+    @classmethod
+    def _issue(cls, engine, controller, capture):
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.cuw_engine_worker import ControlFileCapture2026
+
+        if (
+            type(engine) is not CUWEngine2026
+            or type(capture) is not ControlFileCapture2026
+            or engine.worker.controller is not controller
+            or engine.worker.runtime is not controller.runtime
+        ):
+            raise TypeError("Exact CONTROL capture and native owners required")
+        capture.validate(engine, controller)
+        result = object.__new__(cls)
+        object.__setattr__(result, "_engine", engine)
+        object.__setattr__(result, "_controller", controller)
+        object.__setattr__(result, "_capture", capture)
+        object.__setattr__(result, "_worker", engine.worker)
+        object.__setattr__(result, "_runtime", controller.runtime)
+        object.__setattr__(result, "_identifiers", tuple(engine.received_identifiers))
+        object.__setattr__(result, "_cpu_index", capture.control_cpu_start)
+        if type(result._cpu_index) is not int or result._cpu_index < 0:
+            raise ValueError("Captured CONTROL local CPU index is invalid")
+        object.__setattr__(result, "_expired", False)
+        _NATIVE_CONTROL_CONTEXTS_2026[id(result)] = result
+        return result
+
+    def __repr__(self) -> str:
+        return "NativeControlContext2026(<source-issued>)"
+
+    def __setattr__(self, name, value):
+        raise AttributeError("Native CONTROL context is immutable")
+
+    @property
+    def cpu_index(self) -> int:
+        self.validate(self._engine, self._controller)
+        return self._cpu_index
+
+    @property
+    def metadata(self) -> Native2026Metadata:
+        return self.metadata_for_cpu(self.cpu_index)
+
+    @property
+    def target_indices(self) -> tuple[int, ...]:
+        self.validate(self._engine, self._controller)
+        return self._capture.target_indices
+
+    @property
+    def identifiers(self) -> tuple[bytes, ...]:
+        """59ab0 copies caller59c/118 once; outer FILE movement cannot replace it."""
+        self.validate(self._engine, self._controller)
+        return self._identifiers
+
+    @property
+    def target_index(self) -> int:
+        index = self.cpu_index
+        targets = self.target_indices
+        if index >= len(targets):
+            raise IndexError("CONTROL local CPU index exceeds captured target vector")
+        return targets[index]
+
+    def metadata_for_cpu(self, native_index: int) -> Native2026Metadata:
+        self.validate(self._engine, self._controller)
+        if type(native_index) is not int or native_index < 0:
+            raise IndexError("Unsigned CONTROL native CPU index required")
+        return self._capture.metadata_for_cpu(native_index)
+
+    def native_index_for_source_cpu(self, source_index: int) -> int:
+        """Map a held post-rebuild CPU index to this FILE's ordered index."""
+        self.validate(self._engine, self._controller)
+        if type(source_index) is not int or source_index < 0:
+            raise IndexError("Unsigned held CONTROL source CPU index required")
+        try:
+            return self._capture.native_order.index(source_index)
+        except ValueError as error:
+            raise ValueError(
+                "CPU is absent from the held CONTROL FILE order"
+            ) from error
+
+    @property
+    def count_scratch(self) -> tuple[int, ...]:
+        self.validate(self._engine, self._controller)
+        getter = getattr(self._worker, "_control_progress_scratch2026", None)
+        if not callable(getter):
+            raise NotImplementedError("114 worker-owned CONTROL scratch API is pending")
+        counts, _percentages = getter(self)
+        if type(counts) is not tuple:
+            raise TypeError("Immutable worker-owned CONTROL count scratch required")
+        return counts
+
+    @property
+    def percentage_scratch(self) -> tuple[int, ...]:
+        self.validate(self._engine, self._controller)
+        getter = getattr(self._worker, "_control_progress_scratch2026", None)
+        if not callable(getter):
+            raise NotImplementedError("114 worker-owned CONTROL scratch API is pending")
+        _counts, percentages = getter(self)
+        if type(percentages) is not tuple:
+            raise TypeError(
+                "Immutable worker-owned CONTROL percentage scratch required"
+            )
+        return percentages
+
+    def _store_count2026(self, target, index: int, value: int) -> None:
+        self.validate(self._engine, self._controller)
+        target.validate(self._engine, self._controller)
+        if target._context is not self:
+            raise ValueError("CONTROL count target belongs to another context")
+        store = getattr(self._worker, "_store_control_count2026", None)
+        if not callable(store):
+            raise NotImplementedError("114 worker-owned CONTROL count store is pending")
+        store(self, target, index, value)
+
+    def _store_percentage2026(self, target, index: int, value: int) -> None:
+        self.validate(self._engine, self._controller)
+        target.validate(self._engine, self._controller)
+        if target._context is not self:
+            raise ValueError("CONTROL percentage target belongs to another context")
+        store = getattr(self._worker, "_store_control_percentage2026", None)
+        if not callable(store):
+            raise NotImplementedError(
+                "114 worker-owned CONTROL percentage store is pending"
+            )
+        store(self, target, index, value)
+
+    def validate(self, engine, controller) -> None:
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.cuw_engine_worker import ControlFileCapture2026
+
+        if (
+            _NATIVE_CONTROL_CONTEXTS_2026.get(id(self)) is not self
+            or self._expired
+            or self._engine is not engine
+            or self._controller is not controller
+            or controller._native_control_context2026 is not self
+            or type(engine) is not CUWEngine2026
+            or engine.worker is not self._worker
+            or engine.worker.controller is not controller
+            or engine.worker.runtime is not self._runtime
+            or controller.runtime is not self._runtime
+            or type(self._capture) is not ControlFileCapture2026
+        ):
+            raise ValueError("CONTROL context is foreign, stale, or unowned")
+        engine._require_owned_phase()
+        self._capture.validate(engine, controller)
+
+
+def _pooled_binding_state2026(binding: "NativeParameterBinding2026") -> dict | None:
+    entry = _POOLED_PARAMETER_BINDINGS_2026.get(id(binding))
+    if entry is None or entry[0]() is not binding:
+        return None
+    return entry[1]
+
+
 @dataclass(frozen=True)
 class NativeParameterBinding2026:
     """One exact native parameter file/selected row, frozen before events."""
@@ -4237,6 +5236,7 @@ class NativeParameterBinding2026:
     loaded_parameter_metadata: Native2026Metadata | None = field(
         default=None, repr=False
     )
+    _pool_issued: bool = field(default=False, repr=False, compare=False)
 
     @property
     def getter_parameter_metadata(self) -> Native2026Metadata | None:
@@ -4269,6 +5269,8 @@ class NativeParameterBinding2026:
     def _rebind_loaded_metadata(
         self, live_metadata: Native2026Metadata
     ) -> "NativeParameterBinding2026":
+        if self._pool_issued:
+            raise ValueError("Source-issued pooled rows cannot be rebound")
         if type(live_metadata) is not Native2026Metadata:
             raise TypeError("Actual live native metadata required")
         original = self.loaded_parameter_metadata or self.metadata
@@ -4309,6 +5311,8 @@ class NativeParameterBinding2026:
 
     def alternate_cid_binding(self) -> "NativeParameterBinding2026 | None":
         """7c20: source first filename, total version count, one native output slot."""
+        if self._pool_issued:
+            raise ValueError("A pooled getter must reuse its actual loaded slot")
         if self.operation != "get_cid" or self.alternate_cid:
             raise ValueError("Primary native getter binding required")
         names = self.lines("AlternateDLLFileNamesForGetCID")
@@ -4361,6 +5365,8 @@ class NativeParameterBinding2026:
         This does not mutate source CUW metadata or redispatch a loaded writer.
         The concrete caller owns the native SetCPUType/firmware condition.
         """
+        if self._pool_issued:
+            raise ValueError("A pooled binding cannot select another parameter row")
         alternate = self.value("AlternateCPUType")
         if (
             not alternate
@@ -4415,6 +5421,11 @@ class NativeParameterBinding2026:
         alternate_cpu: bool = False,
     ) -> "NativeParameterBinding2026":
         """Reproduce exact file/row binding from immutable catalog and CUW bytes."""
+        if self._pool_issued:
+            if _pooled_binding_state2026(self) is None:
+                raise ValueError("Exact source-issued pooled binding identity required")
+            _validate_pooled_binding2026(self, container, operation)
+            return self
         if type(alternate_cpu) is not bool:
             raise TypeError("Explicit native alternate-CPU branch Boolean required")
         retained = self.loaded_parameter_metadata
@@ -4460,6 +5471,17 @@ class NativeParameterBinding2026:
     @property
     def parameter(self) -> NativeParameter2026:
         """Return a mutable native parameter instance from the frozen source rows."""
+        state = _pooled_binding_state2026(self)
+        if self._pool_issued:
+            if state is None:
+                raise ValueError("Exact source-issued pooled binding identity required")
+            _validate_pooled_binding2026(
+                self, self.metadata.source_container, self.operation
+            )
+            result = NativeParameter2026(self.headers, self.rows)
+            result.key_column = state["key_column"]
+            result.row_index = state["row_index"]
+            return result
         result = NativeParameter2026(
             self.headers, self.rows, "ParamFileKeySystemProtocolMicon"
         )
@@ -4467,6 +5489,10 @@ class NativeParameterBinding2026:
         return result
 
     def lines(self, name: str) -> tuple[str, ...]:
+        if self._pool_issued:
+            _validate_pooled_binding2026(
+                self, self.metadata.source_container, self.operation
+            )
         return self.values.get(name, ())
 
     def value(self, name: str) -> str:
@@ -4479,6 +5505,10 @@ class NativeParameterBinding2026:
         *,
         module_versions: Mapping[str, str] | None = None,
     ) -> dict:
+        if self._pool_issued:
+            _validate_pooled_binding2026(
+                self, self.metadata.source_container, self.operation
+            )
         _suffix, export, phase_index = _PARAMETER_STAGES_2026[self.operation]
         module = self.module_name
         if not re.fullmatch(r"[A-Za-z0-9_-]+\.dll", module):
@@ -4671,6 +5701,785 @@ def bind_native_parameter2026(
         catalog_sources,
         module_binding,
     )
+
+
+def _validate_pooled_binding2026(binding, container, operation) -> None:
+    state = _pooled_binding_state2026(binding)
+    if state is None:
+        raise ValueError("Exact source-issued pooled parameter binding required")
+    engine, controller, pool = state["engine"], state["controller"], state["pool"]
+    if (
+        container is not binding.metadata.source_container
+        or operation != binding.operation
+    ):
+        raise ValueError("Pooled binding source or operation differs")
+    pool.validate(engine, controller)
+    context = controller.native_control_context2026(engine)
+    context.validate(engine, controller)
+    if (
+        context is not state["context"]
+        or context._capture is not state["capture"]
+        or context._capture.metadata.source_container
+        is not state["load_metadata"].source_container
+    ):
+        raise ValueError("Pooled binding is outside its held CONTROL FILE")
+    native2026_validate_runtime_metadata(binding.metadata)
+    native2026_validate_runtime_metadata(state["load_metadata"])
+    slot, loaded_metadata = pool._binding_state2026(engine, controller, state["index"])
+    if (
+        slot is not state["slot"]
+        or loaded_metadata is not state["load_metadata"]
+        or slot.revision != state["revision"]
+        or slot.filename != binding.source_name
+        or slot.source_sha256 != binding.source_sha256
+        or slot.loaded is not True
+    ):
+        raise ValueError("Pooled binding slot was replaced or unloaded")
+    parameter = slot.parameter
+    if (
+        parameter.headers != binding.headers
+        or parameter.rows != binding.rows
+        or parameter.key_column != state["key_column"]
+        or parameter.row_index != state["row_index"]
+    ):
+        raise ValueError("Pooled binding no longer matches its loaded native row")
+    catalog_sources = pool.catalog_sources
+    if (
+        pool.encoded is not state["encoded"]
+        or dict(catalog_sources) != dict(state["catalog_sources"])
+        or hashlib.sha256(catalog_sources[binding.source_name]).hexdigest()
+        != binding.source_sha256
+    ):
+        raise ValueError("Pooled binding catalog identity changed")
+
+
+def _binding_from_control_pool2026(
+    engine, controller, pool, index: int, operation: str
+) -> NativeParameterBinding2026:
+    """Issue a binding from one exact loaded pool row, never by key reselection."""
+    from scripts.cuw_2026 import CUWEngine2026
+    from scripts.cuw_parameter_pool import (
+        ControlParameterPool2026,
+        ControlParameterSlot2026,
+    )
+
+    if (
+        type(engine) is not CUWEngine2026
+        or type(controller) is not ControlCommPhase2026
+        or type(pool) is not ControlParameterPool2026
+        or type(index) is not int
+        or index < 0
+        or operation not in _PARAMETER_STAGES_2026
+    ):
+        raise TypeError("Concrete CONTROL pool binding inputs required")
+    pool.validate(engine, controller)
+    context = controller.native_control_context2026(engine)
+    context.validate(engine, controller)
+    slot, load_metadata = pool._binding_state2026(engine, controller, index)
+    if type(slot) is not ControlParameterSlot2026:
+        raise TypeError("Exact source-issued CONTROL pool slot required")
+    if type(load_metadata) is not Native2026Metadata:
+        raise TypeError("Strict load-time native metadata required")
+    native2026_validate_runtime_metadata(load_metadata)
+    metadata = native2026_validate_runtime_metadata(context.metadata)
+    if (
+        load_metadata.source_container is not context._capture.metadata.source_container
+        or metadata.source_container is not load_metadata.source_container
+        or not slot.loaded
+        or slot.filename is None
+        or slot.source_sha256 is None
+    ):
+        raise ValueError("Loaded pool row must belong to the held CONTROL FILE")
+    encoded = pool.encoded
+    catalog_sources = pool.catalog_sources
+    if type(encoded) is not bool:
+        raise TypeError("Source-issued pool encoding flag required")
+    catalog = dict(catalog_sources)
+    data = catalog.get(slot.filename)
+    if (
+        type(data) is not bytes
+        or hashlib.sha256(data).hexdigest() != slot.source_sha256
+    ):
+        raise ValueError("Loaded pool source differs from the exact bound catalog")
+    parameter = slot.parameter
+    row_index = slot.row_index
+    if (
+        type(row_index) is not int
+        or row_index <= 0
+        or row_index > len(parameter.rows)
+        or parameter.row_index != row_index
+        or not 0 <= parameter.key_column < len(parameter.headers)
+    ):
+        raise ValueError("Loaded CONTROL slot has no valid selected native row")
+    row = parameter.rows[row_index - 1]
+    key_cell = row[parameter.key_column]
+    if not key_cell:
+        raise ValueError("Loaded CONTROL row has no native key")
+    key = key_cell[0]
+    values = {}
+    for name, cell in zip(parameter.headers, row, strict=True):
+        values.setdefault(name, cell)
+    values = MappingProxyType(values)
+    contact = load_metadata.vehicle.get("contacttype", "")
+    modern = contact in ("P5-Unified", "Phase6", "Ethernet")
+    cpu_index = (
+        native2026_global_cpu_index(load_metadata)
+        if operation in ("prepare", "write") and not modern
+        else 0
+    )
+    cpu_type = native2026_cpu_type(load_metadata, cpu_index)
+    catalog_snapshot = MappingProxyType(catalog)
+    binding = NativeParameterBinding2026(
+        slot.filename,
+        slot.source_sha256,
+        key,
+        operation,
+        values,
+        metadata,
+        parameter.headers,
+        parameter.rows,
+        cpu_type,
+        encoded,
+        catalog_snapshot,
+        None,
+        None,
+        False,
+        load_metadata,
+        _pool_issued=True,
+    )
+    state = {
+        "engine": engine,
+        "controller": controller,
+        "pool": pool,
+        "index": index,
+        "slot": slot,
+        "revision": slot.revision,
+        "context": context,
+        "capture": context._capture,
+        "load_metadata": load_metadata,
+        "catalog_sources": catalog_snapshot,
+        "encoded": encoded,
+        "key_column": parameter.key_column,
+        "row_index": row_index,
+    }
+    _register_pooled_binding2026(binding, state)
+    if operation == "prepare" and not modern and index != 0:
+        module_binding = _binding_from_control_pool2026(
+            engine, controller, pool, 0, operation
+        )
+        binding = replace(binding, module_binding=module_binding)
+        # Replacing a frozen dataclass intentionally loses the unregistered object;
+        # register the exact returned identity with the same frozen pool evidence.
+        _register_pooled_binding2026(binding, state)
+    return binding
+
+
+class NativeControlExportTarget2026:
+    """Frozen entry module/slot with live CONTROL metadata and local CPU projection."""
+
+    __slots__ = (
+        "__weakref__",
+        "_binding",
+        "_context",
+        "_controller",
+        "_engine",
+        "_entry_cpu_index",
+        "_entry_index",
+        "_entry_revision",
+        "_entry_slot",
+        "_module_binding",
+        "_pool",
+    )
+
+    def __new__(cls, *args, **kwargs):
+        raise TypeError("CONTROL export targets are issued from loaded pool slots")
+
+    @classmethod
+    def issue(cls, engine, controller, pool, index: int, operation: str):
+        binding = _binding_from_control_pool2026(
+            engine, controller, pool, index, operation
+        )
+        context = controller.native_control_context2026(engine)
+        slot = pool.slot(index)
+        result = object.__new__(cls)
+        object.__setattr__(result, "_engine", engine)
+        object.__setattr__(result, "_controller", controller)
+        object.__setattr__(result, "_pool", pool)
+        object.__setattr__(result, "_context", context)
+        object.__setattr__(result, "_entry_slot", slot)
+        object.__setattr__(result, "_entry_index", index)
+        object.__setattr__(result, "_entry_revision", slot.revision)
+        object.__setattr__(result, "_binding", binding)
+        object.__setattr__(result, "_module_binding", binding.module_binding or binding)
+        object.__setattr__(result, "_entry_cpu_index", context.cpu_index)
+        _NATIVE_CONTROL_EXPORT_TARGETS_2026[id(result)] = result
+        result.validate(engine, controller)
+        return result
+
+    def __repr__(self) -> str:
+        return "NativeControlExportTarget2026(<source-issued>)"
+
+    def _alternate_getter2026(self):
+        """7c20 retains slot0 and changes only its source-named getter DLL."""
+        self.validate(self._engine, self._controller)
+        if self.binding.operation != "get_cid" or self.binding.alternate_cid:
+            raise ValueError("Actual primary pooled getter required")
+        context = self._context
+        entry = _control_helper_entry2026(context)
+        if _NATIVE_CONTROL_HELPER_ENTRIES_2026[id(entry)][1]["helper"] != "6f20":
+            raise ValueError("Alternate getter belongs to the actual6f20 helper")
+        names = self.binding.lines("AlternateDLLFileNamesForGetCID")
+        versions = self.binding.lines("EnableAlternateDLLVersionsInformationForGetCID")
+        if not names or not names[0] or not versions:
+            return None
+        if len(versions) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]+\.dll", names[0]):
+            raise ValueError("Bounded one-slot native alternate getter required")
+        binding = replace(self.binding, alternate_cid=True)
+        binding_state = _pooled_binding_state2026(self.binding)
+        if binding_state is None:
+            raise ValueError("Actual pooled getter row lineage required")
+        _register_pooled_binding2026(binding, binding_state)
+        result = object.__new__(type(self))
+        for name in self.__slots__:
+            if name != "__weakref__":
+                object.__setattr__(result, name, getattr(self, name))
+        object.__setattr__(result, "_binding", binding)
+        object.__setattr__(result, "_module_binding", binding)
+        _NATIVE_CONTROL_EXPORT_TARGETS_2026[id(result)] = result
+        result.validate(self._engine, self._controller)
+        return result
+
+    def _next_writer_cpu2026(self):
+        """5c30 passes the next row/FILE CPU while retaining its entry DLL."""
+        engine, controller, context = self._engine, self._controller, self._context
+        self.validate(engine, controller)
+        lease = _control_helper_entry2026(context)
+        entry = _NATIVE_CONTROL_HELPER_ENTRIES_2026[id(lease)][1]
+        if (
+            entry["helper"] != "5c30"
+            or not entry["primary_return_seen"]
+            or context.cpu_index != self.entry_cpu_index + 1
+        ):
+            raise ValueError("Actual modern writer source cursor advance required")
+        result = type(self).issue(
+            engine, controller, self._pool, context.cpu_index, "write"
+        )
+        binding = replace(result.binding, module_binding=self.module_binding)
+        binding_state = _pooled_binding_state2026(result.binding)
+        if binding_state is None:
+            raise ValueError("Actual pooled writer row lineage required")
+        _register_pooled_binding2026(binding, binding_state)
+        object.__setattr__(result, "_binding", binding)
+        object.__setattr__(result, "_module_binding", self.module_binding)
+        entry["addresses"][result.entry_index] = entry["addresses"][self.entry_index]
+        result.validate(engine, controller)
+        return result
+
+    def __setattr__(self, name, value):
+        raise AttributeError("Native CONTROL export target is immutable")
+
+    def validate(self, engine, controller) -> None:
+        if (
+            _NATIVE_CONTROL_EXPORT_TARGETS_2026.get(id(self)) is not self
+            or self._engine is not engine
+            or self._controller is not controller
+        ):
+            raise ValueError("CONTROL export target is foreign or stale")
+        self._context.validate(engine, controller)
+        self._pool.validate(engine, controller)
+        if (
+            controller.native_control_context2026(engine) is not self._context
+            or self._pool.slot(self._entry_index) is not self._entry_slot
+            or self._entry_slot.revision != self._entry_revision
+        ):
+            raise ValueError("CONTROL export entry slot or execution context changed")
+        self._binding.validate_against(
+            self._binding.metadata.source_container,
+            operation=self._binding.operation,
+        )
+        if self._module_binding is not self._binding:
+            self._module_binding.validate_against(
+                self._module_binding.metadata.source_container,
+                operation=self._module_binding.operation,
+            )
+
+    @property
+    def entry_slot(self):
+        self.validate(self._engine, self._controller)
+        return self._entry_slot
+
+    @property
+    def entry_index(self) -> int:
+        self.validate(self._engine, self._controller)
+        return self._entry_index
+
+    @property
+    def entry_revision(self) -> int:
+        self.validate(self._engine, self._controller)
+        return self._entry_revision
+
+    @property
+    def binding(self) -> NativeParameterBinding2026:
+        self.validate(self._engine, self._controller)
+        return self._binding
+
+    @property
+    def module_binding(self) -> NativeParameterBinding2026:
+        self.validate(self._engine, self._controller)
+        return self._module_binding
+
+    @property
+    def entry_cpu_index(self) -> int:
+        self.validate(self._engine, self._controller)
+        return self._entry_cpu_index
+
+    @property
+    def metadata(self) -> Native2026Metadata:
+        self.validate(self._engine, self._controller)
+        return self._context.metadata
+
+    @property
+    def cpu_index(self) -> int:
+        self.validate(self._engine, self._controller)
+        return self._context.cpu_index
+
+    @property
+    def target_index(self) -> int:
+        self.validate(self._engine, self._controller)
+        return self._context.target_index
+
+
+def _control_export_dispatch2026(target, export: str):
+    """Expose dispatch metadata only inside the actual raw helper export lease."""
+    from scripts.cuw_2026 import CUWEngine2026
+
+    if type(target) is not NativeControlExportTarget2026 or type(export) is not str:
+        raise TypeError("Exact source-issued CONTROL target and export required")
+    engine, controller = target._engine, target._controller
+    if type(engine) is not CUWEngine2026:
+        raise ValueError("CONTROL dispatch target has no concrete engine")
+    target.validate(engine, controller)
+    lease = controller._native_control_export_lease2026
+    record = _NATIVE_CONTROL_HELPER_LEASES_2026.get(id(lease))
+    if (
+        lease is None
+        or record is None
+        or record[0] is not lease
+        or record[1]["target"] is not target
+        or record[1]["context"] is not target._context
+        or record[1]["export"] != export
+        or record[1]["stage"]._control_target2026 is not target
+        or record[1]["stage"]._control_export2026 != export
+        or engine._controller_export_target2026 is not target
+        or controller._native_control_raw_execution2026 is None
+        or controller.native_control_context2026(engine) is not target._context
+    ):
+        raise ValueError("Active raw CONTROL helper export lease required")
+    state = record[1]
+    binding = target.binding
+    identity = state["identity"]
+    return MappingProxyType(
+        {
+            "module": state["module"],
+            "operation": export,
+            "required_exports": state["required_exports"],
+            "selectors": binding.selector_functions,
+            "identity": identity,
+            "module_version_checked": state["module_version_checked"],
+            "source_name": binding.source_name,
+            "source_sha256": binding.source_sha256,
+            "key": binding.key,
+        }
+    )
+
+
+def _control_preflight_failure2026(helper, kind, alternate=False):
+    lines = {
+        "6f20": (0x6E5, 0x6F0),
+        "8990": (0x7B2, 0x7BD),
+        "a250": (0x842, 0x84D),
+        "9370": (0xA7B, 0xA86),
+        "4c10": (0x913, 0x91E),
+        "5c30": (0xBB3, 0xBC1),
+    }
+    line = ((0xC77, 0xC7D) if alternate else lines[helper])[
+        0 if kind == "version_read" else 1
+    ]
+    return NativePassThruException2026(
+        9999, "TCUWControlCommPhase.dll:RVA" + ("7c20" if alternate else helper), line
+    )
+
+
+def _control_loader_failure2026(helper, export):
+    line = {
+        "StartGetCID": 0x245,
+        "StartPrepareWrite": 0x26A,
+        "ChangeToReprogGatewayMode": 0x294,
+        "StartFlashWrite": 0x2C1,
+        "PrepareRetry": 0x2C8,
+        "IsFinishReprogramming": 0x2D0,
+        "ProcessBeforeIGOffOnAtRetry": 0x273 if helper == "9370" else 0x2DA,
+    }[export]
+    return NativePassThruException2026(9999, "TCUWControlCommPhase.dll:RVAloader", line)
+
+
+# Source wrappers store this exact process BOOL through StartGetCID param7.
+# The native function return is the CID vector, not that byte. See6f20 ASM073bf.
+_CONTROL_GETTER_OUT_FIELDS_2026 = {
+    "TCUWP4P5CanCIDGetter.dll": "bool_out",
+    "TCUWP5CanCIDGetter.dll": "bool_out",
+    "TCUWP5CanCIDGetterWithSetBS.dll": "bool_out",
+    "TCUWP6CanCIDGetter.dll": "native_success",
+    "TCUWCanDCMPRLVersionGetter.dll": "native_success",
+    "TCUWCanMMCCIDGetter.dll": "native_success",
+    "TCUWCanSBRSoftwareIDGetter.dll": "native_success",
+    "TCUWCanHINOCIDGetter.dll": "native_success",
+    "TCUWCanHINOCIDGetterForDSS.dll": "native_success",
+    "TCUWCanHINOCIDGetterForVCS.dll": "native_success",
+    "TCUWCanCIDGetter.dll": "native_success",
+    "TCUWCanSuzukiUDSSoftwareIDGetter.dll": "native_success",
+    "TCUWSilCIDGetter.dll": "native_success",
+    "TCUWSilDCMPRLVersionGetter.dll": "native_success",
+    "TCUWSilDHSoftwareIDGetter.dll": "native_success",
+    "TCUWSilHINOCIDGetterForAMT.dll": "native_success",
+    "TCUWCanUnifiedCIDGetter.dll": "native_return",
+    "TCUWEthernetCIDGetter.dll": "native_return",
+    "TCUWCanDHSoftwareIDGetter.dll": "native_return",
+    "TCUWCanDHUDSSoftwareIDGetter.dll": "native_return",
+    "TCUWCanDHSoftMaskIDGetter.dll": "native_return",
+    "TCUWCanDHSoftwareIDAndSoftMaskIDGetter.dll": "native_return",
+    "TCUWP5CanDHVehicleInfoCIDGetter.dll": "native_return",
+    "TCUWCanDHWritableCIDGetter.dll": "native_return",
+    "TCUWCanDHWritableSoftMaskIDAndCIDGetter.dll": "native_return",
+}
+
+
+def _control_alternate_getter_byte2026(target, report):
+    target.validate(target._engine, target._controller)
+    if target.binding.operation != "get_cid" or type(report) is not dict:
+        raise TypeError("Actual getter target and concrete report required")
+    name = target.module_binding.module_name
+    field_name = _CONTROL_GETTER_OUT_FIELDS_2026.get(name)
+    value = report.get(field_name) if field_name is not None else None
+    if type(value) is not bool:
+        raise NotImplementedError("Source getter param7 byte unavailable for " + name)
+    return value
+
+
+def _record_control_getter_family_return2026(target, report):
+    """Save primary or alternate getter param7 before post-export callbacks."""
+    if type(target) is not NativeControlExportTarget2026:
+        raise TypeError("Exact issued getter target required")
+    engine, controller = target._engine, target._controller
+    target.validate(engine, controller)
+    entry_lease = _control_helper_entry2026(target._context)
+    entry = _NATIVE_CONTROL_HELPER_ENTRIES_2026[id(entry_lease)][1]
+    lease = _NATIVE_CONTROL_HELPER_LEASES_2026.get(
+        id(controller._native_control_export_lease2026)
+    )
+    if (
+        entry["helper"] != "6f20"
+        or lease is None
+        or lease[0] is not controller._native_control_export_lease2026
+        or lease[1]["target"] is not target
+        or lease[1]["export"] != "StartGetCID"
+        or engine._controller_export_target2026 is not target
+    ):
+        raise ValueError("Actual active6f20 getter return boundary required")
+    entry["getter_al"] = _control_alternate_getter_byte2026(target, report)
+
+
+def _control_helper_entry2026(context: NativeControlContext2026):
+    """Look up the opaque source-helper entry lease for worker CPass handling."""
+    if type(context) is not NativeControlContext2026:
+        raise TypeError("Exact active CONTROL context required")
+    context.validate(context._engine, context._controller)
+    controller = context._controller
+    lease = controller._native_control_helper_entry2026
+    record = _NATIVE_CONTROL_HELPER_ENTRIES_2026.get(id(lease))
+    if (
+        lease is None
+        or record is None
+        or record[0] is not lease
+        or record[1]["context"] is not context
+        or record[1]["engine"] is not context._engine
+        or record[1]["controller"] is not controller
+        or controller.native_control_context2026(context._engine) is not context
+    ):
+        raise ValueError("No active source-issued CONTROL helper entry lease")
+    return lease
+
+
+def _record_control_family_return2026(target, export: str, returned: bool) -> None:
+    """Save the actual primary helper AL before its later callbacks can throw."""
+    if (
+        type(target) is not NativeControlExportTarget2026
+        or type(export) is not str
+        or type(returned) is not bool
+    ):
+        raise TypeError("Exact staged CONTROL export and native BOOL required")
+    engine, controller = target._engine, target._controller
+    target.validate(engine, controller)
+    context = controller.native_control_context2026(engine)
+    entry_lease = controller._native_control_helper_entry2026
+    entry = _NATIVE_CONTROL_HELPER_ENTRIES_2026.get(id(entry_lease))
+    export_lease = controller._native_control_export_lease2026
+    lease = _NATIVE_CONTROL_HELPER_LEASES_2026.get(id(export_lease))
+    if (
+        entry is None
+        or entry[0] is not entry_lease
+        or entry[1]["context"] is not context
+        or entry[1]["engine"] is not engine
+        or entry[1]["controller"] is not controller
+        or lease is None
+        or lease[0] is not export_lease
+        or lease[1]["target"] is not target
+        or lease[1]["context"] is not context
+        or lease[1]["export"] != export
+        or engine._controller_export_target2026 is not target
+    ):
+        raise ValueError("Actual active CONTROL helper return boundary required")
+    expected = {
+        "8990": "StartPrepareWrite",
+        "9370": "StartPrepareWrite",
+        "4c10": "StartFlashWrite",
+        "5c30": "StartFlashWrite",
+    }
+    helper = entry[1]["helper"]
+    if expected.get(helper) != export:
+        raise ValueError("Auxiliary CONTROL export cannot replace the helper BOOL")
+    entry[1]["saved_raw"] = returned
+    entry[1]["primary_return_seen"] = True
+
+
+def _control_saved_family_return2026(
+    context: NativeControlContext2026, helper_lease
+) -> bool:
+    """Read the source helper's initialized-or-saved local result byte."""
+    if (
+        type(context) is not NativeControlContext2026
+        or type(helper_lease) is not object
+    ):
+        raise TypeError("Exact CONTROL context and helper-entry lease required")
+    context.validate(context._engine, context._controller)
+    entry = _NATIVE_CONTROL_HELPER_ENTRIES_2026.get(id(helper_lease))
+    if (
+        entry is None
+        or entry[0] is not helper_lease
+        or entry[1]["context"] is not context
+        or context._controller._native_control_helper_entry2026 is not helper_lease
+        or type(entry[1]["saved_raw"]) is not bool
+    ):
+        raise ValueError("Active source-issued saved CONTROL helper result required")
+    return entry[1]["saved_raw"]
+
+
+def _control_helper_primary_return_seen2026(
+    context: NativeControlContext2026, helper_lease, helper: str
+) -> bool:
+    """Validate a helper's completed primary return for post-scope callbacks."""
+    if (
+        type(context) is not NativeControlContext2026
+        or type(helper_lease) is not object
+        or type(helper) is not str
+    ):
+        raise TypeError("Exact CONTROL context, helper lease and name required")
+    context.validate(context._engine, context._controller)
+    entry = _NATIVE_CONTROL_HELPER_ENTRIES_2026.get(id(helper_lease))
+    if (
+        entry is None
+        or entry[0] is not helper_lease
+        or entry[1]["context"] is not context
+        or entry[1]["helper"] != helper
+        or context._controller._native_control_helper_entry2026 is not helper_lease
+        or type(entry[1]["primary_return_seen"]) is not bool
+    ):
+        raise ValueError("Exact active CONTROL helper return lineage required")
+    return entry[1]["primary_return_seen"]
+
+
+def _clear_control_saved_family_return2026(
+    context: NativeControlContext2026, helper_lease
+) -> None:
+    """Apply callback22's source-issued raw/result clear before retry."""
+    if (
+        type(context) is not NativeControlContext2026
+        or type(helper_lease) is not object
+    ):
+        raise TypeError("Exact CONTROL context and helper-entry lease required")
+    context.validate(context._engine, context._controller)
+    entry = _NATIVE_CONTROL_HELPER_ENTRIES_2026.get(id(helper_lease))
+    if (
+        entry is None
+        or entry[0] is not helper_lease
+        or entry[1]["context"] is not context
+        or entry[1]["helper"] not in ("4c10", "5c30")
+        or context._controller._native_control_helper_entry2026 is not helper_lease
+    ):
+        raise ValueError("Actual writer callback22 helper lease required")
+    entry[1]["saved_raw"] = False
+
+
+def _control_helper_addresses2026(target):
+    """Return only the immutable resolver vector preflighted for the active lease."""
+    if type(target) is not NativeControlExportTarget2026:
+        raise TypeError("Exact source-issued CONTROL target required")
+    target.validate(target._engine, target._controller)
+    lease = target._controller._native_control_export_lease2026
+    record = _NATIVE_CONTROL_HELPER_LEASES_2026.get(id(lease))
+    if (
+        lease is None
+        or record is None
+        or record[0] is not lease
+        or record[1]["target"] is not target
+        or record[1]["context"] is not target._context
+        or target._engine._controller_export_target2026 is not target
+    ):
+        raise ValueError("Active source-preflighted CONTROL helper lease required")
+    addresses = record[1]["addresses"]
+    if type(addresses) is not tuple:
+        raise TypeError("Immutable source-preflighted address vector required")
+    return addresses
+
+
+def _control_return_snapshot2026(context: NativeControlContext2026):
+    """Look up only the returned pair snapshot issued by the ordinary raw tail."""
+    if type(context) is not NativeControlContext2026:
+        raise TypeError("Exact active CONTROL context required")
+    context.validate(context._engine, context._controller)
+    record = _NATIVE_CONTROL_RETURN_SNAPSHOTS_2026.get(id(context))
+    if record is None or record[0] is not context:
+        raise ValueError("No ordinary raw CONTROL return snapshot was issued")
+    _snapshot, pair = record[1], record[2]
+    from scripts.j2534_2026 import J2534InterfacePair2026, NativeInterfaceData2026
+
+    if (
+        type(pair) is not J2534InterfacePair2026
+        or type(_snapshot) is not NativeInterfaceData2026
+        or pair.control is not context._controller.runtime_device()
+        or pair._issued.get(pair.control, (None,))[0] is not _snapshot
+    ):
+        raise ValueError("Returned CONTROL pair snapshot is stale or foreign")
+    pair.validate_views()
+    return _snapshot
+
+
+def _control_has_ordinary_getter_return2026(context: NativeControlContext2026) -> bool:
+    """Identify the actual outer getter handoff, never a phase-only prediction."""
+    if type(context) is not NativeControlContext2026:
+        raise TypeError("Exact active CONTROL context required")
+    context.validate(context._engine, context._controller)
+    result = _NATIVE_CONTROL_GETTER_RESULTS_2026.get(id(context))
+    snapshot = _NATIVE_CONTROL_RETURN_SNAPSHOTS_2026.get(id(context))
+    if result is None or snapshot is None:
+        return False
+    if (
+        result[0] is not context
+        or snapshot[0] is not context
+        or context._capture._phase != 0
+    ):
+        raise ValueError("Ordinary CONTROL getter return lineage is stale or foreign")
+    _control_getter_return_al2026(context)
+    _control_getter_return_values2026(context)
+    _control_return_snapshot2026(context)
+    return True
+
+
+def _record_control_getter_result2026(context, entry_lease, raw_al, identifiers):
+    """Retain the actual 6f20 return byte and final vector for outer 5a050."""
+    from scripts.cuw_engine_worker import ControlFileCapture2026
+
+    if (
+        type(context) is not NativeControlContext2026
+        or type(entry_lease) is not object
+        or type(raw_al) is not bool
+        or type(identifiers) is not tuple
+        or any(type(value) is not bytes or b"\0" in value for value in identifiers)
+    ):
+        raise TypeError("Actual bounded CONTROL getter outputs required")
+    context.validate(context._engine, context._controller)
+    entry = _NATIVE_CONTROL_HELPER_ENTRIES_2026.get(id(entry_lease))
+    if (
+        entry is None
+        or entry[0] is not entry_lease
+        or entry[1]["context"] is not context
+        or entry[1]["helper"] != "6f20"
+        or context._capture._phase != 0
+        or context._controller._native_control_helper_entry2026 is not entry_lease
+        or not isinstance(context._capture, ControlFileCapture2026)
+        or id(context) in _NATIVE_CONTROL_GETTER_RESULTS_2026
+        or len(identifiers) > 34
+        or any(len(value) > 33 for value in identifiers)
+    ):
+        raise ValueError("Active source-issued ordinary getter result required")
+    _NATIVE_CONTROL_GETTER_RESULTS_2026[id(context)] = (
+        context,
+        raw_al,
+        identifiers,
+    )
+
+
+def _control_getter_return_values2026(context: NativeControlContext2026):
+    if type(context) is not NativeControlContext2026:
+        raise TypeError("Exact active CONTROL context required")
+    context.validate(context._engine, context._controller)
+    record = _NATIVE_CONTROL_GETTER_RESULTS_2026.get(id(context))
+    if record is None or record[0] is not context or context._capture._phase != 0:
+        raise ValueError("Actual ordinary CONTROL getter result is unavailable")
+    return record[2]
+
+
+def _control_getter_return_al2026(context: NativeControlContext2026) -> bool:
+    if type(context) is not NativeControlContext2026:
+        raise TypeError("Exact active CONTROL context required")
+    context.validate(context._engine, context._controller)
+    record = _NATIVE_CONTROL_GETTER_RESULTS_2026.get(id(context))
+    if record is None or record[0] is not context or context._capture._phase != 0:
+        raise ValueError("Actual ordinary CONTROL getter return byte is unavailable")
+    return record[1]
+
+
+def _record_control_return2026(engine, controller, pair_context):
+    """Publish the real b74a ExportData snapshot without reverse-importing it."""
+    from scripts.cuw_2026 import CUWEngine2026
+    from scripts.j2534_2026 import J2534InterfacePair2026
+
+    if (
+        type(engine) is not CUWEngine2026
+        or type(controller) is not ControlCommPhase2026
+    ):
+        raise TypeError("Concrete CONTROL return owners required")
+    context = controller.native_control_context2026(engine)
+    token = controller._native_control_raw_execution2026
+    if (
+        token is None
+        or _NATIVE_CONTROL_RAW_EXECUTIONS_2026.get(id(token))
+        != (token, engine, controller, context)
+        or controller._native_control_export_lease2026 is not None
+    ):
+        raise ValueError("Ordinary return is outside the raw CONTROL Execute driver")
+    if pair_context is None:
+        return None
+    if (
+        type(pair_context) is not tuple
+        or len(pair_context) != 2
+        or type(pair_context[0]) is not J2534InterfacePair2026
+        or pair_context[0] is not engine.interface_pair
+        or pair_context[0].control is not controller.runtime_device()
+    ):
+        raise ValueError("Exact engine-to-CONTROL pair transfer required")
+    pair, imported = pair_context
+    snapshot = pair.export_from(pair.control, previous=imported)
+    _NATIVE_CONTROL_RETURN_SNAPSHOTS_2026[id(context)] = (
+        context,
+        snapshot,
+        pair,
+    )
+    recorder = getattr(engine.worker, "record_control_return2026", None)
+    if not callable(recorder):
+        raise NotImplementedError("114 ordinary CONTROL return recorder is pending")
+    recorder(context, snapshot)
+    return snapshot
 
 
 # Public spelling shared with the bytes-only loader/importer.

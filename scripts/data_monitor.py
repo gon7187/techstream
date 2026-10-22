@@ -3221,6 +3221,7 @@ def selected_normal_monitor_worker(
     system_connection: SelectedP5CanConnection | None = None,
     security_release: bool = False,
     monitor_session: SelectedMonitorSession | None = None,
+    communication: NativeCommunication | None = None,
     limits: Limits | None = None,
     clock: Callable[[], float] = time.monotonic,
     ticks: Callable[[], int] | None = None,
@@ -3245,6 +3246,32 @@ def selected_normal_monitor_worker(
         plan, (SelectedP4Monitor, SelectedP5Monitor, SelectedPacketA8Monitor)
     ):
         raise MonitorError("Normal worker requires its concrete selected provider")
+    if communication is not None:
+        from scripts.native_communication import (
+            NativeCommunication,
+            NativeFrameController,
+        )
+
+        # Retained workers borrow one admitted normal P4/P5 owner; other native
+        # worker branches have separate controller and child-consumer contracts.
+        if not isinstance(plan, (SelectedP4Monitor, SelectedP5Monitor)):
+            raise MonitorError("Retained normal worker only supports selected P4/P5")
+        if (
+            not isinstance(communication, NativeCommunication)
+            or not isinstance(communication.operations, NativeFrameController)
+            or communication.operations.operations is not operations
+            or communication.profile is not operations.profile
+            or communication.closed
+            or communication.source_build != operations.native_build
+            or communication.bus_id != connection.bus_id
+            or communication.operations._context_failed
+            or operations.poisoned
+            or connection.source_identity != plan.definitions.source_identity
+            or plan.source_build != operations.native_build
+        ):
+            raise MonitorError(
+                "Retained normal worker source/controller context differs"
+            )
     if isinstance(plan, SelectedPacketA8Monitor) and plan.packing.mode == 1:
         if (
             any(
@@ -3281,6 +3308,7 @@ def selected_normal_monitor_worker(
             clock=clock,
             ticks=ticks,
             cancelled=cancelled,
+            communication=communication,
         )
     if monitor_session is not None:
         from scripts.monitor_j2534 import DirectJ2534Worker

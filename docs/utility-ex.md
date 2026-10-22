@@ -165,6 +165,13 @@ readiness independently and retains the native three-argument controller-init
 shape as metadata; TY18 keeps its two-argument shape. `json_d_get_data` and
 `json_s_get_data` expose only explicitly registered individual JSON primitives.
 
+The exact TYPlus `Ex2InitializeDoIP` public export resets native global
+`0x10135be4`, then follows the concrete20/20 mode and protocol predicate through
+the same-context SIS driver and its three-argument controller primitive. The
+controller output is retained even when the native status is nonzero, and the
+public return is void. This admits only that export; other TYPlus DoIP exports,
+lower lifecycle composition and full UtilityEx coverage remain open.
+
 Plus P6 is a separate `UtilityP6DriverBinding` for exact TYPlus/NKPlus images.
 It preserves the `0x24..0x5c` table, readiness offset `0x20` and controller
 handle offset `0x1c`; protocols `6` and `0x8012` have separate context bindings.

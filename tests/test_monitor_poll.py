@@ -29,6 +29,7 @@ from scripts.diagnostic_db import Section
 from scripts.drive_recorder import RecorderCancelled, native_monitor_buffer
 from scripts.frame_transport import (
     J2534Result,
+    NativeConfig,
     NativeFrameOperations,
     NativeFrameReceive,
     NativeMessage,
@@ -57,6 +58,7 @@ from scripts.monitor_poll import (
 )
 from scripts.monitor_support import MonitorSupportCache, monitor_source_identity
 from scripts.monitor_variable import SelectedVariableMonitor, VariableRuntimeTarget
+from scripts.native_communication import NativeCommunication, NativeFrameController
 
 
 def authored_worker(*, build: Literal[12, 18] = 18, p5=False, **kwargs):
@@ -1569,6 +1571,263 @@ class NormalPollTests(unittest.TestCase):
         self.assertEqual(len(backend.calls), writes)
         worker.close()
         worker.close()
+
+
+class RetainedNormalWorkerTests(unittest.TestCase):
+    def communication(self, worker):
+        controller = NativeFrameController(worker.operations)
+        communication = NativeCommunication(
+            worker.operations.profile,
+            controller,
+            "selected-ecu",
+            bus_id=worker.operations.bus_id,
+            source_build=worker.operations.native_build,
+            clock=lambda: 0,
+        )
+        communication._context_first_request = b"\x10\x01"
+        communication._shared_controller = True
+        return communication
+
+    def retained_worker(self, base, communication, **kwargs):
+        return selected_normal_poll_worker(
+            base.operations,
+            base.plan,
+            base.connection,
+            communication=communication,
+            clock=lambda: 0,
+            ticks=lambda: 1234,
+            **kwargs,
+        )
+
+    def test_fresh_worker_keeps_enabled_stmin_setup_side_effect_free(self):
+        base, backend = authored_worker(p5=True)
+        management = base.operations.profile.catalog.management
+        section = management.sections[14]
+        row = bytearray(section.payload)
+        row[26] = 1
+        struct.pack_into("<H", row, 20, 0x55)
+        management.sections[14] = replace(section, payload=bytes(row))
+
+        worker = selected_normal_poll_worker(
+            base.operations,
+            base.plan,
+            base.connection,
+            clock=lambda: 0,
+            ticks=lambda: 1234,
+        )
+        assert isinstance(worker, NormalPollingWorker)
+        self.assertEqual(worker.start(), OK)
+        self.assertFalse(
+            any(
+                name == "ioctl"
+                and fields.get("ioctl_id") == 2
+                and fields.get("input")
+                and fields["input"][0].parameter == 0x23
+                for name, fields in backend.calls
+            )
+        )
+        self.assertEqual(worker.stop(), OK)
+        self.assertEqual(worker.close(), 0)
+        self.assertFalse(
+            any(
+                name == "ioctl"
+                and fields.get("ioctl_id") == 2
+                and fields.get("input")
+                and fields["input"][0].parameter == 0x23
+                for name, fields in backend.calls
+            )
+        )
+
+    def test_retained_cold_start_opens_on_first_actual_send(self):
+        base, backend = authored_worker(p5=True)
+        communication = self.communication(base)
+        worker = self.retained_worker(base, communication)
+        assert isinstance(worker, NormalPollingWorker)
+        disconnect_flags = []
+        controller = communication.operations
+        assert isinstance(controller, NativeFrameController)
+        original_disconnect = controller.disconnect
+
+        def disconnect(flag=0, *, deadline=None):
+            disconnect_flags.append(flag)
+            return original_disconnect(flag, deadline=deadline)
+
+        controller.disconnect = disconnect
+        self.assertIs(worker.communication, communication)
+        self.assertIs(worker.controller, communication.operations)
+        self.assertEqual(worker.start(), OK)
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(worker.step(), OK)  # Select the native event request.
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(worker.step(), OK)  # First real SendProc performs lazy open.
+        self.assertIn("connect", [name for name, _ in backend.calls])
+        self.assertIn("write_messages", [name for name, _ in backend.calls])
+        self.assertFalse(
+            any(
+                name == "ioctl"
+                and fields.get("ioctl_id") == 1
+                and fields.get("channel_id") is None
+                for name, fields in backend.calls
+            )
+        )
+        self.assertEqual(worker.stop(), OK)
+        worker.stop_fault = True
+        self.assertEqual(worker.close(), 0)
+        self.assertEqual(disconnect_flags, [1])
+
+    def test_retained_open_channel_applies_and_restores_native_temp_config(self):
+        base, backend = authored_worker(p5=True)
+        management = base.operations.profile.catalog.management
+        section = management.sections[14]
+        row = bytearray(section.payload)
+        row[26] = 1
+        struct.pack_into("<H", row, 20, 0x55)
+        management.sections[14] = replace(section, payload=bytes(row))
+        original = backend.invoke
+
+        def invoke(operation, fields, *, deadline, cancelled):
+            result = original(operation, fields, deadline=deadline, cancelled=cancelled)
+            if operation == "ioctl" and fields.get("ioctl_id") == 1:
+                return replace(result, configs=(NativeConfig(0x23, 0x1234),))
+            return result
+
+        backend.invoke = invoke
+        self.assertEqual(base.operations.open(deadline=100), 0)
+        communication = self.communication(base)
+        worker = self.retained_worker(base, communication)
+        assert isinstance(worker, NormalPollingWorker)
+        self.assertEqual(worker.start(), OK)
+        self.assertEqual(worker.stop(), OK)
+        self.assertEqual(worker.close(), 0)
+        calls = backend.calls
+        configs = [
+            fields["input"][0]
+            for name, fields in calls
+            if name == "ioctl"
+            and fields.get("ioctl_id") == 2
+            and fields["input"][0].parameter == 0x23
+        ]
+        self.assertEqual(
+            [(item.parameter, item.value) for item in configs],
+            [(0x23, 0x55), (0x23, 0x1234)],
+        )
+        self.assertEqual(
+            sum(
+                name == "ioctl" and fields.get("ioctl_id") == 1
+                for name, fields in calls
+            ),
+            1,
+        )
+        assert isinstance(communication.operations, NativeFrameController)
+        self.assertIsNone(communication.operations.operations.channel)
+
+    def test_retained_closed_initialized_stmin_uses_native_handle_zero(self):
+        base, backend = authored_worker(p5=True)
+        management = base.operations.profile.catalog.management
+        section = management.sections[14]
+        row = bytearray(section.payload)
+        row[26] = 1
+        struct.pack_into("<H", row, 20, 0x55)
+        management.sections[14] = replace(section, payload=bytes(row))
+        original = backend.invoke
+
+        def invoke(operation, fields, *, deadline, cancelled):
+            result = original(operation, fields, deadline=deadline, cancelled=cancelled)
+            if operation == "ioctl" and fields.get("ioctl_id") == 1:
+                return replace(result, configs=(NativeConfig(0x23, 0x1234),))
+            return result
+
+        backend.invoke = invoke
+        self.assertEqual(base.operations.open(deadline=100), 0)
+        self.assertEqual(base.operations.close(deadline=100), 0)
+        self.assertIsNone(base.operations.channel)
+        backend.calls.clear()
+
+        communication = self.communication(base)
+        worker = self.retained_worker(base, communication)
+        assert isinstance(worker, NormalPollingWorker)
+        self.assertEqual(worker.start(), OK)
+        self.assertEqual(worker.stop(), OK)
+        self.assertEqual(worker.close(), 0)
+        stmin = [
+            (fields["channel_id"], fields["ioctl_id"], fields["input"][0].value)
+            for name, fields in backend.calls
+            if name == "ioctl" and fields.get("ioctl_id") in (1, 2) and fields["input"]
+        ]
+        self.assertEqual(stmin, [(0, 1, 0), (0, 2, 0x55), (0, 2, 0x1234)])
+
+    def test_retained_channel_change_and_failed_context_reject_before_io(self):
+        base, backend = authored_worker(p5=True)
+        communication = self.communication(base)
+        worker = self.retained_worker(base, communication)
+        base.operations.adopt_channel(99, owned=False)
+        with self.assertRaisesRegex(MonitorError, "changed"):
+            worker.start()
+        self.assertEqual(backend.calls, [])
+
+        fresh, second_backend = authored_worker(p5=True)
+        failed = self.communication(fresh)
+        assert isinstance(failed.operations, NativeFrameController)
+        failed.operations._context_failed = True
+        with self.assertRaisesRegex(MonitorError, "context differs"):
+            self.retained_worker(fresh, failed)
+        self.assertEqual(second_backend.calls, [])
+
+        poisoned, poisoned_backend = authored_worker(p5=True)
+        poisoned_communication = self.communication(poisoned)
+        poisoned.operations.poisoned = True
+        with self.assertRaisesRegex(MonitorError, "context differs"):
+            self.retained_worker(poisoned, poisoned_communication)
+        self.assertEqual(poisoned_backend.calls, [])
+
+        p4, p4_backend = authored_worker()
+        variable_operations, targets, _ = authored_multi()
+        self.assertIsInstance(variable_operations, NativeMultiMonOperations)
+        with self.assertRaisesRegex(MonitorError, "only selected P4/P5"):
+            selected_normal_poll_worker(
+                p4.operations,
+                targets[0].plan,
+                p4.connection,
+                communication=self.communication(p4),
+            )
+        self.assertEqual(p4_backend.calls, [])
+
+    def test_retained_cancellation_and_poison_use_resource_cleanup_only(self):
+        base, backend = authored_worker(p5=True)
+        self.assertEqual(base.operations.open(deadline=100), 0)
+        backend.calls.clear()
+        communication = self.communication(base)
+        cancelled = [False]
+        worker = self.retained_worker(
+            base, communication, cancelled=lambda: cancelled[0]
+        )
+        assert isinstance(worker, NormalPollingWorker)
+        self.assertEqual(worker.start(), OK)
+        cancelled[0] = True
+        with self.assertRaises(RecorderCancelled):
+            worker.step()
+        self.assertEqual(worker.stop(), OK)
+        self.assertEqual(worker.close(), 0)
+        self.assertIn("disconnect", [name for name, _ in backend.calls])
+
+        poisoned, poisoned_backend = authored_worker(p5=True)
+        poisoned_communication = self.communication(poisoned)
+        self.assertEqual(poisoned.operations.open(deadline=100), 0)
+        poisoned_worker = self.retained_worker(poisoned, poisoned_communication)
+        assert isinstance(poisoned_worker, NormalPollingWorker)
+        self.assertEqual(poisoned_worker.start(), OK)
+        poisoned.operations.poisoned = True
+        self.assertEqual(poisoned_worker.stop(), OK)
+        before_close = len(poisoned_backend.calls)
+        self.assertEqual(poisoned_worker.close(), 0)
+        cleanup = poisoned_backend.calls[before_close:]
+        self.assertFalse(
+            any(
+                name == "ioctl" and fields.get("ioctl_id") in (1, 2)
+                for name, fields in cleanup
+            )
+        )
+        self.assertIn("disconnect", [name for name, _ in cleanup])
 
 
 if __name__ == "__main__":

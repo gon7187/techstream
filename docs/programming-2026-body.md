@@ -109,39 +109,40 @@ The authored binary fixture uses native `.bin` hexadecimal ZV frames. It does
 not label zero-filled raw bytes as VBF or invent a captured hardware identifier
 to pass the VBF selection gate. GetNewPassword reads the authored frame DWORD.
 
-All worker-backed public fixtures first execute actual CID reception inside
-owned outer phase0, which runs native34e10/3ddf0/3e710. Distinct authored NewCID
-values prevent ambiguous reorder; second-target controls use distinct SECOND_A
-and SECOND_B getter replies. No unmatched-target fallback supplies field73c.
-Public contexts bind only after the native metadata rebuild.
+Worker-backed public fixtures run the real generic CAN getter inside owned outer
+phase0, receive its ordinary4be0 snapshot and import it through the actual paired
+getter handoff before native34e10 selects the returned OLD_A/OLD_B or SECOND_A/
+SECOND_B identifiers. Phase1's real36800 prefix applies the later3e710 rebuild.
+Distinct authored NewCID values prevent ambiguous ordering. No synthetic target
+vector or unmatched-target fallback supplies native73c.
 
-All nine public entries have typed positive operand checks through the normal
-phase1-to-phase2 replay factory on one engine/controller/runtime. Authored
-second targets prove native73c selects their password rather than target0.
-For the three Body variants, native36800 supplies retained CPU A while CPU B
-is selected; different A/B endian flags prove the writer reloads the retained
-CPU's row.
+The nine CPU1 factory success controls run one complete phase1 CONTROL Execute:
+actual Body preparation, source-empty gateway transition, then exactly one
+actual selected writer, on the same engine/controller/runtime/trace. Each
+control first captures authored primitive traffic, then repeats from position0
+with an ordinary frozen ProgrammingTrace and verifies the complete trace was
+consumed. The writer report and raw Execute result remain separate. No family
+runner or success callback is substituted.
 
-A separate check runs the actual generic CAN getter at CPU0, commits its
-OLD_A/OLD_B CID bytes, selects CPU1 through the concrete controller-authorized
-engine selector, then constructs prepare/write sessions on the same shared
-primitive timeline. The getter acquires and releases its own connection; the
-caller reopens the typed channel for preparation. This proves selected-target
-composition without claiming automatic all-CPU execution.
+`test_raw_body_two_cpu_chain_writes_each_source_once` covers Sonar and Body at
+CPU0 with both source CPUs. It checks actual prepare/write export order, native
+CPU rows0/1, one initial wire write per CPU and frozen replay from position0.
+The same actual pool/context/paired interfaces survive prepare→gateway→write;
+there is no separate writer invocation after raw Execute.
 
-During secondary-CPU ChangeNextCpu, explicit native errors retain the native
-callback-before-rethrow order. Host errors and cancellation unwind immediately
-without callback1 or advancing the engine. Authored source-CPU0 normal factory
-checks cover all five affected modules: success queues a one-shot CPU1
-continuation; native error10 and native unknown9999 also queue it before error
-handling; OSError, InterruptedError and KeyboardInterrupt preserve their exact
-objects and leave CPU0 with no continuation.
+Single-family boundary controls deliberately keep a standalone source-bound
+replay or direct family invocation. They preserve the old CPU0 ChangeNextCpu
+oracle before an outer job consumes the continuation: success and native10/
+unknown9999 queue the actual one-shot CPU1 continuation, while host exceptions
+and cancellation preserve identity and do not queue it. The Body source flags,
+retained getter CPU/endian selection, every-primitive fault/cancellation and
+cleanup/driver-status assertions remain at their original family boundary.
 
-The retained PrepareRetry and IsFinishReprogramming preflights are checked for all nine executed normal
-writer sessions: the recovery session retains the actual loaded module, key,
-source hash and frozen row objects. Forged source metadata and a different CPU
-are rejected. These checks consume no SDK events and do not execute an unavailable export or
-assert retry/probe-loop chronology.
+Standalone PrepareRetry/IsFinish preflight controls retain the executed writer
+module, key, source hash and frozen row objects without consuming SDK events or
+calling an unavailable export. They do not borrow expired staged CONTROL
+capabilities. Forged source metadata and changed CPU remain rejected. These
+checks do not assert the full retry/probe-loop chronology.
 
 The separate134 canonical215-SDK-event trace now proves actual CID selection,
 source5a835/CUW1ad30 startup, and public Sonar consumption of engine980true in
@@ -149,9 +150,9 @@ its10000ms ID-response read, with2048 bytes and every event consumed. This is a
 bounded producer-to-consumer check. Supplying a flag or calling a worker
 mutation hook remains unacceptable proof.
 
-These checks remain narrower than full worker execution. Automatic continuation
-consumption into the next export, remaining lifecycle branches and final
-independent integration acceptance remain **OPEN**. The implemented full-export
+Automatic outer continuation consumption, remaining lifecycle branches and final
+independent integration acceptance remain separately gated; these source-backed
+software checks do not certify vehicle behavior. The implemented full-export
 registry remains separate from the nine callable writer candidates.
 `writer-candidates-current.json` retains the private source
 hash ledger. No vehicle or

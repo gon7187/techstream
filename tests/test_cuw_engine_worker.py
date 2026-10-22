@@ -1,6 +1,5 @@
 import hashlib
 import io
-import json
 import struct
 import tempfile
 import threading
@@ -24,7 +23,6 @@ from scripts.programming_2026_common import (
     NativeGeneralParameters2026,
     NativeRuntime2026,
 )
-from scripts.programming_replay import load_programming_replay
 from tests.private_evidence import read_private_bytes
 from tests.test_calibration_2026 import cuw, srecord
 
@@ -813,7 +811,15 @@ class EngineWorker2026Tests(unittest.TestCase):
 
     def test_control_state_keeps_fatal_failed_and_callback_fields_independent(self):
 
-        engine = self.engine(calibration())
+        source = calibration()
+        state = ReproInfoState(
+            (RecoveryCalibration("control.cuw", source),),
+            ssmid=2,
+            dh_central_gw_type=3,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(Path(directory), state)
+            engine = self.engine(source, persistence=persistence)
         controller = make_controller(NativeRuntime2026(lambda *_: None))
         self.addCleanup(engine.close)
         worker = engine.bind_worker(controller)
@@ -822,8 +828,6 @@ class EngineWorker2026Tests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 worker.record_callback_24(True)
             worker.record_callback_24(2)
-            worker.record_callback_28(2)
-            worker.record_callback_47(3)
         state = worker.control_state
         self.assertEqual(state.error_kind, 7)
         self.assertFalse(state.initial_command_retry)
@@ -841,7 +845,8 @@ class EngineWorker2026Tests(unittest.TestCase):
         )
         with engine.controller_execution(controller, 2):
             worker.publish_callback_25_gateway_node()
-            worker.publish_callback_48_source_mode()
+            context = controller.native_control_context2026(engine)
+            worker.publish_control_callback_30_2026(context)
         self.assertEqual(engine.repro_gateway_node, 2)
         self.assertFalse(worker.control_state.use_new_password)
         self.assertEqual(worker.control_state.source_mode, 3)
@@ -864,8 +869,8 @@ class EngineWorker2026Tests(unittest.TestCase):
 
         self.assertTrue(worker.control_state.native_fatal_input)
         self.assertEqual(worker.control_state.error_kind, 0xFFFFFFF9)
-        self.assertEqual(worker.control_state.primary_error, 0)
-        self.assertEqual(worker.control_state.passthru_error, 0)
+        self.assertEqual(worker.control_state.primary_error, 8)
+        self.assertEqual(worker.control_state.passthru_error, 9)
         self.assertTrue(engine.native_fatal_output)
         self.assertFalse(worker.control_state.fatal)
         self.assertFalse(engine.native_control_fatal_output)
@@ -1149,80 +1154,49 @@ class EngineWorker2026Tests(unittest.TestCase):
         self.assertEqual(worker.control_state.lifecycle, "faulted")
 
     def test_actual_imported_prepare_pipeline_drives_worker_lifecycle(self):
-        source = cuw(
-            "[Format]\nVersion=6\n[Vehicle]\nKindOfECU=1\nContactType=SIL\n"
-            "NumberOfCalibration=1\n[CPU01]\nCPUType=1\nCPUImageName=one.vbf\n"
-        )
-        module_name = "TCUWSilPrepareWriter.dll"
-        catalog = {
-            "1SIL1.ini": encoded_table(
-                ("ParamFileKeySystemProtocolMicon", "DLLFileNameForPrepareWrite"),
-                (("1SIL1", module_name),),
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+        from tests.test_programming_2026_common import RawControlStageMachineTests
+
+        engine, controller, session = RawControlStageMachineTests().fixture(
+            operation="prepare",
+            contact="SIL",
+            events=(
+                RawControlStageMachineTests.event("set_communication_log_mode", mode=2),
+                RawControlStageMachineTests.event("set_communication_log_mode", mode=0),
             ),
-            "Parameter.ini": encoded_table(
-                ("ParamFileKeySystemProtocolMicon", "M16CTypeFlag"),
-                (("1SIL1", "0"),),
-            ),
-        }
-        context = {
-            "schema": "techstream-programming-replay-v1",
-            "source": "recorded_unverified",
-            "calibration_sha256": hashlib.sha256(source).hexdigest(),
-            "operation": "prepare",
-            "node": 1,
-            "observations": {
-                "current_cids": [],
-                "tester_info_hex": bytes(32).hex(),
-                "system_time": [2026, 10, 20, 20, 1, 2, 3, 4],
-                "timeout_seconds": 30,
-                "cid_mode": 2,
-                "host": {},
-            },
-            "events": [
-                {
-                    "kind": "action",
-                    "request": {"operation": "get_local_milliseconds_of_day"},
-                    "result": {"type": "int", "value": 1000},
-                    "elapsed_ms": 0,
-                },
-                {
-                    "kind": "action",
-                    "request": {"operation": "get_local_milliseconds_of_day"},
-                    "result": {"type": "int", "value": 1017},
-                    "elapsed_ms": 0,
-                },
-            ],
-        }
-        module = (RUNTIME / module_name).read_bytes()
-        session = load_programming_replay(
-            source,
-            json.dumps(context).encode(),
-            catalog,
-            {module_name: module},
         )
-        runtime = NativeRuntime2026(
-            session.trace.action,
-            clock=session.trace.clock,
-            cancelled=session.trace.cancelled,
-            local_seconds_of_day=session.trace.native_local_seconds_of_day,
-            local_milliseconds_of_day=session.trace.native_local_milliseconds_of_day,
-        )
-        general = NativeGeneralParameters2026.from_sources(catalog, encoded=True)
-        engine = CUWEngine2026(
-            (RUNTIME / "CUW.dll").read_bytes(), general_parameters=general
-        )
-        engine.configure(struct.pack("<IIddII", 1, 0, 1, 2, 0, 0))
-        engine.load_cuw(source)
-        self.addCleanup(engine.close)
-        controller = make_controller(runtime)
         worker = engine.bind_worker(controller)
-        report = controller.run_bound_export(engine, session)
-        self.assertTrue(report["native_return"])
+        original_runner = ProgrammingReplay._runner
+        runner_calls = []
+
+        def runner(replay, *args):
+            module = args[1]
+            runner_calls.append((replay.operation, module.name))
+            if replay.operation == "write":
+                return lambda: {"native_return": True}
+            return original_runner(replay, *args)
+
+        with (
+            engine.controller_execution(controller, 1),
+            patch.object(ProgrammingReplay, "_runner", runner),
+        ):
+            report = controller.execute(engine, session)
+        self.assertTrue(report["native_return"], repr(report))
+        self.assertEqual(
+            runner_calls,
+            [
+                ("prepare", "TCUWSilPrepareWriter.dll"),
+                ("write", "TCUWSilFlashWriter.dll"),
+            ],
+        )
+        self.assertEqual(len(report["exports"]), 2)
         self.assertTrue(session.used)
         self.assertEqual(worker.native_getter_cpu_type, "1")
         self.assertEqual(worker.control_state.lifecycle, "ready")
         self.assertFalse(worker.source_state.complete)
-        session.trace.assert_complete()
+        self.assertEqual(session.trace.position, len(session.trace.rows))
 
 
 class GatewayCacheCallbackTests(unittest.TestCase):
@@ -1298,6 +1272,614 @@ class GatewayCacheCallbackTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source-issued worker"):
             worker().record_callback_24(2)
         self.assertEqual(engine.native_gateway_cache, 7)
+
+
+class ControlFileCapture2026Tests(unittest.TestCase):
+    def setUp(self):
+        required = (RUNTIME / "CUW.dll", RUNTIME / "TCUWControlCommPhase.dll")
+        if any(not path.is_file() for path in required):
+            self.skipTest("Authenticated static CUW2026 pipeline is absent")
+        self.engine = EngineWorker2026Tests().engine(calibration(cpus=2))
+        self.addCleanup(self.engine.close)
+        self.controller = make_controller(NativeRuntime2026(lambda *_: None))
+        self.worker = self.engine.bind_worker(self.controller)
+        EngineWorker2026Tests.receive(
+            self.engine, self.controller, (b"OLD", b"SECOND-OLD")
+        )
+
+    def capture(self):
+        capture = self.worker._control_file_capture
+        self.assertIsNotNone(capture)
+        assert capture is not None
+        return capture
+
+    def test_capture_maps_held_nonidentity_order_and_targets(self):
+        # Exercise nonidentity execution order over authentic authored FILE rows.
+        self.worker._cpu_orders_by_file = ((1, 0),)
+        self.worker._targets_by_file = ((1, 0),)
+        self.worker._current_global_cpu_index = 1
+        with self.engine.controller_execution(self.controller, 2):
+            capture = self.capture()
+            self.assertEqual(capture.native_order, (1, 0))
+            self.assertEqual(capture.target_indices, (1, 0))
+            self.assertEqual(capture.control_cpu_start, 1)
+            first = capture.metadata_for_cpu(0)
+            second = capture.metadata_for_cpu(1)
+            self.assertEqual((first.cpu_index, second.cpu_index), (1, 0))
+            self.assertIs(first.source_container, capture.metadata.source_container)
+            self.assertEqual(capture.metadata, capture.metadata_for_cpu(1))
+            self.engine.select_target(1, 1, controller=self.controller)
+            capture.validate(self.engine, self.controller)
+            self.assertIsNot(capture.metadata, self.engine.native_metadata)
+
+    def test_capture_is_once_only_and_rejects_forged_copied_and_bad_indices(self):
+        import copy
+        from dataclasses import replace
+
+        with self.engine.controller_execution(self.controller, 2):
+            with self.assertRaisesRegex(ValueError, "59ab0"):
+                self.worker.capture_control_file2026(self.controller)
+            with (
+                self.assertRaisesRegex(ValueError, "active"),
+                self.engine.controller_execution(self.controller, 2),
+            ):
+                pass
+            capture = self.capture()
+            with self.assertRaisesRegex(ValueError, "59ab0"):
+                self.worker.capture_control_file2026(self.controller)
+            for index in (-1, True, 2, 1.0, "0"):
+                with (
+                    self.subTest(index=index),
+                    self.assertRaises((TypeError, ValueError)),
+                ):
+                    capture.metadata_for_cpu(index)  # pyright: ignore[reportArgumentType]
+            for impostor in (copy.copy(capture), replace(capture)):
+                with self.assertRaisesRegex(ValueError, "capture"):
+                    impostor.validate(self.engine, self.controller)
+            with self.assertRaisesRegex(ValueError, "capture"):
+                capture.validate(self.engine, make_controller(self.controller.runtime))
+            original_runtime = self.controller.runtime
+            self.controller.runtime = NativeRuntime2026(lambda *_: None)
+            try:
+                with self.assertRaisesRegex(ValueError, "capture"):
+                    capture.validate(self.engine, self.controller)
+            finally:
+                self.controller.runtime = original_runtime
+
+    def test_capture_rejects_foreign_thread_and_expires_at_unwind(self):
+        with self.engine.controller_execution(self.controller, 2):
+            capture = self.capture()
+            errors = []
+
+            def validate_foreign_thread():
+                try:
+                    capture.validate(self.engine, self.controller)
+                except ValueError as error:
+                    errors.append(error)
+
+            thread = threading.Thread(target=validate_foreign_thread)
+            thread.start()
+            thread.join()
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], ValueError)
+            capture.validate(self.engine, self.controller)
+        with self.assertRaisesRegex(ValueError, "capture"):
+            capture.validate(self.engine, self.controller)
+
+
+class ControlOutput2026Tests(unittest.TestCase):
+    def setUp(self):
+        required = (RUNTIME / "CUW.dll", RUNTIME / "TCUWControlCommPhase.dll")
+        if any(not path.is_file() for path in required):
+            self.skipTest("Authenticated static CUW2026 pipeline is absent")
+        self.engine = EngineWorker2026Tests().engine(calibration(cpus=2))
+        self.addCleanup(self.engine.close)
+        self.controller = make_controller(NativeRuntime2026(lambda *_: None))
+        state = self.engine.dh_state
+        state._transferred_bytes = (19, 23)
+        state._progress = (41, 47)
+        self.worker = self.engine.bind_worker(self.controller)
+
+    def test_constructor_owns_zero_count_and_copies_global_percent_without_publishing(
+        self,
+    ):
+        self.assertEqual(self.worker._control_count_scratch2026, [0, 0])
+        self.assertEqual(self.worker._control_percent_scratch2026, [41, 47])
+        self.assertEqual(self.engine.dh_state.transferred_bytes, (19, 23))
+        self.assertEqual(self.engine.dh_state.progress, (41, 47))
+
+    def test_repeated_import_retains_scratch_and_new_worker_uses_current_global_percent(
+        self,
+    ):
+        first = self.worker._control_count_scratch2026
+        first[:] = [5, 7]
+        with self.engine.controller_execution(self.controller, 0):
+            pass
+        with self.engine.controller_execution(self.controller, 0):
+            pass
+        self.assertIs(self.worker._control_count_scratch2026, first)
+        self.assertEqual(first, [5, 7])
+        self.engine.dh_state._progress = (61, 67)
+        self.worker.close()
+        self.worker = self.engine.bind_worker(self.controller)
+        self.assertEqual(self.worker._control_count_scratch2026, [0, 0])
+        self.assertEqual(self.worker._control_percent_scratch2026, [61, 67])
+
+    def test_source_reset_pending_clears_only_private_scratch_after_non_be8_two_phase(
+        self,
+    ):
+        self.worker._control_count_scratch2026[:] = [3, 5]
+        self.worker._control_percent_scratch2026[:] = [7, 11]
+        self.worker._control_scratch_reset_pending2026 = True
+        with self.engine.controller_execution(self.controller, 0):
+            pass
+        self.assertEqual(self.worker._control_count_scratch2026, [0, 0])
+        self.assertEqual(self.worker._control_percent_scratch2026, [0, 0])
+        self.assertFalse(self.worker._control_scratch_reset_pending2026)
+        self.assertEqual(self.engine.dh_state.transferred_bytes, (19, 23))
+        self.assertEqual(self.engine.dh_state.progress, (41, 47))
+
+    def test_source_reset_pending_is_preserved_for_be8_two_and_on_phase_failure(self):
+        self.worker._control_count_scratch2026[:] = [13, 17]
+        self.worker._control_percent_scratch2026[:] = [19, 23]
+        self.worker._control_scratch_reset_pending2026 = True
+        self.worker._prepare_handshake = 2
+        with self.engine.controller_execution(self.controller, 0):
+            pass
+        self.assertEqual(self.worker._control_count_scratch2026, [13, 17])
+        self.assertTrue(self.worker._control_scratch_reset_pending2026)
+        self.worker._prepare_handshake = 1
+        with (
+            self.assertRaisesRegex(RuntimeError, "source fault"),
+            self.engine.controller_execution(self.controller, 0),
+        ):
+            raise RuntimeError("source fault")
+        self.assertEqual(self.worker._control_count_scratch2026, [13, 17])
+        self.assertTrue(self.worker._control_scratch_reset_pending2026)
+
+    def test_publication_copies_whole_vectors_and_percent_snapshot_precedes_write(self):
+        counts = [101, 103]
+        percentages = [109, 113]
+        self.worker._control_count_scratch2026[:] = counts
+        self.worker._control_percent_scratch2026[:] = percentages
+        with self.engine.controller_execution(self.controller, 0):
+            context = self.controller.native_control_context2026(self.engine)
+            self.worker.publish_control_count2026(context)
+            self.assertEqual(self.engine.dh_state.transferred_bytes, tuple(counts))
+            self.worker.publish_control_percent2026(context)
+            self.assertEqual(self.worker._previous_percentages2026, (41, 47))
+            self.assertEqual(self.engine.dh_state.progress, tuple(percentages))
+
+    def test_foreign_context_and_bad_dword_are_rejected_without_global_mutation(self):
+        with self.engine.controller_execution(self.controller, 0):
+            context = self.controller.native_control_context2026(self.engine)
+            with self.assertRaises((TypeError, ValueError)):
+                self.worker._control_progress_scratch2026(object())
+            with self.assertRaises((TypeError, ValueError)):
+                self.worker._store_control_count2026(
+                    context, object(), 0, 0x1_0000_0000
+                )
+        self.assertEqual(self.engine.dh_state.transferred_bytes, (19, 23))
+
+    def test_c25_and_c08_hooks_read_source_owned_bytes(self):
+        with self.engine.controller_execution(self.controller, 0):
+            context = self.controller.native_control_context2026(self.engine)
+            with self.assertRaises((TypeError, ValueError)):
+                self.worker.publish_sbr_ssm2026(object())
+            self.engine.dh_state._central_gateway_type = 0x102
+            self.worker._source_mode = 0x205
+            with self.assertRaisesRegex((TypeError, ValueError), "helper entry"):
+                self.worker.publish_control_callback_2f2026(context)
+            self.engine._ssmid_cache2026 = 0xA5
+            self.assertEqual(self.worker.store_control_ssm_retry2026(context), 0xA5)
+        self.assertEqual(self.worker._control_ssm_byte2026, 0xA5)
+        self.assertEqual(self.worker._source_mode, 0x205)
+        self.assertEqual(self.engine.dh_state._central_gateway_type, 0x102)
+
+    def test_helper_cpass_rejects_missing_source_entry_without_mutating_native_state(
+        self,
+    ):
+        from scripts.programming_2026_common import NativePassThruException2026
+
+        state = self.engine.dh_state
+        state.record_native_error(0x12, 0x34, 0x56)
+        self.worker._failed = True
+        with self.engine.controller_execution(self.controller, 0):
+            context = self.controller.native_control_context2026(self.engine)
+            with self.assertRaisesRegex(ValueError, "helper entry"):
+                self.worker._record_control_helper_cpass2026(
+                    context,
+                    NativePassThruException2026(0x78, "test", 1),
+                    object(),
+                )
+        self.assertEqual(
+            (state.error_kind, state.primary_error, state.passthru_error),
+            (0x12, 0x34, 0x56),
+        )
+        self.assertTrue(self.worker.control_state.failed)
+        self.assertFalse(self.worker.native_fatal_input80)
+        self.assertFalse(self.worker.control_state.fatal)
+
+    def test_helper_cpass_copies_only_primary_and_sets_both_native_fatal_fields(self):
+        from scripts.programming_2026_common import NativePassThruException2026
+
+        state = self.engine.dh_state
+        state.record_native_error(0x12, 0x34, 0x56)
+        with self.engine.controller_execution(self.controller, 0):
+            context = self.controller.native_control_context2026(self.engine)
+            raw_lease = self.controller._begin_native_control_raw_execution2026(
+                self.engine
+            )
+            helper_lease = self.controller._begin_native_control_helper_entry2026(
+                self.engine, helper="6f20"
+            )
+            try:
+                self.worker._record_control_helper_cpass2026(
+                    context,
+                    NativePassThruException2026(-2, "source", 0x123),
+                    helper_lease,
+                )
+            finally:
+                self.controller._end_native_control_helper_entry2026(
+                    self.engine, lease=helper_lease
+                )
+                self.controller._end_native_control_raw_execution2026(
+                    self.engine, raw_lease
+                )
+        self.assertEqual(
+            (state.error_kind, state.primary_error, state.passthru_error),
+            (0x12, 0xFFFFFFFE, 0x56),
+        )
+        self.assertFalse(self.worker.control_state.failed)
+        self.assertTrue(self.worker.native_fatal_input80)
+        self.assertTrue(self.worker.control_state.fatal)
+
+
+class HeldControlFileCapture2026Tests(unittest.TestCase):
+    def setUp(self):
+        required = (RUNTIME / "CUW.dll", RUNTIME / "TCUWControlCommPhase.dll")
+        if any(not path.is_file() for path in required):
+            self.skipTest("Authenticated static CUW2026 pipeline is absent")
+
+    def test_held_capture_survives_outer_file_change_without_deleting_source(self):
+        first_source = calibration(first_target="FILE-A")
+        second_source = calibration(first_target="FILE-B")
+        state = ReproInfoState(
+            (
+                RecoveryCalibration("first.cuw", first_source),
+                RecoveryCalibration("second.cuw", second_source),
+            ),
+            multi_calibration_file_num=2,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(Path(directory), state)
+            engine = EngineWorker2026Tests().engine(
+                first_source, persistence=persistence
+            )
+            self.addCleanup(engine.close)
+            controller = make_controller(NativeRuntime2026(lambda *_: None))
+            worker = engine.bind_worker(controller)
+            original = engine.native_metadata
+            with engine.controller_execution(controller, 2):
+                capture = worker._control_file_capture
+                self.assertIsNotNone(capture)
+                assert capture is not None
+                second = worker.loaded_metadata[1]
+                engine._select_worker_metadata(
+                    second, controller=controller, worker=worker
+                )
+                capture.validate(engine, controller)
+                self.assertIs(engine.native_metadata, second)
+                self.assertIs(capture.metadata, original)
+                self.assertIs(
+                    capture.metadata_for_cpu(0).source_container,
+                    original.source_container,
+                )
+                self.assertIsNot(
+                    capture.metadata.source_container,
+                    engine.native_metadata.source_container,
+                )
+
+
+class ControlDHRetryPublisherTests(unittest.TestCase):
+    def test_actual_prepare_retry_writer_lease_publishes_c08(self):
+        import importlib.util
+        from unittest.mock import patch
+
+        from scripts import programming_2026_common
+        from scripts.cuw_engine_worker import EngineWorker2026
+        from tests.private_evidence import require_private
+
+        fixture_relative = Path("runtime/no-car-119/dh_retry_fixture.py")
+        require_private(fixture_relative)
+        fixture_path = Path(__file__).resolve().parents[1] / fixture_relative
+        spec = importlib.util.spec_from_file_location("dh_retry_fixture", fixture_path)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+
+        with fixture.canonical(authoring=True) as (
+            engine,
+            controller,
+            root,
+            host_cancel,
+        ):
+            retry = engine.bind_retry_controller()
+            worker = engine.worker
+            self.assertIsInstance(worker, EngineWorker2026)
+            accepted = []
+            rejected_wrong_scope = []
+            original_publish = worker._publish_control_gateway_type2026
+
+            def publish(state):
+                target = engine._controller_export_target2026
+                self.assertIsNotNone(target)
+                if target is not None and target.binding.operation == "write":
+                    self.assertIn(
+                        programming_2026_common._control_export_dispatch2026(
+                            target, "PrepareRetry"
+                        )["module"],
+                        {
+                            "TCUWCanDHFlashWriter.dll",
+                            "TCUWCanDHUDSFlashWriter.dll",
+                            "TCUWP5CanDHUDSFlashWriter.dll",
+                        },
+                    )
+                    accepted.append(target)
+                    prior_mode = worker._source_mode
+                    helper_lease = controller._native_control_export_lease2026
+                    lease_record = (
+                        programming_2026_common._NATIVE_CONTROL_HELPER_LEASES_2026[
+                            id(helper_lease)
+                        ]
+                    )
+                    prior_export = lease_record[1]["export"]
+                    try:
+                        lease_record[1]["export"] = "StartFlashWrite"
+                        with self.assertRaises((TypeError, ValueError)):
+                            original_publish(state)
+                        self.assertEqual(worker._source_mode, prior_mode)
+                    finally:
+                        lease_record[1]["export"] = prior_export
+                    rejected_wrong_scope.append(target)
+                    return original_publish(state)
+
+            raw_reports, failures = [], []
+
+            def execute():
+                try:
+                    with engine.controller_execution(controller, 2):
+                        raw_reports.append(controller.execute(engine, root))
+                except BaseException as error:  # noqa: BLE001 - preserve native fault
+                    failures.append(error)
+
+            thread = threading.Thread(target=execute, daemon=True)
+            with (
+                patch.object(worker, "_publish_control_gateway_type2026", publish),
+            ):
+                thread.start()
+                try:
+                    query = retry.wait_for_query()
+                    self.assertEqual(query.primary_error, 1)
+                    self.assertEqual(query.passthru_error, 24)
+                    self.assertEqual(engine.inform_result_of_query_retry(1, 0), 0)
+                    thread.join(3)
+                    self.assertFalse(thread.is_alive())
+                except BaseException:
+                    engine.cancel()
+                    host_cancel.set()
+                    thread.join(3)
+                    raise
+
+            if failures:
+                raise failures[0]
+            self.assertEqual(len(raw_reports), 1)
+            self.assertFalse(raw_reports[0]["native_return"])
+            self.assertTrue(accepted)
+            self.assertTrue(rejected_wrong_scope)
+            self.assertEqual(engine.dh_state._central_gateway_type, 1)
+
+            with self.assertRaises((TypeError, ValueError)):
+                original_publish(object())
+            with self.assertRaises((TypeError, ValueError)):
+                original_publish(engine.dh_state)
+
+
+class ControlSBRActualWorker2026Tests(unittest.TestCase):
+    def test_real_prepare_sbr_read_publishes_through_registered_worker(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+
+        from scripts.cuw_parameter_pool import ControlParameterPool2026
+        from scripts.native_modules import identify_native_module
+        from scripts.programming_2026_common import NativeControlExportTarget2026
+        from scripts.programming_2026_vendor import (
+            SBRUtils2026,
+            bind_native_context,
+            prepare_sbr,
+        )
+
+        source = cuw(
+            "[Format]\nVersion=9\n[Vehicle]\nNumberOfCalibration=1\n"
+            "ContactType=P5-CAN\nKindOfECU=106\n[CPU01]\nCPUType=282\n"
+            "NumberOfFiles=1\n[File1001]\nALFID=44\nEraseBlock=1\n"
+            "DownloadAddress=00001000\nDownloadMemsize=00000004\n",
+            (b"DATA",),
+        )
+        general = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": table(
+                    (
+                        "ParamFileKeySystemProtocolMicon",
+                        "M16CTypeFlag",
+                        "FORESTTypeFlag",
+                        "PasswordAddress",
+                        "ByteOrder",
+                        "FlagToDoIGOFFONAtCPUTypeChange",
+                        "FlagToChangeToReprogGWModeForCentralGW",
+                    ),
+                    (("106P5-CAN282", "0", "0", "00", "1", "0", "0"),),
+                )
+            },
+            encoded=False,
+        )
+        engine = CUWEngine2026(
+            read_private_bytes(RUNTIME / "CUW.dll"), general_parameters=general
+        )
+        engine.configure(struct.pack("<IIddII", 1, 0, 0, 0, 0, 0))
+        engine.load_cuw(source)
+        self.addCleanup(engine.close)
+
+        challenge_fault = OSError("authored SBR challenge read fault")
+        read_count = 0
+
+        def provider(operation, _remaining):
+            nonlocal read_count
+            name = operation["operation"]
+            if name == "start_flow_control_filter":
+                return 1
+            if name == "write_messages":
+                return 1
+            if name == "read_specified_can_message":
+                read_count += 1
+                if read_count == 2:
+                    raise challenge_fault
+                return operation["address"] + b"\x62\xf1\x00\xe0\x00\x00"
+            if name == "get_protocol_id":
+                return 6
+            if name == "get_timeout":
+                return 1000
+            if name == "lock":
+                return 1
+            return None
+
+        runtime = NativeRuntime2026(provider)
+        controller = make_controller(runtime)
+        worker = engine.bind_worker(controller)
+        module_name = "TCUWCanSBRPrepareWriter.dll"
+        module_data = read_private_bytes(RUNTIME / module_name)
+        module_identity = identify_native_module(
+            hashlib.sha256(module_data).hexdigest(), module_name
+        )
+        catalog = {
+            "106P5-CAN282.ini": table(
+                (
+                    "ParamFileKeySystemProtocolMicon",
+                    "DLLFileNameForPrepareWrite",
+                    "GetCANIDFunctionNameForPrepareWrite",
+                    "CanIDForPrepareWrite",
+                    "ReceiveTimeoutBeforeGetCID",
+                    "SBLStartAddressSize",
+                    "DATAStartAddressSize",
+                ),
+                (
+                    (
+                        "106P5-CAN282",
+                        module_name,
+                        "GetCanIDsFromParamForPrepareWrite",
+                        "07E0/07E8",
+                        "100",
+                        "00001000\n00000004",
+                        "00001000\n00000004",
+                    ),
+                ),
+            )
+        }
+
+        with engine.controller_execution(controller, 0):
+            pool = ControlParameterPool2026.issue(
+                engine, controller, catalog, encoded=False
+            )
+            self.addCleanup(pool.close)
+            self.assertEqual(pool.load_for(engine, controller, "prepare"), (0,))
+            target = NativeControlExportTarget2026.issue(
+                engine, controller, pool, 0, "prepare"
+            )
+            parent_context = bind_native_context(
+                target.binding.metadata.source_container,
+                target.binding.metadata.node,
+                (),
+                target.binding,
+                module_identity,
+                {},
+                {"cpu_index": 0},
+            )
+            with (
+                engine.controller_export_target(controller, target),
+                patch.object(
+                    runtime._device_calls,
+                    "control_export",
+                    (engine, controller, target),
+                    create=True,
+                ),
+            ):
+                with (
+                    patch.object(SBRUtils2026, "extended_session"),
+                    patch.object(SBRUtils2026, "collate_gateway"),
+                    patch.object(SBRUtils2026, "central_gateway_routine"),
+                    patch.object(SBRUtils2026, "diagnostic_mask"),
+                    patch.object(SBRUtils2026, "stop_communication"),
+                    patch.object(SBRUtils2026, "programming_session"),
+                    self.assertRaises(OSError) as caught,
+                ):
+                    prepare_sbr(
+                        parent_context,
+                        runtime,
+                        key_provider=lambda *_: bytes(4),
+                        gateway_key_provider=lambda _: bytes(256),
+                    )
+                self.assertIs(caught.exception, challenge_fault)
+                self.assertEqual(worker._control_ssm_byte2026, 0xE0)
+                producer = worker._sbr_ssm_producer2026
+                self.assertIsNotNone(producer)
+                assert producer is not None
+                utility = producer[0]
+                clone = SBRUtils2026(utility.channel)
+                saved_context = utility.context
+                self.assertIsNotNone(saved_context)
+                assert saved_context is not None
+                clone.context = saved_context
+                clone.ssm = utility.ssm
+                with self.assertRaisesRegex(ValueError, "producer"):
+                    worker.publish_sbr_ssm2026(clone)
+
+                utility.context = replace(saved_context)
+                try:
+                    with self.assertRaisesRegex(ValueError, "producer"):
+                        worker.publish_sbr_ssm2026(utility)
+                finally:
+                    utility.context = saved_context
+
+                saved_runtime = utility.runtime
+                utility.runtime = NativeRuntime2026(lambda *_: None)
+                try:
+                    with self.assertRaisesRegex(ValueError, "producer"):
+                        worker.publish_sbr_ssm2026(utility)
+                finally:
+                    utility.runtime = saved_runtime
+
+                saved_scope = runtime._device_calls.control_export
+                runtime._device_calls.control_export = (engine, controller, object())
+                try:
+                    with self.assertRaisesRegex(ValueError, "producer"):
+                        worker.publish_sbr_ssm2026(utility)
+                finally:
+                    runtime._device_calls.control_export = saved_scope
+
+                errors = []
+
+                def publish_from_foreign_thread():
+                    try:
+                        worker.publish_sbr_ssm2026(utility)
+                    except ValueError as error:
+                        errors.append(error)
+
+                foreign = threading.Thread(target=publish_from_foreign_thread)
+                foreign.start()
+                foreign.join()
+                self.assertEqual(len(errors), 1)
+            self.assertEqual(worker._control_ssm_byte2026, 0xE0)
 
 
 if __name__ == "__main__":

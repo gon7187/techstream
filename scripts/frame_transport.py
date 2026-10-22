@@ -874,6 +874,8 @@ class NativeFrameOperations:
         self._native_close_started = False
         self.preinit_d1_suppressed = 1
         self.last_no_session = False
+        self._stmin_enabled = 0
+        self._stmin_value = 0
         self._temporary_config: int | None = None
         prot = profile.protocol_info(bus_id)
         if prot is None:
@@ -1351,6 +1353,19 @@ class NativeFrameOperations:
             deadline,
         )
 
+    def _stmin_ioctl(self, number: int, value: object, deadline: float) -> J2534Result:
+        # Native close resets its handle to zero while retaining STMin fields.
+        return self._invoke(
+            "ioctl",
+            {
+                "channel_id": 0 if self.channel is None else self.channel,
+                "ioctl_id": number,
+                "input": value,
+                "output_capacity": 0,
+            },
+            deadline,
+        )
+
     def _can_record(self) -> bytes:
         return _simple_record(self.profile, 14, 28, 8, word(self.protocol_record, 2))
 
@@ -1362,21 +1377,18 @@ class NativeFrameOperations:
             or self.device_kind == 4
             or self._temporary_config is not None
             or self.bus_id & 15 != 2
+            or not self._stmin_enabled
+            or not (self._stmin_value <= 255 or self._stmin_value == 65535)
         ):
             return
-        info = self._can_record()
-        enabled = info[24 if self.native_build == 12 else 26]
-        value = word(info, 18 if self.native_build == 12 else 20)
-        if not enabled or not (value <= 255 or value == 65535):
-            return
         try:
-            result = self._ioctl(1, (NativeConfig(0x23, 0),), until)
+            result = self._stmin_ioctl(1, (NativeConfig(0x23, 0),), until)
             if result.code:
                 return
             if len(result.configs) != 1 or result.configs[0].parameter != 0x23:
                 raise OSError("Native GET_CONFIG omitted requested parameter23")
             saved = result.configs[0].value & 65535
-            self.configure(((0x23, value),), deadline=until)
+            self._stmin_ioctl(2, (NativeConfig(0x23, self._stmin_value),), until)
             self._temporary_config = saved  # Native ignores SET_CONFIG status.
         except BaseException as error:
             self._fault_for(error)
@@ -1386,8 +1398,14 @@ class NativeFrameOperations:
         """Native CAN virtual b4; restore only after a successful GET_CONFIG."""
         until = self._deadline(deadline)
         if self._temporary_config is not None:
-            self.configure(((0x23, self._temporary_config),), deadline=until)
-            self._temporary_config = None
+            try:
+                self._stmin_ioctl(
+                    2, (NativeConfig(0x23, self._temporary_config),), until
+                )
+                self._temporary_config = None  # Native ignores SET_CONFIG status.
+            except BaseException as error:
+                self._fault_for(error)
+                raise
 
     def _runtime_configs(self) -> tuple[NativeConfig, ...]:
         configs = self.plan.configs
@@ -1395,6 +1413,8 @@ class NativeFrameOperations:
             configs = (NativeConfig(0x8001, 0x30B),) + configs
         if self._protocol_family() == 6 and self.device_kind == 8:
             info = self._can_record()
+            self._stmin_enabled = info[24 if self.native_build == 12 else 26]
+            self._stmin_value = word(info, 18 if self.native_build == 12 else 20)
             offset = 20 if self.native_build == 12 else 22
             configs += (NativeConfig(0x2A, word(info, offset)),)
         elif self._protocol_family() == 2:

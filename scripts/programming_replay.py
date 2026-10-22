@@ -9,6 +9,7 @@ import re
 import tempfile
 from array import array
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,19 @@ SCHEMA = "techstream-programming-replay-v1"
 MAX_BYTES = 64 * 1024 * 1024
 MAX_STREAM_BYTES = 8 * 1024 * 1024 * 1024
 MAX_STREAM_EVENTS = 16_777_216
+
+
+def _same_trace_callable2026(actual, expected) -> bool:
+    """Compare a retained callable, including fresh bound-method views."""
+    if actual is expected:
+        return True
+    return (
+        getattr(actual, "__self__", None) is not None
+        and getattr(actual, "__self__", None) is getattr(expected, "__self__", None)
+        and getattr(actual, "__func__", None) is getattr(expected, "__func__", None)
+    )
+
+
 DEVICE_ACTIONS2026 = frozenset(
     [
         "switch_connection",
@@ -904,15 +918,17 @@ class ProgrammingReplay:
     input_hashes: dict = field(repr=False)
     used: bool = False
     _last_report: dict | None = field(default=None, repr=False)
-    _engine2026: object | None = field(default=None, repr=False)
-    _runtime2026: object | None = field(default=None, repr=False)
-    _controller2026: object | None = field(default=None, repr=False)
+    _engine2026: Any = field(default=None, repr=False)
+    _runtime2026: Any = field(default=None, repr=False)
+    _controller2026: Any = field(default=None, repr=False)
     _selection2026: object | None = field(default=None, repr=False)
     _retained_export2026: str | None = field(default=None, repr=False)
     _alternate_parent2026: ProgrammingReplay | None = field(default=None, repr=False)
     _executed_selection2026: object | None = field(default=None, repr=False)
     _catalog_sources: Mapping[str, bytes] = field(default_factory=dict, repr=False)
     _module_files: Mapping[str, bytes] = field(default_factory=dict, repr=False)
+    _control_target2026: Any = field(default=None, repr=False)
+    _control_export2026: str | None = field(default=None, repr=False)
 
     @property
     def operation(self):
@@ -939,7 +955,16 @@ class ProgrammingReplay:
 
         if self._engine2026 is None or self._controller2026 is None:
             raise ValueError("Actual bound native2026 engine and controller required")
-        selection, *_ = self._dispatch2026()
+        if self._control_target2026 is not None:
+            with self._control_scope2026():
+                selection = self._control_target2026.binding
+                if (
+                    self._engine2026.family_metadata
+                    != self._control_target2026.metadata
+                ):
+                    raise ValueError("CONTROL family view differs from issued target")
+        else:
+            selection, *_ = self._dispatch2026()
         if type(selection) is not NativeParameterBinding2026:
             raise TypeError("Source-bound native2026 parameter selection required")
         return selection
@@ -954,6 +979,21 @@ class ProgrammingReplay:
             raise ValueError(
                 "Engine binding requires an unused or shared-runtime recording"
             )
+        if self._control_target2026 is not None:
+            with self._control_scope2026():
+                held = engine.family_metadata
+                if (
+                    held.source_sha256 != self.container.digest
+                    or held.source_container.digest != self.container.digest
+                    or held.node != self.node
+                    or held != self._control_target2026.metadata
+                    or engine is not self._control_target2026._engine
+                ):
+                    raise ValueError("Engine differs from held CONTROL source target")
+            if self._engine2026 is not None and self._engine2026 is not engine:
+                raise ValueError("Recording already bound to another engine")
+            self._engine2026 = engine
+            return
         state = engine.dh_state
         cpu_index = self.context["observations"]["host"].get("cpu_index", 0)
         if (
@@ -1042,6 +1082,171 @@ class ProgrammingReplay:
             raise ValueError("Recording already bound to another native runtime")
         self._runtime2026 = runtime
         self._bind_recorded_transport2026(runtime)
+
+    def _bind_control_root2026(self, engine, controller, runtime) -> None:
+        """Bind the unused root recording to the active held CONTROL source."""
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.programming_2026_common import (
+            _NATIVE_CONTROL_RAW_EXECUTIONS_2026,
+            ControlCommPhase2026,
+            NativeControlContext2026,
+            NativeRuntime2026,
+        )
+
+        if (
+            type(engine) is not CUWEngine2026
+            or type(controller) is not ControlCommPhase2026
+            or not isinstance(runtime, NativeRuntime2026)
+            or controller.runtime is not runtime
+            or engine.worker.controller is not controller
+            or engine.worker.runtime is not runtime
+            or self.used
+            or (self._engine2026 is not None and self._engine2026 is not engine)
+            or (
+                self._controller2026 is not None
+                and self._controller2026 is not controller
+            )
+            or (self._runtime2026 is not None and self._runtime2026 is not runtime)
+        ):
+            raise ValueError("Unused CONTROL root and exact native owners required")
+        context = controller.native_control_context2026(engine)
+        token = controller._native_control_raw_execution2026
+        if (
+            type(context) is not NativeControlContext2026
+            or _NATIVE_CONTROL_RAW_EXECUTIONS_2026.get(id(token))
+            != (token, engine, controller, context)
+            or token is None
+            or context._runtime is not runtime
+            or context._capture.metadata.source_sha256 != self.container.digest
+            or context._capture.metadata.source_container.digest
+            != self.container.digest
+            or context._capture.metadata.node != self.node
+            or not _same_trace_callable2026(runtime.action, self.trace.action)
+            or not _same_trace_callable2026(runtime.clock, self.trace.clock)
+            or not _same_trace_callable2026(runtime.cancelled, self.trace.cancelled)
+            or not _same_trace_callable2026(
+                runtime.local_seconds_of_day,
+                self.trace.native_local_seconds_of_day,
+            )
+            or not _same_trace_callable2026(
+                runtime.local_milliseconds_of_day,
+                self.trace.native_local_milliseconds_of_day,
+            )
+        ):
+            raise ValueError("Active held CONTROL source and exact trace required")
+        self._validate_control_frontend_sources2026(engine, context._capture.metadata)
+        already_bound = (
+            self._runtime2026 is runtime
+            and self._controller2026 is controller
+            and self._engine2026 is engine
+        )
+        self._runtime2026 = runtime
+        self._controller2026 = controller
+        self.input_hashes["controller"] = controller.identity.sha256
+        self._engine2026 = engine
+        self.input_hashes["engine"] = engine.identity.sha256
+        if not already_bound:
+            self._bind_recorded_transport2026(runtime)
+
+    def _bind_control_prelude2026(self, engine, controller, runtime) -> None:
+        """Bind owners to the held CONTROL source before raw execution starts."""
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.programming_2026_common import (
+            ControlCommPhase2026,
+            NativeControlContext2026,
+            NativeRuntime2026,
+        )
+
+        if (
+            type(engine) is not CUWEngine2026
+            or type(controller) is not ControlCommPhase2026
+            or not isinstance(runtime, NativeRuntime2026)
+            or controller.runtime is not runtime
+            or engine.worker.controller is not controller
+            or engine.worker.runtime is not runtime
+            or self.used
+            or (self._engine2026 is not None and self._engine2026 is not engine)
+            or (
+                self._controller2026 is not None
+                and self._controller2026 is not controller
+            )
+            or (self._runtime2026 is not None and self._runtime2026 is not runtime)
+            or controller._native_control_raw_execution2026 is not None
+            or controller._native_control_helper_entry2026 is not None
+        ):
+            raise ValueError("Unused CONTROL prelude and exact native owners required")
+        context = controller.native_control_context2026(engine)
+        if (
+            type(context) is not NativeControlContext2026
+            or context._runtime is not runtime
+            or context._capture.metadata.source_sha256 != self.container.digest
+            or context._capture.metadata.source_container.digest
+            != self.container.digest
+            or context._capture.metadata.node != self.node
+            or not _same_trace_callable2026(runtime.action, self.trace.action)
+            or not _same_trace_callable2026(runtime.clock, self.trace.clock)
+            or not _same_trace_callable2026(runtime.cancelled, self.trace.cancelled)
+            or not _same_trace_callable2026(
+                runtime.local_seconds_of_day, self.trace.native_local_seconds_of_day
+            )
+            or not _same_trace_callable2026(
+                runtime.local_milliseconds_of_day,
+                self.trace.native_local_milliseconds_of_day,
+            )
+        ):
+            raise ValueError("Held CONTROL source and exact trace required")
+        self._validate_control_frontend_sources2026(engine, context._capture.metadata)
+        already_bound = (
+            self._runtime2026 is runtime
+            and self._controller2026 is controller
+            and self._engine2026 is engine
+        )
+        self._runtime2026 = runtime
+        self._controller2026 = controller
+        self.input_hashes["controller"] = controller.identity.sha256
+        self._engine2026 = engine
+        self.input_hashes["engine"] = engine.identity.sha256
+        if not already_bound:
+            self._bind_recorded_transport2026(runtime)
+
+    def _validate_control_frontend_sources2026(self, engine, metadata) -> None:
+        """Check supplied canonical frontend inputs without binding them late."""
+        from scripts.programming_2026_common import (
+            NativeFrontendParameters2026,
+            NativeGeneralParameters2026,
+        )
+
+        supplied = self._catalog_sources
+        if metadata.parser_parameters_validated and "Parameter.ini" in supplied:
+            general = NativeGeneralParameters2026.from_sources(supplied, encoded=True)
+            if general != metadata.parser_general_parameters:
+                raise ValueError("Held parser General source differs from catalog")
+
+        frontend = engine.frontend_parameters
+        names = ("Parameter.ini", "CanIDTable.ini", "LogicalAddressTable.ini")
+        if frontend is not None:
+            frontend.validate_source()
+            for name in names:
+                if (
+                    name in supplied
+                    and name in frontend.sources
+                    and supplied[name] != frontend.sources[name]
+                ):
+                    raise ValueError(
+                        "Supplied frontend source differs from native engine"
+                    )
+            if all(name in supplied for name in names):
+                selected = NativeFrontendParameters2026.from_sources(
+                    supplied, encoded=True
+                )
+                if frontend != selected:
+                    raise ValueError(
+                        "Supplied frontend bundle differs from native engine"
+                    )
+        elif all(name in supplied for name in names):
+            raise ValueError(
+                "Frontend sources must be bound before the native worker starts"
+            )
 
     def _bind_recorded_transport2026(self, runtime) -> None:
         host = self.context["observations"]["host"]
@@ -1215,10 +1420,202 @@ class ProgrammingReplay:
         following.selected_identity()
         return following
 
+    def _next_control_export2026(self, target, export: str):
+        """Clone one source-issued CONTROL export onto this exact shared trace."""
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.programming_2026_common import (
+            ControlCommPhase2026,
+            NativeControlExportTarget2026,
+        )
+
+        operations = {
+            "StartGetCID": "get_cid",
+            "StartPrepareWrite": "prepare",
+            "StartFlashWrite": "write",
+            "ChangeToReprogGatewayMode": "change_gateway",
+            "PrepareRetry": "recovery",
+            "IsFinishReprogramming": "probe",
+        }
+        if export == "ProcessBeforeIGOffOnAtRetry":
+            if type(
+                target
+            ) is not NativeControlExportTarget2026 or target.binding.operation not in (
+                "prepare",
+                "write",
+            ):
+                raise ValueError("Retained CONTROL prepare/write target required")
+            operation = target.binding.operation
+        else:
+            operation = operations.get(export)
+        if (
+            type(target) is not NativeControlExportTarget2026
+            or operation is None
+            or not isinstance(self._engine2026, CUWEngine2026)
+            or not isinstance(self._controller2026, ControlCommPhase2026)
+            or self._runtime2026 is not self._controller2026.runtime
+            or target._engine is not self._engine2026
+            or target._controller is not self._controller2026
+            or not _same_trace_callable2026(self._runtime2026.action, self.trace.action)
+            or not _same_trace_callable2026(self._runtime2026.clock, self.trace.clock)
+            or not _same_trace_callable2026(
+                self._runtime2026.cancelled, self.trace.cancelled
+            )
+            or not _same_trace_callable2026(
+                self._runtime2026.local_seconds_of_day,
+                self.trace.native_local_seconds_of_day,
+            )
+            or not _same_trace_callable2026(
+                self._runtime2026.local_milliseconds_of_day,
+                self.trace.native_local_milliseconds_of_day,
+            )
+        ):
+            raise ValueError("Issued CONTROL target and exact replay owners required")
+        target.validate(self._engine2026, self._controller2026)
+        if self._engine2026._controller_export_target2026 is target:
+            metadata = self._engine2026.family_metadata
+        else:
+            with self._engine2026.controller_export_target(
+                self._controller2026, target
+            ):
+                metadata = self._engine2026.family_metadata
+        if (
+            metadata.source_sha256 != self.container.digest
+            or metadata.source_container.digest != self.container.digest
+            or metadata != target.metadata
+            or target.binding.catalog_sources != self._catalog_sources
+            or target.module_binding.catalog_sources != self._catalog_sources
+        ):
+            raise ValueError("CONTROL target source differs from replay inputs")
+        held_container = target.binding.metadata.source_container
+        if (
+            held_container is not target.metadata.source_container
+            or held_container.digest != self.container.digest
+        ):
+            raise ValueError("CONTROL stage requires the exact held FILE container")
+        context = dict(self.context)
+        observations = dict(context["observations"])
+        held_identifiers = target._context.identifiers
+        if type(held_identifiers) is not tuple or any(
+            type(identifier) is not bytes for identifier in held_identifiers
+        ):
+            raise ValueError("Exact held CONTROL identifiers required")
+        observations["current_cids"] = tuple(
+            identifier.decode("latin1") for identifier in held_identifiers
+        )
+        host = dict(observations["host"])
+        host.pop("native2026", None)
+        host["cpu_index"] = target.entry_cpu_index
+        observations["host"] = host
+        context.update(
+            operation=operation, node=metadata.node, observations=observations
+        )
+        following = ProgrammingReplay(
+            held_container,
+            context,
+            self.catalog,
+            self.modules,
+            self.attachments,
+            self.trace,
+            dict(self.input_hashes),
+            _engine2026=self._engine2026,
+            _runtime2026=self._runtime2026,
+            _controller2026=self._controller2026,
+            _selection2026=target.binding,
+            _retained_export2026=export
+            if export == "ProcessBeforeIGOffOnAtRetry"
+            else None,
+            _catalog_sources=self._catalog_sources,
+            _module_files=self._module_files,
+            _control_target2026=target,
+            _control_export2026=export,
+        )
+        following._validate_control_stage2026()
+        return following
+
+    def _validate_control_stage2026(self) -> None:
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.programming_2026_common import (
+            ControlCommPhase2026,
+            NativeControlExportTarget2026,
+        )
+
+        target = self._control_target2026
+        export = self._control_export2026
+        if (
+            type(target) is not NativeControlExportTarget2026
+            or not isinstance(self._engine2026, CUWEngine2026)
+            or type(self._controller2026) is not ControlCommPhase2026
+            or self._runtime2026 is not self._controller2026.runtime
+            or self._selection2026 is not target.binding
+            or not _same_trace_callable2026(self._runtime2026.action, self.trace.action)
+            or not _same_trace_callable2026(self._runtime2026.clock, self.trace.clock)
+            or not _same_trace_callable2026(
+                self._runtime2026.cancelled, self.trace.cancelled
+            )
+            or not _same_trace_callable2026(
+                self._runtime2026.local_seconds_of_day,
+                self.trace.native_local_seconds_of_day,
+            )
+            or not _same_trace_callable2026(
+                self._runtime2026.local_milliseconds_of_day,
+                self.trace.native_local_milliseconds_of_day,
+            )
+            or export is None
+            or self.operation
+            != {
+                "StartGetCID": "get_cid",
+                "StartPrepareWrite": "prepare",
+                "StartFlashWrite": "write",
+                "ChangeToReprogGatewayMode": "change_gateway",
+                "PrepareRetry": "recovery",
+                "IsFinishReprogramming": "probe",
+                "ProcessBeforeIGOffOnAtRetry": target.binding.operation,
+            }.get(export)
+        ):
+            raise ValueError("Private CONTROL replay lineage is invalid")
+        target.validate(self._engine2026, self._controller2026)
+        metadata = target.binding.metadata
+        if (
+            metadata.source_sha256 != self.container.digest
+            or metadata.source_container.digest != self.container.digest
+            or target.entry_cpu_index
+            != self.context["observations"]["host"].get("cpu_index")
+            or self.node != metadata.node
+            or target.binding.catalog_sources != self._catalog_sources
+            or self._control_export2026
+            not in (
+                "StartGetCID",
+                "StartPrepareWrite",
+                "StartFlashWrite",
+                "ChangeToReprogGatewayMode",
+                "PrepareRetry",
+                "IsFinishReprogramming",
+                "ProcessBeforeIGOffOnAtRetry",
+            )
+        ):
+            raise ValueError("Private CONTROL replay target/source changed")
+
+    @contextmanager
+    def _control_scope2026(self):
+        self._validate_control_stage2026()
+        target = self._control_target2026
+        if self._engine2026._controller_export_target2026 is target:
+            yield target
+        else:
+            with self._engine2026.controller_export_target(
+                self._controller2026, target
+            ):
+                yield target
+
     def next_alternate_getter2026(self, primary=None):
         """Select only the alternate getter issued by the current native row."""
         from scripts.programming_2026_common import NativeParameterBinding2026
 
+        if self._control_target2026 is not None:
+            self._validate_control_stage2026()
+            raise ValueError(
+                "CONTROL getter continuation must use its newly issued source target"
+            )
         if self.operation != "get_cid":
             raise ValueError("Alternate getter requires the actual CID phase")
         selection = primary or self._executed_selection2026
@@ -1335,14 +1732,35 @@ class ProgrammingReplay:
             or type(selection) is not NativeParameterBinding2026
             or not isinstance(self._engine2026, CUWEngine2026)
             or selection.catalog_sources != self._catalog_sources
-            or self._engine2026.source_sha256 != self.container.digest
+            or (
+                self._control_target2026 is None
+                and self._engine2026.source_sha256 != self.container.digest
+            )
             or selection.metadata.source_sha256 != self.container.digest
         ):
             raise ValueError("Executed native source binding and engine required")
+        if self._control_target2026 is not None:
+            with self._control_scope2026():
+                if (
+                    selection is not self._control_target2026.binding
+                    or self._engine2026.family_metadata
+                    != self._control_target2026.metadata
+                    or self._engine2026.family_metadata.source_sha256
+                    != selection.metadata.source_sha256
+                ):
+                    raise ValueError(
+                        "Executed binding differs from held CONTROL family view"
+                    )
         return selection
 
     def _next_loaded_writer2026(self, operation):
         """Retain the actual writer DLL/parameter row for its auxiliary export."""
+        if self._control_target2026 is not None:
+            exports = {"recovery": "PrepareRetry", "probe": "IsFinishReprogramming"}
+            export = exports.get(operation)
+            if export is None:
+                raise ValueError("Unknown retained CONTROL writer continuation")
+            return self._next_control_export2026(self._control_target2026, export)
         from scripts.cuw_2026 import CUWEngine2026
         from scripts.programming_2026_common import NativeParameterBinding2026
 
@@ -1379,6 +1797,15 @@ class ProgrammingReplay:
 
     def next_ig_cycle_process2026(self, selected=None):
         """Select the retained phase's literal ProcessBeforeIGOffOnAtRetry export."""
+        if self._control_target2026 is not None:
+            if (
+                selected is not None
+                and selected is not self._control_target2026.binding
+            ):
+                raise ValueError("IG cycle process must retain the issued CONTROL row")
+            return self._next_control_export2026(
+                self._control_target2026, "ProcessBeforeIGOffOnAtRetry"
+            )
         from scripts.cuw_2026 import CUWEngine2026
         from scripts.programming_2026_common import NativeParameterBinding2026
 
@@ -1425,6 +1852,20 @@ class ProgrammingReplay:
             _native_export="ProcessBeforeIGOffOnAtRetry",
         )
 
+    @staticmethod
+    def _explicit_control_native_return2026(result):
+        """Read only an explicit source-computed BOOL from a family report."""
+        if not isinstance(result, dict):
+            return None
+        if "native_return" in result:
+            return result["native_return"]
+        native_result = result.get("native_result")
+        if isinstance(native_result, dict):
+            returned = native_result.get("returned")
+            if type(returned) is bool:
+                return returned
+        return None
+
     def run_bound2026(self, runtime) -> dict:
         """Run one actual export inside a controller-owned chronological recording.
 
@@ -1432,11 +1873,58 @@ class ProgrammingReplay:
         lifetime. This method neither closes the runtime nor promotes completion.
         """
         self.bind_runtime2026(runtime)
-        selection, module, addresses, node, cpu, vehicle = self._dispatch()
-        self._executed_selection2026 = selection
-        runner = self._runner(selection, module, addresses, node, cpu, vehicle)
-        self.used = True
-        result = runner()
+        if self._control_target2026 is None:
+            selection, module, addresses, node, cpu, vehicle = self._dispatch()
+            self._executed_selection2026 = selection
+            runner = self._runner(selection, module, addresses, node, cpu, vehicle)
+            self.used = True
+            result = runner()
+        else:
+            self._validate_control_stage2026()
+            with self._engine2026.controller_export_target(
+                self._controller2026, self._control_target2026
+            ):
+                selection, module, addresses, node, cpu, vehicle = self._dispatch()
+                self._executed_selection2026 = selection
+                runner = self._runner(selection, module, addresses, node, cpu, vehicle)
+                self.used = True
+                result = runner()
+                if (
+                    isinstance(result, dict)
+                    and self._control_export2026 == "StartGetCID"
+                ):
+                    from scripts import programming_2026_common as common2026
+
+                    record_getter = getattr(
+                        common2026,
+                        "_record_control_getter_family_return2026",
+                        None,
+                    )
+                    if not callable(record_getter):
+                        raise RuntimeError(
+                            "CONTROL getter return receipt producer is pending"
+                        )
+                    record_getter(self._control_target2026, result)
+                if isinstance(result, dict) and self._control_export2026 in (
+                    "StartPrepareWrite",
+                    "StartFlashWrite",
+                ):
+                    returned = self._explicit_control_native_return2026(result)
+                    if type(returned) is bool:
+                        from scripts import programming_2026_common as common2026
+
+                        record_return = getattr(
+                            common2026, "_record_control_family_return2026", None
+                        )
+                        if not callable(record_return):
+                            raise RuntimeError(
+                                "CONTROL family return receipt producer is pending"
+                            )
+                        record_return(
+                            self._control_target2026,
+                            self._control_export2026,
+                            returned,
+                        )
         runtime.check()
         if not isinstance(result, dict):
             raise TypeError("Native2026 export must return an actual result mapping")
@@ -1480,6 +1968,100 @@ class ProgrammingReplay:
 
     def _dispatch2026(self):
         from scripts.programming_2026_common import bind_parameter2026
+
+        if self._control_target2026 is not None:
+            if (
+                self._engine2026._controller_export_target2026
+                is not self._control_target2026
+            ):
+                with self._control_scope2026():
+                    return self._dispatch2026()
+            self._validate_control_stage2026()
+            from scripts import programming_2026_common as common2026
+
+            target = self._control_target2026
+            export = self._control_export2026
+            if export is None:
+                raise ValueError("CONTROL export name is missing")
+            dispatch_lookup = getattr(common2026, "_control_export_dispatch2026", None)
+            if not callable(dispatch_lookup):
+                raise RuntimeError(
+                    "Native CONTROL dispatch receipt producer is pending"
+                )
+            receipt = dispatch_lookup(target, export)
+            address_lookup = getattr(common2026, "_control_helper_addresses2026", None)
+            if not callable(address_lookup):
+                raise RuntimeError("Native CONTROL helper address receipt is pending")
+            addresses = address_lookup(target)
+            if type(addresses) is not tuple:
+                raise ValueError(
+                    "Immutable source-preflighted CONTROL addresses required"
+                )
+            receipt_fields = {
+                "module",
+                "operation",
+                "required_exports",
+                "selectors",
+                "identity",
+                "module_version_checked",
+                "source_name",
+                "source_sha256",
+                "key",
+            }
+            if (
+                type(receipt) is not type(MappingProxyType({}))
+                or set(receipt) != receipt_fields
+            ):
+                raise ValueError(
+                    "Exact source-issued CONTROL dispatch receipt required"
+                )
+            expected_operation = {
+                "StartGetCID": "get_cid",
+                "StartPrepareWrite": "prepare",
+                "StartFlashWrite": "write",
+                "ChangeToReprogGatewayMode": "change_gateway",
+                "PrepareRetry": "recovery",
+                "IsFinishReprogramming": "probe",
+                "ProcessBeforeIGOffOnAtRetry": target.binding.operation,
+            }[export]
+            metadata = target.metadata
+            binding = target.binding
+            module_binding = target.module_binding
+            module_name = receipt["module"]
+            module = self.modules.get(module_name)
+            required = receipt["required_exports"]
+            if (
+                receipt["operation"] != export
+                or self.operation != expected_operation
+                or module is None
+                or type(module.native_identity) is not type(receipt["identity"])
+                or module.native_identity != receipt["identity"]
+                or receipt["identity"].sha256 != module.sha256
+                or module.name != module_binding.module_name
+                or receipt["module"] != module_binding.module_name
+                or module.sha256 != receipt["identity"].sha256
+                or receipt["source_name"] != binding.source_name
+                or receipt["source_sha256"] != binding.source_sha256
+                or receipt["key"] != binding.key
+                or receipt["module_version_checked"] is not True
+                or not isinstance(required, tuple)
+                or export not in required
+                or any(name not in module.exports for name in required)
+                or any(
+                    name not in receipt["identity"].callable_exports
+                    for name in required
+                )
+                or receipt["selectors"] != binding.selector_functions
+            ):
+                raise ValueError("CONTROL dispatch receipt differs from held source")
+            return (
+                binding,
+                module,
+                list(addresses),
+                dict(metadata.node_values),
+                dict(metadata.cpu.values) if metadata.cpus else {},
+                dict(metadata.vehicle),
+            )
 
         observations = self.context["observations"]
         host = observations["host"]
@@ -2160,6 +2742,27 @@ class ProgrammingReplay:
             execute_context_report,
         )
 
+        dh_modules = {
+            "TCUWCanDHUDSSoftwareIDGetter.dll",
+            "TCUWCanDHSoftMaskIDGetter.dll",
+            "TCUWCanDHSoftwareIDAndSoftMaskIDGetter.dll",
+            "TCUWP5CanDHVehicleInfoCIDGetter.dll",
+            "TCUWCanDHSoftwareIDGetter.dll",
+            "TCUWCanDHWritableCIDGetter.dll",
+            "TCUWCanDHWritableSoftMaskIDAndCIDGetter.dll",
+            "TCUWCanDHPrepareWriter.dll",
+            "TCUWCanDHFlashWriter.dll",
+            "TCUWCanDHGatewayPrepareWriter.dll",
+            "TCUWCanDHUDSPrepareWriter.dll",
+            "TCUWCanDHUDSFlashWriter.dll",
+            "TCUWP5CanDHUDSFlashWriter.dll",
+            "TCUWCanDHGatewayFlashWriter.dll",
+            "TCUWCanDH19PFSURegGatewayPrepareWriter.dll",
+            "TCUWCanDH19PFSURegGatewayFlashWriter.dll",
+            "TCUWP5CanDHUDSPrepareWriter.dll",
+            "TCUWCanDHMultiROMPrepareWriter.dll",
+            "TCUWCanDHMultiROMFlashWriter.dll",
+        }
         observed = self.context["observations"]
         host = observed["host"]
         aliases = host.get("native2026_attachments", {})
@@ -2170,6 +2773,17 @@ class ProgrammingReplay:
         material = {name: self.attachments[alias] for name, alias in aliases.items()}
         values = dict(host.get("native2026", {}))
         values.setdefault("cpu_index", host.get("cpu_index", 0))
+        if (
+            module.name not in dh_modules
+            and self._control_target2026 is not None
+            and self._control_export2026
+            in (
+                "PrepareRetry",
+                "IsFinishReprogramming",
+                "ProcessBeforeIGOffOnAtRetry",
+            )
+        ):
+            values["export"] = self._control_export2026
         if isinstance(values.get("target_indices"), list):
             values["target_indices"] = tuple(values["target_indices"])
         if values.get("previous_addresses") == []:
@@ -2530,27 +3144,6 @@ class ProgrammingReplay:
                 values,
             )
             return lambda: m16c2026.run_native_context(context, runtime)
-        dh_modules = {
-            "TCUWCanDHUDSSoftwareIDGetter.dll",
-            "TCUWCanDHSoftMaskIDGetter.dll",
-            "TCUWCanDHSoftwareIDAndSoftMaskIDGetter.dll",
-            "TCUWP5CanDHVehicleInfoCIDGetter.dll",
-            "TCUWCanDHSoftwareIDGetter.dll",
-            "TCUWCanDHWritableCIDGetter.dll",
-            "TCUWCanDHWritableSoftMaskIDAndCIDGetter.dll",
-            "TCUWCanDHPrepareWriter.dll",
-            "TCUWCanDHFlashWriter.dll",
-            "TCUWCanDHGatewayPrepareWriter.dll",
-            "TCUWCanDHUDSPrepareWriter.dll",
-            "TCUWCanDHUDSFlashWriter.dll",
-            "TCUWP5CanDHUDSFlashWriter.dll",
-            "TCUWCanDHGatewayFlashWriter.dll",
-            "TCUWCanDH19PFSURegGatewayPrepareWriter.dll",
-            "TCUWCanDH19PFSURegGatewayFlashWriter.dll",
-            "TCUWP5CanDHUDSPrepareWriter.dll",
-            "TCUWCanDHMultiROMPrepareWriter.dll",
-            "TCUWCanDHMultiROMFlashWriter.dll",
-        }
         if module.name in dh_modules:
             from scripts import programming_2026_dh as dh2026
 
@@ -2620,6 +3213,16 @@ class ProgrammingReplay:
                 material,
                 values,
             )
+            if module.name == "TCUWCanSBRFlashWriter.dll":
+                vendor_notify = lambda field, value: (
+                    runtime.call("progress", field=field, value=value)
+                    if field in ("writing", "next_cpu")
+                    else None
+                )
+            else:
+                vendor_notify = lambda field, value: runtime.call(
+                    "progress", field=field, value=value
+                )
             return lambda: vendor2026.run_native(
                 context,
                 runtime,
@@ -2634,9 +3237,7 @@ class ProgrammingReplay:
                 gateway_key_provider=lambda seed: runtime.call(
                     "calculate_sbr_gateway_key", seed=seed
                 ),
-                notify=lambda field, value: runtime.call(
-                    "progress", field=field, value=value
-                ),
+                notify=vendor_notify,
             )
         if (
             module.name

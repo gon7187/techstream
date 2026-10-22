@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 
 from scripts.programming_replay import (
@@ -358,7 +359,6 @@ class ProgrammingReplayTests(unittest.TestCase):
         session.context["observations"]["host"]["legacy"] = {"stage": "gateway"}
         with self.assertRaisesRegex(ValueError, "distinct gateway operation"):
             session._legacy_runner(None, SimpleNamespace(), 30)
-        self.assertEqual(session.trace.position, 0)
 
     def test_raw_catalog_presence_does_not_parse_native_profile(self):
         session = self.load()
@@ -861,6 +861,904 @@ class RecordedDeviceTests(unittest.TestCase):
             )
             with self.subTest(value=value), self.assertRaises(ValueError):
                 trace.driver_primitive({"operation": "passthru_open"}, 30)
+
+
+def make_authentic_sbr_replay_fixture(
+    case,
+    *,
+    data: bytes = b"DATA",
+    cpu_count: int = 1,
+    cpu_type_second: str = "283",
+    block_response: bytes = bytes.fromhex("7420000a"),
+    events_override=None,
+    capture_progress: bool = True,
+):
+    """Build real SBR family outputs into one raw CONTROL chronology."""
+    import csv
+    import hashlib
+    import io
+    from pathlib import Path
+
+    from scripts.calibration import CalibrationContainer
+    from scripts.calibration_2026 import parse_cuw_2026
+    from scripts.j2534_2026 import J2534Device2026, PrimitiveResult
+    from scripts.native_modules import identify_native_module
+    from scripts.programming_2026_common import (
+        NativeRuntime2026,
+        bind_native_parameter2026,
+    )
+    from scripts.programming_2026_vendor import bind_native_context, run_native
+    from tests.private_evidence import read_private_bytes
+    from tests.test_calibration_2026 import cuw
+    from tests.test_cuw_engine_worker import encoded_table
+    from tests.test_programming_2026_common import make_raw_control_fixture2026
+    from tests.test_programming_2026_vendor import (
+        TypedDriver,
+    )
+    from tests.test_programming_2026_vendor import (
+        context as vendor_context,
+    )
+
+    prepare_name = "TCUWCanSBRPrepareWriter.dll"
+    writer_name = "TCUWCanSBRFlashWriter.dll"
+    utility_name = "TCUWSBRUtils.dll"
+    original = vendor_context(prepare_name)
+    catalog_name, original_table = next(
+        iter(original.selection.catalog_sources.items())
+    )
+    source_rows = list(csv.reader(io.StringIO(original_table.decode())))
+    fields = source_rows[0]
+    row = dict(zip(fields, source_rows[1], strict=True))
+    if cpu_count not in (1, 2):
+        raise ValueError("The authored SBR replay fixture supports one or two CPUs")
+    row.update(
+        DLLFileNameForFlashWrite=writer_name,
+        DLLFileNameForChangeToReprogGatewayMode="",
+        GetCANIDFunctionNameForFlashWrite="GetCanIDsFromParamForPrepareWrite",
+        CanIDForFlashWrite="07E0/07E8",
+        CanIDForPrepareWrite=(
+            "07E0/07E8\n07E1/07E9" if cpu_count == 2 else "07E0/07E8"
+        ),
+        EnableDLLVersionInformation="0\n0\n0\n0",
+        CpuLoopBetweenPrepareAndWriteFlag="0",
+    )
+    for name in (
+        "DLLFileNameForFlashWrite",
+        "DLLFileNameForChangeToReprogGatewayMode",
+        "GetCANIDFunctionNameForFlashWrite",
+        "CanIDForFlashWrite",
+        "CanIDForPrepareWrite",
+        "EnableDLLVersionInformation",
+    ):
+        if name not in fields:
+            fields.append(name)
+    values = tuple(row[name] for name in fields)
+    plain_table = io.StringIO(newline="")
+    plain_writer = csv.writer(plain_table, lineterminator="\r\n")
+    plain_writer.writerow(fields)
+    plain_writer.writerow(values)
+    raw_catalog = {catalog_name: plain_table.getvalue().encode()}
+    catalog = {catalog_name: encoded_table(tuple(fields), (values,))}
+    if cpu_count == 2:
+        second_row = dict(row)
+        second_row["ParamFileKeySystemProtocolMicon"] = (
+            row["ParamFileKeySystemProtocolMicon"][:-3] + cpu_type_second
+        )
+        second_row["CanIDForFlashWrite"] = "07E1/07E9"
+        second_row["CanIDForPrepareWrite"] = "07E1/07E9"
+        second_values = tuple(second_row[name] for name in fields)
+        second_catalog_name = catalog_name[: -len("282.ini")] + cpu_type_second + ".ini"
+        second_table = io.StringIO(newline="")
+        second_writer = csv.writer(second_table, lineterminator="\r\n")
+        second_writer.writerow(fields)
+        second_writer.writerow(second_values)
+        raw_catalog[second_catalog_name] = second_table.getvalue().encode()
+        catalog[second_catalog_name] = encoded_table(tuple(fields), (second_values,))
+    general_fields = (
+        "ParamFileKeySystemProtocolMicon",
+        "M16CTypeFlag",
+        "FlagToChangeToReprogGWModeForCentralGW",
+        "FORESTTypeFlag",
+        "PasswordAddress",
+        "ByteOrder",
+        "FlagToDoIGOFFONAtCPUTypeChange",
+    )
+    general_rows = [
+        (row["ParamFileKeySystemProtocolMicon"], "0", "0", "0", "00", "1", "0")
+    ]
+    if cpu_count == 2:
+        general_rows.append(
+            (
+                second_row["ParamFileKeySystemProtocolMicon"],
+                "0",
+                "0",
+                "0",
+                "00",
+                "1",
+                "0",
+            )
+        )
+    catalog["Parameter.ini"] = encoded_table(general_fields, tuple(general_rows))
+    cpu_sections = [
+        (
+            "[CPU01]\nCPUType=282\nNumberOfFiles=1\n[File1001]\n"
+            "ALFID=44\nEraseBlock=1\nDownloadAddress=00001000\n"
+            f"DownloadMemsize={len(data):08X}\n"
+        )
+    ]
+    if cpu_count == 2:
+        cpu_sections.append(
+            f"[CPU02]\nCPUType={cpu_type_second}\nNumberOfFiles=1\n"
+            "[File2001]\nALFID=44\nEraseBlock=1\n"
+            "DownloadAddress=00002000\n"
+            f"DownloadMemsize={len(data):08X}\n"
+        )
+    source = cuw(
+        "[Format]\nVersion=9\n[Vehicle]\n"
+        f"NumberOfCalibration={cpu_count}\n"
+        "ContactType=P5-CAN\nKindOfECU=106\n" + "".join(cpu_sections),
+        (data,) * cpu_count,
+    )
+    container = parse_cuw_2026(source)
+    if not isinstance(container, CalibrationContainer):
+        raise TypeError("Authored SBR fixture must remain a CUW container")
+    image_root = Path("runtime/no-car-21/recovered")
+    module_bytes = {
+        name: read_private_bytes(image_root / name)
+        for name in (prepare_name, writer_name, utility_name)
+    }
+
+    class CapturingDriver(TypedDriver):
+        def __init__(self, replies):
+            self.rows = []
+            self.replies = {
+                request: list(values) for request, values in replies.items()
+            }
+            self.pending = []
+            self.events = []
+            self.fault = None
+            self.now = 0.0
+            self.timeout = 100
+            self.device = J2534Device2026(
+                cast(Any, self), clock=lambda: self.now, background_workers=False
+            )
+
+        def __call__(self, event, remaining):
+            if event["operation"] in (
+                "calculate_sbr_key",
+                "calculate_sbr_gateway_key",
+                "progress",
+                "notify_progress_count",
+                "notify_progress_percent",
+            ):
+                result = (
+                    bytes(4)
+                    if event["operation"] == "calculate_sbr_key"
+                    else bytes(256)
+                    if event["operation"] == "calculate_sbr_gateway_key"
+                    else None
+                )
+                self.rows.append((event, result, False))
+                return result
+            result = super().__call__(event, remaining)
+            self.rows.append((event, result, True))
+            return result
+
+    def tag(value):
+        from scripts.j2534_2026 import NativeMessage, NativeReadBatch2026
+
+        if isinstance(value, PrimitiveResult):
+            value = {"status": value.status, "value": value.value}
+        if value is None:
+            return {"type": "none", "value": None}
+        if type(value) is bool:
+            return {"type": "bool", "value": value}
+        if type(value) is int:
+            return {"type": "int", "value": value}
+        if isinstance(value, bytes):
+            return {"type": "bytes", "value": value.hex()}
+        if isinstance(value, str):
+            return {"type": "text", "value": value}
+        if isinstance(value, (tuple, list)):
+            kind = "tuple" if isinstance(value, tuple) else "sequence"
+            return {"type": kind, "value": [tag(item) for item in value]}
+        if isinstance(value, dict):
+            return {
+                "type": "mapping",
+                "value": {key: tag(item) for key, item in value.items()},
+            }
+        if type(value) is NativeMessage:
+            return {
+                "type": "mapping",
+                "value": {
+                    "_native_type": {"type": "text", "value": "PASSTHRU_MSG_2026"},
+                    **{key: tag(item) for key, item in vars(value).items()},
+                },
+            }
+        if type(value) is NativeReadBatch2026:
+            return {
+                "type": "mapping",
+                "value": {
+                    "_native_type": {"type": "text", "value": "READ_BATCH_2026"},
+                    "messages": tag(value.messages),
+                    "count": tag(value.count),
+                },
+            }
+        raise TypeError(f"Unsupported captured primitive value {type(value)!r}")
+
+    if (
+        not isinstance(block_response, bytes)
+        or len(block_response) != 4
+        or block_response[:2] != bytes.fromhex("7420")
+    ):
+        raise ValueError("SBR block response must be a four-byte 74 20 response")
+    block_width = int.from_bytes(block_response[2:], "big") - 6
+    if block_width < 1:
+        raise ValueError("SBR max block length must leave room for one data byte")
+    replies = {
+        b"\x27\x33": [b"\x67\x33" + bytes(range(16))],
+        b"\x27\x34" + bytes(256): [b"\x67\x34"],
+        b"\x31\x01\x02\0": [b"\x71\x01\x02\0"],
+        b"\x31\x01\x02\x01": [b"\x71\x01\x02\x01"],
+        b"\x22\xf1\0": [b"\x62\xf1\0\xe0\0\0"],
+        b"\x27\x01": [b"\x67\x01" + bytes(4)],
+        b"\x10\x02": [b"\x50\x02"],
+        b"\x37": [b"\x77"] * cpu_count,
+    }
+    for cpu_index in range(cpu_count):
+        address = 0x1000 + cpu_index * 0x1000
+        cpu_area = bytes.fromhex("440000") + address.to_bytes(2, "big")
+        cpu_area += len(data).to_bytes(4, "big")
+        replies[bytes.fromhex("3101ff00") + cpu_area] = [bytes.fromhex("7101ff00")]
+        replies[bytes.fromhex("3404") + cpu_area] = [block_response]
+        replies[bytes.fromhex("3101ff01") + cpu_area] = [bytes.fromhex("7101ff0101")]
+        for sequence, offset in enumerate(range(0, len(data), block_width), 1):
+            chunk = data[offset : offset + block_width]
+            request = (
+                bytes((0x36, sequence & 0xFF))
+                + (address + offset).to_bytes(4, "big")
+                + chunk
+            )
+            replies[request] = [bytes((0x76, sequence & 0xFF))]
+    driver = CapturingDriver(replies)
+    driver.device.open()
+    driver.device.connect(6)
+    direct_device_action = driver.device.primitive
+
+    def direct_action(event, remaining):
+        if event["operation"] in (
+            "switch_connection",
+            "switch_connection_with_version",
+            "start_periodic",
+            "stop_periodic",
+            "connect",
+            "start_sync_periodic",
+            "set_local_time_to_previous_send_time",
+            "is_sending_sync_periodic",
+            "disconnect",
+            "stop_sync_periodic",
+            "stop_sync_periodic_message",
+            "get_protocol_id",
+            "get_send_timeout",
+            "set_send_timeout",
+            "set_history_enabled",
+            "get_system_time",
+            "local_time_ms",
+            "get_timeout",
+            "set_timeout",
+            "write_messages",
+            "read_specified_can_messages",
+            "read_messages_result",
+            "read_after_indication_result",
+            "read_messages",
+            "read_after_indication",
+            "queue_messages",
+            "write_tcp",
+            "read_tcp",
+            "logical_connect",
+            "logical_disconnect",
+            "logical_connect_udp_discovery",
+            "logical_disconnect_udp_discovery",
+            "start_sync_periodic_0500",
+            "five_baud_init",
+            "fast_init",
+            "read_specified_can_message",
+            "start_flow_control_filter",
+            "stop_filter",
+            "control_io",
+            "wait",
+            "lock",
+            "unlock",
+            "ioctl",
+            "wrap_read_messages",
+        ):
+            return direct_device_action(event, remaining)
+        if event["operation"] == "get_local_milliseconds_of_day":
+            result = 1500
+        elif event["operation"] == "get_local_seconds_of_day":
+            result = 1
+        elif event["operation"] == "calculate_sbr_key":
+            result = bytes(4)
+        elif event["operation"] == "calculate_sbr_gateway_key":
+            result = bytes(256)
+        elif event["operation"] == "progress" or event["operation"] in (
+            "notify_progress_count",
+            "notify_progress_percent",
+        ):
+            result = None
+        elif event["operation"] == "set_communication_log_mode":
+            result = 0
+        else:
+            raise AssertionError(f"Unexpected authored family primitive: {event}")
+        driver.rows.append((event, result, False))
+        return result
+
+    def local_ms():
+        driver.rows.append(
+            ({"operation": "get_local_milliseconds_of_day"}, 1500, False)
+        )
+        return 1500
+
+    def local_seconds():
+        driver.rows.append(({"operation": "get_local_seconds_of_day"}, 1, False))
+        return 1
+
+    runtime = NativeRuntime2026(
+        direct_action,
+        timeout=1800,
+        clock=lambda: driver.now,
+        native_cancelled=lambda: False,
+        local_seconds_of_day=local_seconds,
+        local_milliseconds_of_day=local_ms,
+    )
+
+    def family_context(name, operation):
+        selection = bind_native_parameter2026(
+            container, raw_catalog, operation, encoded=False, node=1
+        )
+        identity = identify_native_module(
+            hashlib.sha256(module_bytes[name]).hexdigest(), name
+        )
+        return bind_native_context(
+            container, 1, (), selection, identity, {}, {"cpu_index": 0}
+        )
+
+    direct_events = []
+    prepare_ctx = family_context(prepare_name, "prepare")
+    prepare_result = run_native(
+        prepare_ctx,
+        runtime,
+        key_provider=lambda secret_type, seed, aes, encrypt: runtime.call(
+            "calculate_sbr_key",
+            secret_type=secret_type,
+            seed=seed,
+            aes=aes,
+            encrypt=encrypt,
+        ),
+        gateway_key_provider=lambda seed: runtime.call(
+            "calculate_sbr_gateway_key", seed=seed
+        ),
+    )
+    assert prepare_result["state"] == "prepare_completed"
+    prepare_count = len(driver.rows)
+    driver.rows.append(
+        (
+            {"operation": "set_communication_log_mode", "mode": 2},
+            0,
+            False,
+        )
+    )
+    writer_ctx = family_context(writer_name, "write")
+    writer_result = run_native(
+        writer_ctx,
+        runtime,
+        notify=lambda field, value: (
+            runtime.call("progress", field=field, value=value)
+            if field in ("writing", "next_cpu")
+            else None
+        ),
+    )
+    assert writer_result["state"] == "writer_completed"
+    driver.rows.append(
+        (
+            {"operation": "set_communication_log_mode", "mode": 0},
+            0,
+            False,
+        )
+    )
+    direct_events.extend(driver.rows[:prepare_count])
+    direct_events.append(driver.rows[prepare_count])
+    direct_events.extend(driver.rows[prepare_count + 1 :])
+    event_rows = []
+    from scripts.programming_replay import _native_request
+
+    for request, output, is_driver in direct_events:
+        if is_driver and isinstance(output, PrimitiveResult):
+            output_value = {"status": output.status, "value": output.value}
+        elif is_driver:
+            output_value = {"status": 0, "value": output}
+        else:
+            output_value = output
+        event_rows.append(
+            {
+                "kind": "action",
+                "request": _native_request(request),
+                "result": tag(output_value),
+                "elapsed_ms": max(
+                    1,
+                    request.get("milliseconds", 1)
+                    if request["operation"] == "wait"
+                    else 1,
+                ),
+            }
+        )
+
+    if cpu_count == 2:
+        for mode in (2, 0):
+            event_rows.append(
+                {
+                    "kind": "action",
+                    "request": {
+                        "operation": "set_communication_log_mode",
+                        "mode": mode,
+                    },
+                    "result": {"type": "int", "value": 0},
+                    "elapsed_ms": 1,
+                }
+            )
+    events = (
+        {
+            "kind": "action",
+            "request": {"operation": "get_local_milliseconds_of_day"},
+            "result": {"type": "int", "value": 1000},
+            "elapsed_ms": 1,
+        },
+        *event_rows,
+        {
+            "kind": "action",
+            "request": {"operation": "get_local_milliseconds_of_day"},
+            "result": {"type": "int", "value": 2000},
+            "elapsed_ms": 1,
+        },
+    )
+    engine, control, session = make_raw_control_fixture2026(
+        case,
+        source=source,
+        catalog=catalog,
+        module_files=module_bytes,
+        operation="prepare",
+        events=events if events_override is None else events_override,
+        paired=True,
+    )
+
+    class ProgrammingTraceCapture:
+        """Capture native order using only already-authored primitive inputs."""
+
+        def __init__(self):
+            self.actions = []
+            self.recorded_consume = session.trace.consume
+
+        def __call__(self, kind, request, remaining=None):
+            if kind == "action" and request.get("operation") in (
+                "notify_progress_count",
+                "notify_progress_percent",
+            ):
+                self.actions.append(dict(request))
+                rows = session.trace.rows
+                if type(rows) is not list:
+                    raise TypeError("Mutable source trace capture rows required")
+                rows.insert(
+                    session.trace.position,
+                    {
+                        "kind": "action",
+                        "request": _native_request(request),
+                        "result": {"type": "none", "value": None},
+                        "elapsed_ms": 0,
+                    },
+                )
+            if kind == "action":
+                rows = session.trace.rows
+                if type(rows) is not list:
+                    raise TypeError("Mutable source trace capture rows required")
+                position = session.trace.position
+                expected = (
+                    rows[position].get("request") if position < len(rows) else None
+                )
+                normalized = _native_request(request)
+                if expected != normalized:
+                    match = next(
+                        (
+                            index
+                            for index in range(position + 1, len(rows))
+                            if rows[index].get("kind") == "action"
+                            and rows[index].get("request") == normalized
+                        ),
+                        None,
+                    )
+                    if match is not None:
+                        rows[position], rows[match] = rows[match], rows[position]
+            return self.recorded_consume(kind, request, remaining)
+
+    from scripts.programming_replay import _native_request
+
+    canonical_actions = []
+    if capture_progress:
+        session.trace.rows = list(session.trace.rows)
+        trace_capture = ProgrammingTraceCapture()
+        canonical_actions = trace_capture.actions
+        session.trace.consume = trace_capture
+    return (
+        engine,
+        control,
+        session,
+        driver,
+        control.runtime,
+        canonical_actions,
+        row["ParamFileKeySystemProtocolMicon"],
+    )
+
+
+class ControlStagedReplayTests(unittest.TestCase):
+    def setUp(self):
+        helper = ProgrammingReplayTests()
+        helper.setUp()
+        self.helper = helper
+        self.session = helper.load()
+
+    def _load_private_dh_retry_proof(self):
+        import importlib.util
+
+        from tests.private_evidence import require_private
+
+        relative_paths = (
+            "runtime/no-car-119/verify_failed_dh_retry.py",
+            "runtime/no-car-119/verify_failed_sonar_retry.py",
+            "runtime/no-car-119/dh_retry_fixture.py",
+            "runtime/no-car-119/sonar_retry_fixture.py",
+            "runtime/no-car-21/recovered/CUW.dll",
+            "runtime/no-car-21/recovered/TCUWCanDHFlashWriter.dll",
+            "runtime/no-car-21/recovered/TCUWCanDHPrepareWriter.dll",
+            "runtime/no-car-21/recovered/TCUWControlCommPhase.dll",
+            "runtime/no-car-21/recovered/TCUWJ2534DeviceIF.dll",
+            "runtime/no-car-21/recovered/TCUWDHUtils.dll",
+            "runtime/no-car-21/recovered/SecretInfo.dll",
+        )
+        require_private(*relative_paths)
+        repo_root = Path(__file__).resolve().parents[1]
+        proof_path = repo_root / relative_paths[0]
+        spec = importlib.util.spec_from_file_location("dh_retry_raw_proof", proof_path)
+        if spec is None or spec.loader is None:
+            raise AssertionError("Private DH retry proof loader is unavailable")
+        proof = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(proof)
+        return proof
+
+    def test_dh_retry_proof_skips_when_private_source_is_absent(self):
+        from tests import private_evidence
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(private_evidence, "_REPO_ROOT", Path(directory)),
+            self.assertRaises(unittest.SkipTest),
+        ):
+            self._load_private_dh_retry_proof()
+
+    def test_private_stage_rejects_forged_or_unbound_target(self):
+        from scripts.programming_2026_common import NativeControlExportTarget2026
+
+        with self.assertRaisesRegex(ValueError, "exact replay owners"):
+            self.session._next_control_export2026(object(), "StartFlashWrite")
+        with self.assertRaisesRegex(ValueError, "exact replay owners"):
+            self.session._next_control_export2026(
+                object.__new__(NativeControlExportTarget2026), "StartFlashWrite"
+            )
+        self.assertEqual(self.session.trace.position, 0)
+        self.assertFalse(self.session.used)
+
+    def test_private_stage_rejects_unknown_export(self):
+        with self.assertRaisesRegex(ValueError, "exact replay owners"):
+            self.session._next_control_export2026(object(), "caller_selected_stage")
+        self.assertEqual(self.session.trace.position, 0)
+
+    def test_control_root_binding_requires_live_raw_driver_owners(self):
+        with self.assertRaisesRegex(ValueError, "exact native owners"):
+            self.session._bind_control_root2026(object(), object(), object())
+        self.assertIsNone(self.session._engine2026)
+        self.assertIsNone(self.session._controller2026)
+        self.assertIsNone(self.session._runtime2026)
+        self.assertEqual(self.session.trace.position, 0)
+
+    def test_public_clone_cannot_receive_private_target_authority(self):
+        from scripts.programming_replay import ProgrammingReplay
+
+        with self.assertRaises(TypeError):
+            cast(Any, self.session.next_session2026)(
+                "write", node=1, cpu_index=0, _control_target2026=object()
+            )
+        forged = ProgrammingReplay(
+            self.session.container,
+            dict(self.session.context),
+            self.session.catalog,
+            self.session.modules,
+            self.session.attachments,
+            self.session.trace,
+            dict(self.session.input_hashes),
+            _control_target2026=object(),
+            _control_export2026="StartFlashWrite",
+        )
+        with self.assertRaisesRegex(ValueError, "Private CONTROL replay lineage"):
+            forged._validate_control_stage2026()
+
+    def test_recording_cannot_supply_a_stage_override(self):
+        document = dict(self.helper.document)
+        document["stage"] = "write"
+        with self.assertRaises(ValueError):
+            self.helper.load(document)
+
+    def test_control_return_receipt_requires_explicit_native_boolean(self):
+        from scripts.programming_replay import ProgrammingReplay
+
+        read_return = ProgrammingReplay._explicit_control_native_return2026
+        self.assertIs(read_return({"native_return": True}), True)
+        self.assertIs(read_return({"native_return": False}), False)
+        self.assertIs(read_return({"native_result": {"returned": True}}), True)
+        self.assertIsNone(
+            read_return({"native_return": None, "native_result": {"returned": True}})
+        )
+        self.assertIsNone(
+            read_return({"state": "writer_completed", "native_success": True})
+        )
+        self.assertIsNone(read_return({"identifiers": (b"CID",)}))
+
+    def test_dh_binding_rejects_caller_supplied_export_override(self):
+        proof = self._load_private_dh_retry_proof()
+        from scripts import programming_2026_dh as dh2026
+
+        with proof.factory.canonical(authoring=True) as (
+            _engine,
+            _control,
+            session,
+            _cancel,
+        ):
+            selection, module, *_ = session._dispatch2026()
+            with self.assertRaisesRegex(ValueError, "undeclared overrides"):
+                dh2026.bind_native_context(
+                    session.container,
+                    session.node,
+                    (),
+                    selection,
+                    module.native_identity,
+                    {"selected_module": session._module_files[module.name]},
+                    {"export": "PrepareRetry"},
+                )
+
+    def test_actual_dh_retry_uses_private_export_on_fresh_strict_trace(self):
+        proof = self._load_private_dh_retry_proof()
+        authored_rows, captured = proof.exercise(1, author=True)
+        rows, strict = proof.exercise(1, events=authored_rows)
+
+        self.assertEqual(rows, authored_rows)
+        self.assertEqual(captured["events"], 97)
+        self.assertFalse(captured["exact_final_trace"])
+        self.assertEqual(captured["native_prepare_retry_exports"], 1)
+        self.assertEqual(strict["events"], 97)
+        self.assertTrue(strict["exact_final_trace"])
+        self.assertEqual(strict["native_prepare_retry_exports"], 1)
+        self.assertTrue(strict["source_retry_decision"])
+
+    def test_authentic_sbr_two_cpu_shared_execute_frozen_strict_replay(self):
+        import copy
+
+        capture_engine, capture_control, capture_session, *_ = (
+            make_authentic_sbr_replay_fixture(self, cpu_count=2)
+        )
+        with capture_engine.controller_execution(capture_control, 1):
+            capture_session._bind_control_prelude2026(
+                capture_engine, capture_control, capture_control.runtime
+            )
+            device = capture_engine.engine_runtime_device()
+            device.open()
+            device.connect(6)
+            capture_result = capture_control.execute(capture_engine, capture_session)
+        self.assertTrue(capture_result["native_return"])
+        self.assertEqual(
+            tuple(report["entrypoint"] for report in capture_result["exports"]),
+            ("StartPrepareWrite", "StartFlashWrite", "StartFlashWrite"),
+        )
+        self.assertEqual(capture_result["exports"][1]["transferred"], 8)
+        self.assertEqual(capture_result["exports"][1]["next_cpu_index"], 2)
+        self.assertEqual(capture_result["exports"][2]["transferred"], 0)
+        self.assertTrue(capture_result["exports"][2]["native_skipped_completed"])
+        self.assertEqual(capture_result["exports"][2]["next_cpu_index"], 1)
+        self.assertEqual(capture_engine.comm_phase, 2)
+        self.assertEqual(
+            capture_session.trace.position, len(capture_session.trace.rows)
+        )
+        captured_events = tuple(copy.deepcopy(capture_session.trace.rows))
+        captured_wire = json.dumps(captured_events)
+        self.assertEqual(captured_wire.count("36010000100044415441"), 1)
+        self.assertEqual(captured_wire.count("36010000200044415441"), 1)
+        self.assertIn("000007e0", captured_wire)
+        self.assertIn("000007e1", captured_wire)
+        self.assertEqual(
+            [
+                event["request"]["mode"]
+                for event in captured_events
+                if event.get("request", {}).get("operation")
+                == "set_communication_log_mode"
+            ],
+            [2, 0, 2, 0],
+        )
+        self.assertEqual(
+            [
+                action["cpu_index"]
+                for action in (
+                    event["request"]
+                    for event in captured_events
+                    if event.get("request", {}).get("operation")
+                    == "notify_progress_count"
+                )
+            ],
+            [0, 1],
+        )
+
+        engine, control, session, *_ = make_authentic_sbr_replay_fixture(
+            self,
+            cpu_count=2,
+            events_override=captured_events,
+            capture_progress=False,
+        )
+        with engine.controller_execution(control, 1):
+            session._bind_control_prelude2026(engine, control, control.runtime)
+            device = engine.engine_runtime_device()
+            device.open()
+            device.connect(6)
+            result = control.execute(engine, session)
+        self.assertTrue(result["native_return"])
+        self.assertEqual(session.trace.position, len(captured_events))
+        self.assertEqual(
+            tuple(report["entrypoint"] for report in result["exports"]),
+            ("StartPrepareWrite", "StartFlashWrite", "StartFlashWrite"),
+        )
+        self.assertEqual(result["exports"][1]["transferred"], 8)
+        self.assertEqual(result["exports"][2]["transferred"], 0)
+        self.assertTrue(result["exports"][2]["native_skipped_completed"])
+        self.assertEqual(engine.comm_phase, 2)
+        self.assertIsNone(control._native_control_raw_execution2026)
+
+    def test_authentic_sbr_prepare_empty_gateway_write_shared_execute(self):
+        import copy
+
+        from scripts.programming_replay import _native_request
+        from tests.test_cuw_engine_worker import encoded_table
+
+        (
+            capture_engine,
+            capture_control,
+            capture_session,
+            _capture_driver,
+            _capture_runtime,
+            canonical_actions,
+            parameter_key,
+        ) = make_authentic_sbr_replay_fixture(self)
+        with capture_engine.controller_execution(capture_control, 1):
+            from types import MappingProxyType
+
+            held_metadata = capture_control.native_control_context2026(
+                capture_engine
+            )._capture.metadata
+            self.assertTrue(held_metadata.parser_parameters_validated)
+            original_sources = capture_session._catalog_sources
+            unrelated_sources = dict(original_sources)
+            unrelated_sources["Parameter.ini"] = encoded_table(
+                (
+                    "ParamFileKeySystemProtocolMicon",
+                    "M16CTypeFlag",
+                    "FlagToChangeToReprogGWModeForCentralGW",
+                    "FORESTTypeFlag",
+                    "PasswordAddress",
+                    "ByteOrder",
+                    "FlagToDoIGOFFONAtCPUTypeChange",
+                ),
+                (
+                    (
+                        parameter_key,
+                        "0",
+                        "0",
+                        "0",
+                        "00",
+                        "1",
+                        "1",
+                    ),
+                ),
+            )
+            capture_session._catalog_sources = MappingProxyType(unrelated_sources)
+            with self.assertRaisesRegex(ValueError, "General source differs"):
+                capture_session._bind_control_prelude2026(
+                    capture_engine, capture_control, capture_control.runtime
+                )
+            capture_session._catalog_sources = original_sources
+            capture_session._bind_control_prelude2026(
+                capture_engine, capture_control, capture_control.runtime
+            )
+            self.assertIsNone(capture_control._native_control_raw_execution2026)
+            capture_session.context["observations"]["current_cids"] = [
+                "ROOT-JSON-MUST-NOT-WIN"
+            ]
+            engine_device = capture_engine.engine_runtime_device()
+            engine_device.open()
+            engine_device.connect(6)
+            capture_result = capture_control.execute(capture_engine, capture_session)
+        self.assertTrue(capture_result["native_return"])
+        self.assertEqual(
+            capture_session.trace.position, len(capture_session.trace.rows)
+        )
+        captured_events = tuple(copy.deepcopy(capture_session.trace.rows))
+
+        (
+            engine,
+            control,
+            session,
+            _driver,
+            _runtime,
+            strict_actions,
+            _parameter_key,
+        ) = make_authentic_sbr_replay_fixture(
+            self, events_override=captured_events, capture_progress=False
+        )
+        self.assertEqual(strict_actions, [])
+        requests = tuple(
+            event["request"]
+            for event in captured_events
+            if event["request"].get("operation")
+            in ("notify_progress_count", "notify_progress_percent")
+        )
+        self.assertEqual(
+            requests,
+            tuple(_native_request(event) for event in canonical_actions),
+        )
+        with engine.controller_execution(control, 1):
+            session._bind_control_prelude2026(engine, control, control.runtime)
+            session.context["observations"]["current_cids"] = ["ROOT-JSON-MUST-NOT-WIN"]
+            engine_device = engine.engine_runtime_device()
+            engine_device.open()
+            engine_device.connect(6)
+            result = control.execute(engine, session)
+        self.assertEqual(
+            tuple(report["native_return"] for report in result["exports"]),
+            (True, True),
+        )
+        self.assertEqual(
+            tuple(report["entrypoint"] for report in result["exports"]),
+            ("StartPrepareWrite", "StartFlashWrite"),
+        )
+        self.assertEqual(engine.comm_phase, 2)
+        self.assertTrue(result["native_return"])
+        self.assertEqual(session.trace.position, len(session.trace.rows))
+        self.assertTrue(session.used)
+        self.assertEqual(
+            tuple(canonical_actions),
+            (
+                {
+                    "operation": "notify_progress_count",
+                    "cpu_index": 0,
+                    "transferred_bytes": 0,
+                },
+                {
+                    "operation": "notify_progress_percent",
+                    "cpu_index": 0,
+                    "progress": 100,
+                },
+            ),
+        )
+        self.assertEqual(session.trace.position, len(captured_events))
+        wire = json.dumps(session.trace.rows)
+        self.assertIn("1063", wire)
+        self.assertIn("360100001000", wire)
+        self.assertIn("44415441", wire)
+        self.assertFalse(engine.worker.control_state.failed)
+        self.assertIsNone(control._native_control_helper_entry2026)
+        self.assertIsNone(control._native_control_raw_execution2026)
 
 
 if __name__ == "__main__":

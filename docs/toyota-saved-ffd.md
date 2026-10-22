@@ -277,8 +277,15 @@ P5 first-support value3 reaches public fields(1,1,3); normal spec2 correctly
 disables159..171 and yields(1,0,0). Source-corrected normal chronology explicitly
 rejects B1/RAM overcalling. Independent full-provider review remains open.
 
-Original12 generic outer still requires its exact internal normal path. ADS,
-PVM, RC and TSS3 indexed image producers and saved outers remain incomplete. `ImageP5Request18` preserves caller BYTE numbers, selector and the two
+ADS18 record-phase log retention now follows the source membership polarity:
+regular records accepted by the first-DDR counter populate the per-group parent
+set; linked extended records keep their raw send/receive bytes, while zero,
+orphan and counter-excluded-parent records roll back to the preceding packet
+offset. Extended rows add no freeze scalar. Three focused actual43/77/49
+controls check these bytes and the existing suppressed-error rollback path.
+The complete ADS image producer and saved outer remain incomplete. Original12
+generic outer still requires its exact internal normal path. PVM, RC and TSS3
+indexed image producers and saved outers remain incomplete. `ImageP5Request18` preserves caller BYTE numbers, selector and the two
 native ECU-reference fields consumed by the DDR selector. Empty and duplicate
 number lists remain visible. Original12 uses separate inline helpers and reads
 all memorized images; original18 requires a caller snapshot-number list, filters

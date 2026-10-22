@@ -188,6 +188,14 @@ Mode35 retains the native error from the final Freeze metadata filtering stage,
 so repeated and sibling calls return that status without another query. Early
 assembly errors and host failures are not inserted as discovery results.
 
+The private `_bind_selected_vehicle_storage(owner, protocol_profile=...)` is only
+for the retained source18 selected-vehicle transition. It requires the canonical
+management profile for the bound ECU category and aliases the existing Ever,
+support-bit and Mode35 dictionaries. Their native lookup scope is category based;
+full ECU/model identity checks still run before every cache hit. Generic same-model
+shares from this context derive each sibling's own canonical category scope.
+TEMP responses and derived per-ECU maps remain local.
+
 ## Verification boundary
 
 This module is under integration, and leaf52 G2 remains open. Passing checks cover

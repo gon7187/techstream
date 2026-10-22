@@ -139,6 +139,26 @@ outer controller. Exact engine-owned CPUType changes feed parameter selection
 through validated metadata state. Unknown native export Booleans remain unknown;
 a result-state label cannot manufacture `native_return`.
 
+The controller's private CONTROL path can clone a stage only from an active,
+source-issued `NativeControlExportTarget2026`. Its export name determines the
+host operation; the recording has no stage override. Dispatch must consume the
+common layer's immutable receipt for that exact target/export, including its
+checked module, selectors, parameter-row provenance and loader preflight. This
+path retains the same engine, controller, runtime and chronological trace, and
+does not preselect a later row before the native helper asks for it.
+For primary prepare/write helpers, the staged runner records a returned Boolean
+only when the concrete family result exposes explicit `native_return` (or,
+when that key is absent, explicit Boolean `native_result.returned`). The active
+helper lease retains that source-derived value for typed callback unwinding.
+State labels, `native_success`, and getter identifier vectors never stand in for
+the helper's returned byte; retry/probe/IG-cycle exports do not replace it.
+For a CONTROL CID getter, each actual `StartGetCID` return records its distinct
+source-authenticated process out-byte through the common module/field whitelist
+before runtime validation or teardown. The getter's identifier vector remains
+separate; both the primary and alternate getter can update the helper's retained
+out-byte, while only the primary getter's C++ return supplies the CID vector.
+For the recovered SBR flash writer, CONTROL progress requests are emitted at the native callback sites: `notify_progress_count` observes the old count before its store, and `notify_progress_percent` observes the updated percentage. The replay adapter does not synthesize these requests from generic writer notifications. Source-captured requests are frozen into a chronological trace and replayed by a fresh ordinary strict `ProgrammingTrace`.
+
 Captured2026 exceptions use `cpass2026` for the signed native error enum, or
 `j2534_2026` with `code` for that enum and mandatory `detail` for the separate
 signed driver status. Reports retain bounded native codes and sanitized cleanup
@@ -315,12 +335,15 @@ writer failure (driver status24, CUW code7). Its Sonar DLL exports only
 `StartFlashWrite`; this fixture does not establish a native `PrepareRetry`
 execution or full retry-loop completion.
 
-The classic DH fixture separately invokes the original writer's retained
-`PrepareRetry`: the fresh strict trace contains 11 failed-writer events and 50
-retry events, with native returns `False` then `True`. Its authenticated source
-INI contains the four actual phase FileVersion strings and retry parameters.
-This establishes the native export boundary; the surrounding `3b90` query loop
-still requires its actual engine connection and captured user input.
+The classic DH raw-controller fixture now exercises a failed `4c10` writer,
+the real retry query/input path, and retained `PrepareRetry` in one Execute.
+Decision `1` runs the original DH flash writer and prepare writer; its fresh
+ordinary strict trace consumes all 97 SDK events, with the failed writer
+returning `False` and `PrepareRetry` returning `True`. The fixture first
+authors primitive responses from its bounded offline SDK provider, then
+replays the frozen rows from cursor zero; it is not a vehicle recording or a
+full phase-1 lifecycle proof. Caller-supplied DH `export` overrides remain
+rejected by the native DH binder.
 
 `alternate_parent2026()` exposes only the exact executed primary getter retained
 by `next_alternate_getter2026`. Engine continuation may use this sealed lineage
@@ -332,3 +355,19 @@ bytes for source-bound controller selection.
 The bound MMC prepare callback reads `engine.native_prepare_handshake` directly.
 An authored `preparation_state` provider result cannot replace the engine's
 actual callback-slot18 state.
+
+Before the native raw helper begins, `_bind_control_prelude2026` can retain the
+exact held CONTROL source, runtime and trace owners without selecting a module or
+issuing a raw token. This prelude bind grants no stage or export authority. The
+focused SBR integration test exercises one real `execute()` across prepare,
+an empty gateway phase and flash write with the actual recovered family bodies
+and one shared authored primitive recording; it asserts both source-returned
+Booleans and complete trace consumption. This remains a software replay, not a
+physical vehicle validation.
+CONTROL stage clones derive `current_cids` from the source-issued target's
+immutable identifier tuple, retaining order and duplicates; root observation JSON
+cannot override those imported identifiers. Before any raw token exists, the
+prelude bind verifies a supplied `Parameter.ini` against validated parser General
+state and compares supplied canonical frontend files against the engine-owned
+bundle when those same sources are present. It never binds frontend parameters
+late while the worker is active.

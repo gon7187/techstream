@@ -13,6 +13,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 from collections.abc import Callable, Mapping
 from functools import cache
 from pathlib import Path
@@ -30,7 +31,12 @@ from scripts.data_monitor import (
     selected_p4_connection,
     selected_p5_can_connection,
 )
-from scripts.drive_recorder import NativeMonitorPacket, NativeRecorderCapture
+from scripts.drive_recorder import (
+    NativeMonitorPacket,
+    NativeRecorderCapture,
+    NativeTriggerInfo,
+    NativeTriggerParameters,
+)
 from scripts.frame_transport import (
     DriverProperties,
     J2534Result,
@@ -698,6 +704,350 @@ class MonitorReplay:
         self.outputs: dict[str, bytes] = {}
         self.dm_bytes: bytes | None = None
         self.used = False
+        self._native_vehicle = None
+        self._native_selector_inputs: tuple[tuple[int, ...], str, int] | None = None
+        self._native_selection = None
+        self._native_systems: tuple[dict, ...] | None = None
+        self._native_bound_profile = None
+        self._native_bound_communication = None
+        self._native_vehicle_closed = False
+        self._native_vehicle_lock = threading.RLock()
+
+    @property
+    def native_vehicle_cleanup_pending(self) -> bool:
+        """Whether the retained native communication still needs release."""
+        with self._native_vehicle_lock:
+            session = self._native_vehicle
+            return bool(session is not None and session.communication._cleanup_pending)
+
+    def begin_native_vehicle(
+        self,
+        *,
+        info_ids: tuple[int, ...],
+        text_encoding: str,
+        division: int = 0,
+    ) -> None:
+        """Open the admitted18 manual selector on this replay's sole recording owner."""
+        from scripts.drive_recorder import NativeVehicleSession
+        from scripts.native_communication import NativeCommunication
+
+        with self._native_vehicle_lock:
+            self._check_sources()
+            if self.used or self._native_vehicle is not None:
+                raise ValueError("Native vehicle selection requires an unused replay")
+            ctx, rec = self.context, self.recording
+            if (
+                ctx["source_build"] != 18
+                or ctx["mode"] != "normal"
+                or ctx["device_kind"] != 8
+            ):
+                from scripts.drive_recorder import UnsupportedRecorderOperation
+
+                raise UnsupportedRecorderOperation(
+                    "Native vehicle selection is admitted only for source18 normal device8"
+                )
+            if not isinstance(info_ids, tuple) or type(division) is not int:
+                raise TypeError("Explicit native vehicle formatter inputs required")
+            if (
+                len(info_ids) > 100_000
+                or any(
+                    type(item) is not int or not 0 <= item <= 0xFFFF
+                    for item in info_ids
+                )
+                or not isinstance(text_encoding, str)
+                or not 0 <= division <= 0xFFFF
+            ):
+                raise ValueError("Invalid native vehicle formatter inputs")
+            catalog = self.profile.catalog
+            category_modules = self.profile.dll_records(0x48)
+            option_modules = self.profile.dll_records(0x7D)
+            if (
+                not category_modules
+                or category_modules[0][:80].decode("utf-16le").split("\0", 1)[0]
+                != "SelectCarCtgrMltOpt.dll"
+                or not option_modules
+                or option_modules[0][:80].decode("utf-16le").split("\0", 1)[0]
+                != "SelectCarTypVn10_DT.dll"
+            ):
+                from scripts.drive_recorder import UnsupportedRecorderOperation
+
+                raise UnsupportedRecorderOperation(
+                    "Selected ECU source does not admit native MULTI48/7D selection"
+                )
+            candidates = catalog.protocol_candidates(tuple(ctx["exception_ids"]))
+            if not candidates:
+                raise ValueError("Native vehicle selection has no protocol candidate")
+            candidate = candidates[0]
+            protocol_profile = catalog.build_protocol_profile(
+                candidate.category, exception_ids=tuple(ctx["exception_ids"])
+            )
+            request = protocol_profile._communication_frame(0)[0].request
+            communication = NativeCommunication.from_backend(
+                protocol_profile,
+                rec,
+                ctx["ecu"],
+                first_request=request,
+                driver=self.driver,
+                device_kind=ctx["device_kind"],
+                bus_id=candidate.variant,
+                source_build=ctx["source_build"],
+                diagnostic_mode=self.diagnostic_mode,
+                limits=self.limits,
+                cancelled=rec.cancelled,
+                clock=rec.clock,
+            )
+            session = None
+            try:
+                communication.begin_operation()
+                session = NativeVehicleSession(communication)
+                self._check_sources()
+            except BaseException as primary:
+                try:
+                    communication.close()
+                except BaseException as cleanup:  # noqa: BLE001 - preserve primary native failure
+                    primary.add_note(
+                        f"Native selection cleanup also failed: {type(cleanup).__name__}"
+                    )
+                if session is not None:
+                    session.dispose()
+                raise
+            self._native_vehicle = session
+            self._native_selector_inputs = (info_ids, text_encoding, division)
+
+    def _native_vehicle_selector(self):
+        from scripts.drive_recorder import NativeVehicleSelector
+
+        session = self._native_vehicle
+        inputs = self._native_selector_inputs
+        if session is None or inputs is None or self._native_vehicle_closed:
+            raise ValueError("Native vehicle selection is not open")
+        return NativeVehicleSelector(
+            session,
+            info_ids=inputs[0],
+            text_encoding=inputs[1],
+            division=inputs[2],
+        )
+
+    def native_categories(
+        self, selected_ids: tuple[tuple[int, int], ...], *, bus_judge: int
+    ):
+        with self._native_vehicle_lock:
+            self._check_sources()
+            if self._native_vehicle is None or self._native_vehicle_closed:
+                raise ValueError("Native vehicle selection is not open")
+            communication = self._native_vehicle.communication
+            communication.begin_operation()
+            try:
+                menu = self._native_vehicle_selector().select_multigroup_categories(
+                    selected_ids, bus_judge=bus_judge
+                )
+            except BaseException as primary:
+                try:
+                    self._check_sources()
+                except BaseException as cleanup:  # noqa: BLE001 - preserve primary native failure
+                    primary.add_note(
+                        f"Source check also failed: {type(cleanup).__name__}"
+                    )
+                raise
+            else:
+                self._check_sources()
+            return menu
+
+    def native_select(self):
+        with self._native_vehicle_lock:
+            self._check_sources()
+            self._require_native_selection_unbound()
+            session = self._native_vehicle
+            assert session is not None
+            session.communication.begin_operation()
+            try:
+                selection = self._native_vehicle_selector().select()
+            except BaseException as primary:
+                try:
+                    self._check_sources()
+                except BaseException as cleanup:  # noqa: BLE001 - preserve primary native failure
+                    primary.add_note(
+                        f"Source check also failed: {type(cleanup).__name__}"
+                    )
+                raise
+            self._accept_native_selection(selection)
+            self._check_sources()
+            return selection
+
+    def native_answer(self, index: int, select_id: int):
+        with self._native_vehicle_lock:
+            if type(index) is not int or not 0 <= index <= 0xFFFF:
+                raise ValueError("Native option index must be a WORD")
+            if type(select_id) is not int or not 0 <= select_id <= 0xFFFF:
+                raise ValueError("Native option select ID must be a WORD")
+            if index == 0:
+                return self.native_select()
+            self._check_sources()
+            self._require_native_selection_unbound()
+            session = self._native_vehicle
+            assert session is not None
+            session.communication.begin_operation()
+            try:
+                selection = self._native_vehicle_selector().answer(index, select_id)
+            except BaseException as primary:
+                try:
+                    self._check_sources()
+                except BaseException as cleanup:  # noqa: BLE001 - preserve primary native failure
+                    primary.add_note(
+                        f"Source check also failed: {type(cleanup).__name__}"
+                    )
+                raise
+            self._accept_native_selection(selection)
+            self._check_sources()
+            return selection
+
+    def _require_native_selection_unbound(self) -> None:
+        if self._native_vehicle is None or self._native_vehicle_closed:
+            raise ValueError("Native vehicle selection is not open")
+        if self._native_bound_profile is not None:
+            raise ValueError("Native ECU is already bound")
+
+    def _accept_native_selection(self, selection) -> None:
+        from scripts.drive_recorder import NativeVehicleSelection
+
+        if not isinstance(selection, NativeVehicleSelection):
+            raise TypeError("Native selector returned an invalid selection")
+        self._native_selection = selection
+        self._native_systems = None
+
+    def native_vehicle_systems(self) -> tuple[dict, ...]:
+        with self._native_vehicle_lock:
+            if self._native_vehicle_closed:
+                raise ValueError("Native vehicle selection is not open")
+            self._check_sources()
+            selection = self._native_selection
+            if selection is None:
+                raise ValueError("Native terminal vehicle selection is required")
+            model = selection.trailing_words[1]
+            if model in (0, 0xFFFF):
+                raise ValueError("Native selection has no terminal vehicle model")
+            if self._native_systems is None:
+                self._native_systems = self.profile.catalog.vehicle_systems(
+                    model, tuple(self.context["exception_ids"])
+                )
+            self._check_sources()
+            return self._native_systems
+
+    def bind_native_vehicle_system(self, category: int) -> None:
+        from scripts.data_monitor import SelectedMonitorSession
+
+        with self._native_vehicle_lock:
+            if self._native_vehicle is None or self._native_vehicle_closed:
+                raise ValueError("Native vehicle selection is not open")
+            self._check_sources()
+            if self._native_bound_profile is not None:
+                raise ValueError("Native ECU is already bound")
+            selection = self._native_selection
+            if selection is None:
+                raise ValueError("Native terminal vehicle selection is required")
+            model = selection.trailing_words[1]
+            if model in (0, 0xFFFF):
+                raise ValueError("Native selection has no terminal vehicle model")
+            systems = self.native_vehicle_systems()
+            if type(category) is not int or not any(
+                row["category"] == category for row in systems
+            ):
+                raise ValueError("Selected ECU is not associated with this vehicle")
+            if category != self.context["category"]:
+                raise ValueError("Recording source is pinned to a different ECU")
+            if (
+                self.context["vehicle_name_key"] is not None
+                and self.context["vehicle_name_key"] != model
+            ):
+                raise ValueError("Recording source is pinned to a different vehicle")
+            profile = self.profile.catalog.build_profile(
+                category,
+                vehicle_name_key=model,
+                exception_ids=tuple(self.context["exception_ids"]),
+            )
+            from scripts.native_communication import (
+                NativeCommunication,
+                NativeFrameController,
+            )
+
+            native_session = self._native_vehicle
+            assert native_session is not None
+            owner = native_session.communication
+            if type(owner) is not NativeCommunication:
+                raise TypeError("Native vehicle owner is not a concrete communication")
+            first_request = _hex(self.context["initial_request_hex"], max_bytes=65535)
+            bound = owner.bind_selected_vehicle(
+                native_session,
+                selection,
+                profile,
+                self.context["ecu"],
+                bus_id=self.context["bus_id"],
+                first_request=first_request,
+            )
+            if not isinstance(bound.operations, NativeFrameController):
+                raise TypeError("Selected owner lost its retained frame controller")
+            bound.begin_operation(limits=self.limits)
+            status = bound.operations.change_context(
+                profile,
+                bus_id=self.context["bus_id"],
+                first_request=first_request,
+                request=None,
+                deadline=bound.deadline,
+                diagnostic_mode=self.diagnostic_mode,
+            )
+            if status:
+                raise MonitorError("Native selected ECU context switch failed", status)
+            self._check_sources()
+            self._native_bound_communication = bound
+            self._native_bound_profile = profile
+            self.profile = profile
+            self.monitor_session = SelectedMonitorSession(
+                profile, source_build=self.context["source_build"]
+            )
+            self._check_sources()
+
+    def close_native_vehicle(self) -> int:
+        with self._native_vehicle_lock:
+            session = self._native_vehicle
+            if session is None:
+                return 0
+            communication = session.communication
+            if self._native_vehicle_closed and not communication._cleanup_pending:
+                return 0
+            self._native_vehicle_closed = True
+            source_failure = None
+            try:
+                self._check_sources()
+            except BaseException as error:  # noqa: BLE001 - close owner despite changed source
+                source_failure = error
+            try:
+                status = communication.close()
+            except BaseException as primary:
+                if source_failure is not None:
+                    primary.add_note(
+                        f"Pre-close source check also failed: {type(source_failure).__name__}"
+                    )
+                try:
+                    self._check_sources()
+                except BaseException as cleanup:  # noqa: BLE001 - preserve primary native failure
+                    primary.add_note(
+                        f"Source check also failed: {type(cleanup).__name__}"
+                    )
+                raise
+            finally:
+                session.dispose()
+            try:
+                self._check_sources()
+            except BaseException as cleanup:  # noqa: BLE001 - preserve source failure
+                if source_failure is None:
+                    source_failure = cleanup
+                else:
+                    source_failure.add_note(
+                        f"Post-close source check also failed: {type(cleanup).__name__}"
+                    )
+            if source_failure is not None:
+                raise source_failure
+            return status
 
     def _operations(self, variant=None) -> NativeFrameOperations:
         ctx, rec = self.context, self.recording
@@ -726,9 +1076,62 @@ class MonitorReplay:
             wait=rec.wait,
         )
 
-    def run(self) -> dict:
+    def run(
+        self,
+        *,
+        trigger: NativeTriggerInfo | None = None,
+        parameters: NativeTriggerParameters | None = None,
+    ) -> dict:
         if self.used:
             raise ValueError("Monitor recording session is single-use")
+        try:
+            return self._run_once(trigger=trigger, parameters=parameters)
+        except BaseException as primary:
+            if self.used and self._native_vehicle is not None:
+                try:
+                    self.close_native_vehicle()
+                except BaseException as cleanup:  # noqa: BLE001 - retain primary run failure
+                    primary.add_note(
+                        f"Native vehicle cleanup failed: {type(cleanup).__name__}"
+                    )
+            raise
+
+    def _run_once(
+        self,
+        *,
+        trigger: NativeTriggerInfo | None,
+        parameters: NativeTriggerParameters | None,
+    ) -> dict:
+        from scripts.drive_recorder import NativeTriggerInfo, NativeTriggerParameters
+
+        if self.used:
+            raise ValueError("Monitor recording session is single-use")
+        native = self._native_vehicle is not None
+        if native and self._native_vehicle_closed:
+            raise ValueError("Native vehicle owner is closed")
+        native_communication = self._native_bound_communication
+        native_selection = self._native_selection
+        if native:
+            if (
+                self._native_selection is None
+                or self._native_bound_profile is None
+                or self._native_bound_communication is None
+                or not isinstance(trigger, NativeTriggerInfo)
+                or not isinstance(parameters, NativeTriggerParameters)
+            ):
+                raise ValueError(
+                    "Native monitor run requires terminal selection, ECU binding and typed trigger inputs"
+                )
+            if trigger.trigger_type == 7:
+                from scripts.drive_recorder import UnsupportedRecorderOperation
+
+                raise UnsupportedRecorderOperation(
+                    "Native trigger type7 requires source-backed Check Mode/session groups"
+                )
+            self._native_bound_communication._check()
+            assert native_communication is not None
+            assert native_selection is not None
+            self._check_sources()
         self.used = True
         self._check_sources()
         ctx, rec, profile = self.context, self.recording, self.profile
@@ -756,17 +1159,21 @@ class MonitorReplay:
                 controller_category_flags=ctx["controller_flags"],
             )
         )
-        cache = MonitorSupportCache(
-            profile,
-            rec.exchange,
-            ctx["ecu"],
-            source_build=ctx["source_build"],
-            stream=rec,
-            bus_id=ctx["bus_id"],
-            limits=self.limits,
-            clock=rec.clock,
-            cancelled=rec.cancelled,
-        )
+        if native:
+            assert native_communication is not None
+            cache = native_communication.cache
+        else:
+            cache = MonitorSupportCache(
+                profile,
+                rec.exchange,
+                ctx["ecu"],
+                source_build=ctx["source_build"],
+                stream=rec,
+                bus_id=ctx["bus_id"],
+                limits=self.limits,
+                clock=rec.clock,
+                cancelled=rec.cancelled,
+            )
         selection = _fields(
             ctx["selection"],
             {
@@ -803,7 +1210,16 @@ class MonitorReplay:
             plan, (SelectedP4Monitor, SelectedP5Monitor, SelectedPacketA8Monitor)
         ):
             raise TypeError("Normal recording selected a variable provider")
-        operations = self._operations()
+        if native:
+            assert native_communication is not None
+            from scripts.native_communication import NativeFrameController
+
+            controller = native_communication.operations
+            if not isinstance(controller, NativeFrameController):
+                raise TypeError("Selected owner lost its retained frame controller")
+            operations = controller.operations
+        else:
+            operations = self._operations()
         oscillator = None
         if ctx["oscilloscope"] is not None:
             from scripts.monitor_poll import NormalOscilloscopeSelection
@@ -912,9 +1328,26 @@ class MonitorReplay:
                 clock=rec.clock,
                 ticks=rec.ticks,
                 cancelled=rec.cancelled,
+                communication=self._native_bound_communication if native else None,
             )
-            capture = worker.run(ctx["packet_count"])
-        rec.assert_complete()
+            try:
+                capture = worker.run(ctx["packet_count"])
+            except BaseException as primary:
+                if native:
+                    try:
+                        self.close_native_vehicle()
+                    except BaseException as cleanup:  # noqa: BLE001 - preserve primary worker failure
+                        primary.add_note(
+                            f"Native vehicle owner cleanup failed: {type(cleanup).__name__}"
+                        )
+                raise
+        native_close_status = None
+        if native:
+            native_close_status = self.close_native_vehicle()
+            if native_close_status:
+                raise MonitorError(
+                    "Native vehicle owner close failed", native_close_status
+                )
         metadata = _fields(
             ctx["metadata"],
             {
@@ -961,6 +1394,51 @@ class MonitorReplay:
             raise ValueError("Native monitor DM reparse failed")
         self._check_sources()
         outputs = {"monitor": raw}
+        formats = {"monitor": "dm"}
+        if native:
+            from scripts.drive_recorder import (
+                DrsFile,
+                NativeDmciCommand,
+                build_native_drs,
+                decode_command,
+            )
+
+            assert native_selection is not None
+            assert isinstance(trigger, NativeTriggerInfo)
+            assert isinstance(parameters, NativeTriggerParameters)
+            setup = tuple(
+                NativeDmciCommand.from_neutral(command.command_id, command.values)
+                for command in (*plan.commands.setup, *plan.commands.start)
+            )
+            stop = tuple(
+                NativeDmciCommand.from_neutral(command.command_id, command.values)
+                for command in plan.commands.stop
+            )
+            system = decode_system_information(_hex(metadata["system_information_hex"]))
+            drs = build_native_drs(
+                native_selection,
+                system,
+                settings,
+                trigger,
+                parameters,
+                setup=setup,
+                stop=stop,
+            )
+            drs_raw = drs.encode()
+            reparsed = DrsFile.parse(drs_raw)
+            if reparsed.encode() != drs_raw:
+                raise ValueError("Native vehicle DRS reparse failed")
+            decoded_selection = decode_command(reparsed.tables[0])["selection"]
+            if decoded_selection != self._native_selection:
+                raise ValueError("Native DRS selection differs from terminal selection")
+            decoded_monitor = decode_command(reparsed.tables[4])["monitor"]
+            if decoded_monitor != settings:
+                raise ValueError(
+                    "Native DRS monitor differs from selected monitor plan"
+                )
+            outputs["recording"] = drs_raw
+            formats["recording"] = "drs"
+        rec.assert_complete()
         report = {
             "workflow": "monitor_replay",
             "source": rec.source,
@@ -990,6 +1468,15 @@ class MonitorReplay:
                 "playback": report["result"]["playback"],
             }
         ]
+        if native:
+            report["result"]["outputs"].append(
+                {
+                    "id": "recording",
+                    "format": "drs",
+                    "category": self.profile.category,
+                    "native_drs_hex": outputs["recording"].hex(),
+                }
+            )
         if oscillator is not None:
             from scripts.monitor_instruments import selected_instrument_monitor
             from scripts.monitor_j2534 import DirectJ2534Worker
@@ -1048,6 +1535,7 @@ class MonitorReplay:
                 }
             )
         self.dm_bytes, self.outputs = raw, outputs
+        self.output_formats = formats
         return report
 
     def _run_variable(self) -> dict:

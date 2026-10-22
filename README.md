@@ -10,7 +10,7 @@ An independent native Linux diagnostic workbench for Toyota/Lexus research, writ
 
 ## Development checkpoint — 22 October 2026
 
-The no-car port is **work in progress**. [PR #1](https://github.com/gon7187/techstream/pull/1) records the reviewed incremental checkpoint and integration status. Implemented components, independently checked cases, known failures and missing integrations are documented separately; the final software gate remains open.
+The no-car port is **work in progress**. Reviewed increments are integrated into [main](https://github.com/gon7187/techstream/tree/main). The development handoff below records the current scope, measured checks, known failures and missing integrations; the final software gate remains open.
 
 - [Current status, known defects and ordered roadmap](docs/development-handoff.md)
 - [Roadmap: implemented, missing and next](docs/ROADMAP.md)

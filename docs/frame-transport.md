@@ -151,7 +151,11 @@ lifecycle remain in this class.
 
 `apply_temporary_config`/`restore_temporary_config` implement the separate native
 CAN config0x23 save/override/restore methods. They are explicit operations, since
-the native send helper does not call them unconditionally. `NativeSharedState`
+the native send helper does not call them unconditionally. Their enable/value
+state is captured only when native device8 setup loads its CAN metadata, survives
+lower close, and resets with a new native object generation. This keeps a cold
+constructor from issuing GET_CONFIG while allowing an initialized retained object
+to use its native closed handle0 for save/override/restore. `NativeSharedState`
 retains observed shared CanMaskJudge result and connection blocking state; `None`
 means the native shared item is unavailable. `set_runtime_flags` exposes the
 observed zero-write-timeout, timestamp-unwrapping and pending-window flags.

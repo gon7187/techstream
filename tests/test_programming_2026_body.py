@@ -140,6 +140,7 @@ def writer_selection(
     body_flags=None,
     target_count=1,
     gateway_startup=False,
+    distinct_images=False,
 ):
     from scripts.calibration_2026 import (
         native2026_metadata,
@@ -172,7 +173,8 @@ def writer_selection(
         )
     # Native .bin archives retain the encoded ZV frame, without decompression.
     image = b"ZV\0" + (1019).to_bytes(2, "big") + bytes(1019)
-    raw = cuw(text, (image.hex().upper().encode(),) * 2)
+    images = (image, image[:-1] + b"\x01") if distinct_images else (image, image)
+    raw = cuw(text, tuple(value.hex().upper().encode() for value in images))
     container = parse_cuw_2026(raw)
     catalogs = {}
     for cpu, address in (
@@ -1395,6 +1397,11 @@ class Body2026Tests(unittest.TestCase):
         receive_cids=False,
         after_write_session=None,
         cid_target_index=0,
+        full_raw=False,
+        raw_capture=None,
+        primitive_rows=None,
+        frozen_rows=None,
+        distinct_images=False,
     ):
         if issue_worker:
             receive_cids = True
@@ -1439,6 +1446,7 @@ class Body2026Tests(unittest.TestCase):
             first_cpu_endian=first_cpu_endian,
             body_flags=body_flags,
             target_count=target_count,
+            distinct_images=distinct_images,
         )
         if module == SONAR_WRITE:
             binder, runner = bind_sonar_write_context, run_sonar_write
@@ -1479,6 +1487,8 @@ class Body2026Tests(unittest.TestCase):
         ):
             replies[2:2] = [b"\x3c", b"\x3c"]
             replies[-1:-1] = [b"\x3c", b"\x3c", b"\0", b"\x3c"]
+        if full_raw and cpu_index == 0:
+            replies *= 2
         if initialize_prepare:
             replies[:0] = [
                 bytes.fromhex("6761010203040506"),
@@ -1532,11 +1542,19 @@ class Body2026Tests(unittest.TestCase):
                             return injected
                     name = operation["operation"]
                     if name in (
+                        "create_mutex",
+                        "load_library",
+                        "get_symbol",
+                        "passthru_load_library",
                         "passthru_open",
                         "passthru_connect",
                         "passthru_start_filter",
                     ):
                         return PrimitiveResult(value=17)
+                    if name == "wait_handle":
+                        return PrimitiveResult(value=0)
+                    if name == "passthru_read_version":
+                        return PrimitiveResult(value=("1", "1", "1"))
                     if name == "passthru_write":
                         message = operation["messages"][0]
                         echoes.append(NativeMessage(6, message.data[:4], rx_status=9))
@@ -1553,12 +1571,13 @@ class Body2026Tests(unittest.TestCase):
                         return PrimitiveResult(value=(message,))
                     return PrimitiveResult()
 
-                device = J2534Device2026(
-                    driver, background_workers=False, clock=lambda: 0
-                )
-                device.open()
-                if not receive_cids:
-                    device.connect(6)
+                if not issue_worker:
+                    device = J2534Device2026(
+                        driver, background_workers=False, clock=lambda: 0
+                    )
+                    device.open()
+                    if not receive_cids:
+                        device.connect(6)
 
             def action(event, remaining):
                 nonlocal response_address
@@ -1606,17 +1625,6 @@ class Body2026Tests(unittest.TestCase):
                     load_programming_replay,
                 )
 
-                class Capture(ProgrammingTrace):
-                    def consume(self, kind, request, remaining=None):
-                        if kind != "action":
-                            raise AssertionError(
-                                "Native preparation must use primitive actions"
-                            )
-                        self.position += 1
-                        return action(
-                            request, remaining if remaining is not None else 60
-                        )
-
                 catalogs = dict(selection.catalog_sources)
                 modules = {
                     name: Path("runtime/no-car-21/recovered", name).read_bytes()
@@ -1626,6 +1634,7 @@ class Body2026Tests(unittest.TestCase):
                         "CUW.dll",
                         "TCUWControlCommPhase.dll",
                         "TCUWCanCIDGetter.dll",
+                        "TCUWJ2534DeviceIF.dll",
                     )
                 }
                 document = {
@@ -1640,26 +1649,133 @@ class Body2026Tests(unittest.TestCase):
                         "system_time": [2026, 10, 2, 20, 1, 2, 3, 4],
                         "timeout_seconds": 300,
                         "cid_mode": 2,
-                        "host": {"cpu_index": 0 if receive_cids else cpu_index},
+                        "host": {
+                            "cpu_index": 0 if receive_cids else cpu_index,
+                            **(
+                                {"driver_recording": "j2534_2026"}
+                                if issue_worker
+                                else {}
+                            ),
+                        },
                     },
                     "events": [],
                 }
                 prepare_session = load_programming_replay(
                     raw, json.dumps(document).encode(), catalogs, modules
                 )
-                prepare_session.trace = Capture(())
-                trace = prepare_session.trace
+                from types import MethodType
+
+                trace = (
+                    ProgrammingTrace.validate(list(frozen_rows))
+                    if frozen_rows is not None
+                    else ProgrammingTrace(())
+                )
                 trace.cancelled = lambda: (
                     cancel_after is not None and len(events) > cancel_after
                 )
+
+                def driver_value(value):
+                    if type(value) is NativeMessage:
+                        return {"_native_type": "PASSTHRU_MSG_2026", **vars(value)}
+                    if type(value) is tuple:
+                        return tuple(driver_value(item) for item in value)
+                    return value
+
+                def typed_value(value):
+                    if value is None:
+                        return {"type": "none", "value": None}
+                    if type(value) is bytes:
+                        return {"type": "bytes", "value": value.hex()}
+                    if type(value) in (bool, int, str):
+                        return {
+                            "type": {bool: "bool", int: "int", str: "text"}[
+                                type(value)
+                            ],
+                            "value": value,
+                        }
+                    if type(value) is tuple:
+                        return {
+                            "type": "tuple",
+                            "value": [typed_value(item) for item in value],
+                        }
+                    if type(value) is dict:
+                        return {
+                            "type": "mapping",
+                            "value": {
+                                key: typed_value(item) for key, item in value.items()
+                            },
+                        }
+                    raise TypeError("Authored primitive value must be explicitly typed")
+
+                def remember(request, value):
+                    from scripts.programming_replay import _native_request
+
+                    if primitive_rows is not None:
+                        primitive_rows.append(
+                            {
+                                "kind": "action",
+                                "request": _native_request(request),
+                                "result": typed_value(value),
+                                "elapsed_ms": request.get("milliseconds", 0)
+                                if request["operation"] == "wait"
+                                else 0,
+                            }
+                        )
+                    return value
+
+                def consume(_trace, kind, request, remaining=None):
+                    if kind != "action":
+                        raise AssertionError("Native body uses primitive actions")
+                    _trace.position += 1
+                    name = request["operation"]
+                    value = None
+                    if name.startswith("get_local_"):
+                        events.append(request)
+                        if fault is not None:
+                            fault(request)
+                        value = 0
+                    elif name == "set_communication_log_mode":
+                        value = 0
+                    elif name == "get_timeout":
+                        value = 999
+                    elif name == "get_send_timeout":
+                        value = 200
+                    return remember(request, value)
+
+                def driver_primitive(_trace, event, remaining):
+                    _trace.position += 1
+                    reply = driver(event, remaining)
+                    remember(
+                        event,
+                        {"status": reply.status, "value": driver_value(reply.value)},
+                    )
+                    return reply
+
+                if frozen_rows is None:
+                    trace.consume = MethodType(consume, trace)
+                    trace.driver_primitive = MethodType(driver_primitive, trace)
+                prepare_session.trace = trace
                 rt = NativeRuntime2026(
                     trace.action,
-                    cleanup_action=cleanup,
                     clock=trace.clock,
                     cancelled=trace.cancelled,
                     local_seconds_of_day=trace.native_local_seconds_of_day,
                     local_milliseconds_of_day=trace.native_local_milliseconds_of_day,
                 )
+                if issue_worker:
+                    from scripts.j2534_2026 import DriverMetadata2026
+
+                    prepare_session.bind_runtime2026(rt)
+                    pair = trace.interface_pair
+                    assert pair is not None
+                    for view in (pair.engine, pair.control):
+                        view.set_current_driver(
+                            DriverMetadata2026("Authored", "authored.dll")
+                        )
+                    engine.bind_interface_pair(pair)
+                    device = pair.control
+                    if not receive_cids:
+                        pair.engine.open()
             else:
                 rt = NativeRuntime2026(
                     action,
@@ -1682,74 +1798,192 @@ class Body2026Tests(unittest.TestCase):
                     rt,
                 )
                 engine.bind_worker(controller)
-            try:
-                if receive_cids:
-                    assert prepare_session is not None
-                    prepare_session.bind_controller2026(controller)
-                    prepare_session.bind_engine2026(engine)
-                    getter_session = prepare_session.next_session2026(
-                        "get_cid",
-                        node=engine.native_metadata.node,
-                        cpu_index=engine.native_metadata.cpu_index,
+            from contextlib import ExitStack
+            from unittest.mock import patch
+
+            from scripts.programming_replay import (
+                ProgrammingReplay,
+                load_programming_replay,
+            )
+
+            with ExitStack() as observers:
+                if initialize_prepare:
+                    original_action = ProgrammingTrace.action
+                    original_cleanup = ProgrammingTrace.cleanup_primitive
+
+                    def observed(original, traced, event, remaining):
+                        nonlocal response_address
+                        if traced is trace:
+                            events.append(event)
+                            if fault is not None:
+                                fault(event)
+                            if event["operation"] == "read_specified_can_message":
+                                response_address = event["address"]
+                                if event.get("frame") == 1:
+                                    echoes.append(
+                                        NativeMessage(6, event["address"], rx_status=2)
+                                    )
+                        return original(traced, event, remaining)
+
+                    observers.enter_context(
+                        patch.object(
+                            ProgrammingTrace,
+                            "action",
+                            lambda traced, event, remaining: observed(
+                                original_action, traced, event, remaining
+                            ),
+                        )
                     )
-                    with engine.controller_execution(controller, 0):
-                        received = controller.receive_cids(engine, getter_session)
-                    self.assertEqual(received["cids"], actual_cids)
-                    self.assertEqual(engine.received_identifiers, actual_cids)
-                    engine.select_target(1, cpu_index, controller=controller)
-                    prepare_session = getter_session.next_session2026(
-                        "prepare",
-                        node=engine.native_metadata.node,
-                        cpu_index=engine.native_metadata.cpu_index,
+                    observers.enter_context(
+                        patch.object(
+                            ProgrammingTrace,
+                            "cleanup_primitive",
+                            lambda traced, event, remaining: observed(
+                                original_cleanup, traced, event, remaining
+                            ),
+                        )
                     )
+                    # Rebind only the observer methods before any runtime action.
+                    rt.action = trace.action
+                    rt.cleanup_action = trace.cleanup_primitive
+
+                def root_session(operation):
+                    document["operation"] = operation
+                    document["observations"]["host"]["cpu_index"] = (
+                        engine.native_metadata.cpu_index
+                    )
+                    following = load_programming_replay(
+                        raw, json.dumps(document).encode(), catalogs, modules
+                    )
+                    following.trace = trace
+                    following.bind_runtime2026(rt)
+                    return following
+
+                try:
+                    if receive_cids:
+                        getter_session = root_session("get_cid")
+                        with engine.controller_execution(controller, 0):
+                            held = controller.native_control_context2026(engine)
+                            received = controller.execute(engine, getter_session)
+                            engine.worker.import_control_getter_return2026(held)
+                            self.assertTrue(engine.worker.mark_cid_reception_complete())
+                        self.assertEqual(received["identifiers"], actual_cids)
+                        self.assertEqual(engine.received_identifiers, actual_cids)
+                        engine.select_target(1, cpu_index, controller=controller)
+                        prepare_session = root_session("prepare")
+                        if device is not None:
+                            wire = engine.engine_runtime_device()
+                            if not wire.opened:
+                                wire.open()
+                            if not wire.connecting:
+                                wire.connect(6)
+                    if full_raw:
+                        stages = []
+                        run_bound = ProgrammingReplay.run_bound2026
+
+                        def record_stage(stage, runtime):
+                            report = run_bound(stage, runtime)
+                            stages.append((stage._control_export2026, stage, report))
+                            return report
+
+                        with (
+                            patch.object(
+                                ProgrammingReplay, "run_bound2026", record_stage
+                            ),
+                            engine.controller_execution(controller, 1),
+                        ):
+                            pair = engine.interface_pair
+                            assert pair is not None
+                            with patch.object(
+                                pair, "import_into", wraps=pair.import_into
+                            ) as transfers:
+                                raw_result = controller.execute(engine, prepare_session)
+                            self.assertEqual(
+                                [call.args[0] for call in transfers.call_args_list],
+                                [pair.control],
+                            )
+                            self.assertTrue(
+                                raw_result["native_return"], repr(raw_result)
+                            )
+                            self.assertEqual(raw_result["native_phase"], 1)
+                            self.assertIsNotNone(raw_result["control_snapshot"])
+                            self.assertEqual(
+                                [export for export, _, _ in stages],
+                                ["StartPrepareWrite"]
+                                + ["StartFlashWrite"] * (2 - cpu_index),
+                            )
+                            self.assertTrue(
+                                all(
+                                    stage._runtime2026 is rt and stage.trace is trace
+                                    for _, stage, _ in stages
+                                )
+                            )
+                            writes = [
+                                report
+                                for export, _stage, report in stages
+                                if export == "StartFlashWrite"
+                            ]
+                            self.assertTrue(writes, repr(raw_result))
+                            result = writes[-1]
+                            if raw_capture is not None:
+                                raw_capture(raw_result, stages, engine)
+                    else:
+                        if prepare_session is not None:
+                            prepare_session.bind_controller2026(controller)
+                            with engine.controller_execution(controller, 1):
+                                controller._begin_execute_pair(engine)
+                                prepare_session.bind_engine2026(engine)
+                                prepared = prepare_session.run_bound2026(rt)
+                            self.assertTrue(prepared["native_return"], repr(prepared))
+                        if factory_export:
+                            assert prepare_session is not None
+                            write_session = prepare_session.next_session2026(
+                                "write",
+                                node=engine.native_metadata.node,
+                                cpu_index=engine.native_metadata.cpu_index,
+                            )
+                            with engine.controller_execution(controller, 2):
+                                result = write_session.run_bound2026(rt)
+                            if after_write_session is not None:
+                                after_write_session(write_session, engine)
+                        else:
+                            if public_export and issue_worker:
+                                metadata = engine.native_metadata
+                                live_selection = bind_native_parameter2026(
+                                    metadata.source_container,
+                                    dict(selection.catalog_sources),
+                                    "write",
+                                    node=metadata.node,
+                                    cpu_index=metadata.cpu_index,
+                                    encoded=selection.encoded,
+                                    metadata_state=metadata,
+                                )
+                                context = binder(
+                                    metadata.source_container,
+                                    metadata.node,
+                                    (),
+                                    live_selection,
+                                    identity(module),
+                                    {},
+                                    observations or {},
+                                )
+                                if context_mutate is not None:
+                                    context = context_mutate(context)
+                            if issue_worker:
+                                with engine.controller_execution(controller, 2):
+                                    result = runner(context, rt, engine=engine)
+                            else:
+                                result = runner(context, rt, engine=engine)
+                    if capture_state is not None:
+                        capture_state(engine)
+                finally:
+                    if on_unwind is not None:
+                        on_unwind(engine)
+                    self.assertEqual(rt.close(), [])
                     if device is not None:
-                        device.open()
-                        device.connect(6)
-                if prepare_session is not None:
-                    prepared = controller.run_bound_export(engine, prepare_session)
-                    self.assertTrue(prepared["native_return"], repr(prepared))
-                if factory_export:
-                    assert prepare_session is not None
-                    write_session = prepare_session.next_session2026(
-                        "write",
-                        node=engine.native_metadata.node,
-                        cpu_index=engine.native_metadata.cpu_index,
-                    )
-                    result = controller.run_bound_export(engine, write_session)
-                    if after_write_session is not None:
-                        after_write_session(write_session, engine)
-                else:
-                    if public_export and issue_worker:
-                        metadata = engine.native_metadata
-                        live_selection = bind_native_parameter2026(
-                            metadata.source_container,
-                            dict(selection.catalog_sources),
-                            "write",
-                            node=metadata.node,
-                            cpu_index=metadata.cpu_index,
-                            encoded=selection.encoded,
-                            metadata_state=metadata,
-                        )
-                        context = binder(
-                            metadata.source_container,
-                            metadata.node,
-                            (),
-                            live_selection,
-                            identity(module),
-                            {},
-                            observations or {},
-                        )
-                        if context_mutate is not None:
-                            context = context_mutate(context)
-                    result = runner(context, rt, engine=engine)
-                if capture_state is not None:
-                    capture_state(engine)
-            finally:
-                if on_unwind is not None:
-                    on_unwind(engine)
-                self.assertEqual(rt.close(), [])
-                if device is not None:
-                    device.disconnect()
+                        device.disconnect()
+            if frozen_rows is not None:
+                self.assertEqual(trace.position, len(trace.rows))
             return result, events, replies, driver_events
 
     def test_nine_writers_use_normal_source_factory_and_actual_phase2(self):
@@ -1757,6 +1991,7 @@ class Body2026Tests(unittest.TestCase):
 
         for module in _WRITER_MODULES:
             with self.subTest(module=module):
+                rows = []
                 result, _, replies, _ = self._sonar_control(
                     module=module,
                     typed=True,
@@ -1764,8 +1999,22 @@ class Body2026Tests(unittest.TestCase):
                     issue_worker=True,
                     initialize_prepare=True,
                     factory_export=True,
+                    full_raw=True,
                     target_count=2,
+                    primitive_rows=rows,
                 )
+                replayed = self._sonar_control(
+                    module=module,
+                    typed=True,
+                    public_export=True,
+                    issue_worker=True,
+                    initialize_prepare=True,
+                    factory_export=True,
+                    full_raw=True,
+                    target_count=2,
+                    frozen_rows=tuple(rows),
+                )[0]
+                self.assertEqual(result, replayed)
                 self.assertTrue(result["native_return"], repr(result))
                 self.assertEqual(result["state"], "writer_completed")
                 self.assertFalse(result["programming_completed"])
@@ -1779,6 +2028,7 @@ class Body2026Tests(unittest.TestCase):
 
         for module in _WRITER_MODULES:
             with self.subTest(module=module):
+                rows = []
                 result, events, replies, _ = self._sonar_control(
                     module=module,
                     typed=True,
@@ -1786,8 +2036,22 @@ class Body2026Tests(unittest.TestCase):
                     issue_worker=True,
                     initialize_prepare=True,
                     factory_export=True,
+                    full_raw=True,
                     receive_cids=True,
+                    primitive_rows=rows,
                 )
+                replayed = self._sonar_control(
+                    module=module,
+                    typed=True,
+                    public_export=True,
+                    issue_worker=True,
+                    initialize_prepare=True,
+                    factory_export=True,
+                    full_raw=True,
+                    receive_cids=True,
+                    frozen_rows=tuple(rows),
+                )[0]
+                self.assertEqual(result, replayed)
                 self.assertTrue(result["native_return"], repr(result))
                 self.assertEqual(result["state"], "writer_completed")
                 self.assertFalse(result["programming_completed"])
@@ -1806,7 +2070,59 @@ class Body2026Tests(unittest.TestCase):
                     - operations[::-1].index("start_flow_control_filter"),
                 )
 
+    def test_raw_body_two_cpu_chain_writes_each_source_once(self):
+        for module in (SONAR_WRITE, "TCUWP4CanBodyFlashWriter.dll"):
+            rows = []
+            reports = []
+
+            def capture(raw_result, stages, engine, reports=reports):
+                self.assertTrue(raw_result["native_return"], repr(raw_result))
+                self.assertEqual(
+                    [export for export, _, _ in stages],
+                    ["StartPrepareWrite", "StartFlashWrite", "StartFlashWrite"],
+                )
+                writes = [
+                    (stage._executed_selection2026.metadata.cpu_index, report)
+                    for export, stage, report in stages
+                    if export == "StartFlashWrite"
+                ]
+                self.assertEqual([cpu for cpu, _ in writes], [0, 1])
+                self.assertTrue(all(report["native_return"] for _, report in writes))
+                self.assertIsNotNone(raw_result["control_snapshot"])
+                reports.append(tuple(report for _, report in writes))
+
+            options = {
+                "module": module,
+                "typed": True,
+                "public_export": True,
+                "issue_worker": True,
+                "full_raw": True,
+                "cpu_index": 0,
+                "distinct_images": True,
+                "raw_capture": capture,
+            }
+            with self.subTest(module=module, pass_kind="capture"):
+                _, _, replies, driver_events = self._sonar_control(
+                    **options, primitive_rows=rows
+                )
+                self.assertEqual(replies, [])
+                image = b"ZV\0" + (1019).to_bytes(2, "big") + bytes(1019)
+                writes = [
+                    event["messages"][0].data
+                    for event in driver_events
+                    if event["operation"] == "passthru_write"
+                ]
+                # Distinct source archives must each be downloaded exactly once.
+                self.assertEqual(writes.count(bytes.fromhex("00000100") + image), 1)
+                self.assertEqual(
+                    writes.count(bytes.fromhex("00000200") + image[:-1] + b"\x01"), 1
+                )
+            with self.subTest(module=module, pass_kind="frozen_from_zero"):
+                self._sonar_control(**options, frozen_rows=tuple(rows))
+                self.assertEqual(reports[0], reports[1])
+
     def test_nine_writer_retry_preflight_retains_executed_source_row(self):
+        """Standalone retained family sessions; no expired CONTROL target reuse."""
         from scripts.programming_2026_body import _WRITER_MODULES
 
         for module in _WRITER_MODULES:
@@ -1858,6 +2174,7 @@ class Body2026Tests(unittest.TestCase):
                 self.assertEqual(checked, [True])
 
     def test_nine_factory_writers_preserve_native_failure_without_completion(self):
+        """Standalone real factory exports preserve each original failure report."""
         from scripts.programming_2026_body import _WRITER_MODULES
         from scripts.programming_2026_common import CommonResponseError
 
@@ -1892,6 +2209,7 @@ class Body2026Tests(unittest.TestCase):
                 self.assertFalse(result["programming_completed"])
 
     def test_secondary_cpu_native_success_queues_concrete_continuation(self):
+        """One real standalone family writer; the outer job has not consumed it."""
         for module in (
             "TCUWP4CanChassisShrinkFlashWriter.dll",
             "TCUWP4CanSecurityChassisShrinkFlashWriter.dll",
@@ -2016,21 +2334,19 @@ class Body2026Tests(unittest.TestCase):
                         )
                     )
 
-                with (
-                    self.subTest(module=module, exception=exception_type.__name__),
-                    self.assertRaises(exception_type) as caught,
-                ):
-                    self._sonar_control(
-                        module=module,
-                        typed=True,
-                        public_export=True,
-                        issue_worker=True,
-                        initialize_prepare=True,
-                        cpu_index=0,
-                        factory_export=True,
-                        fault=fault,
-                        on_unwind=unwind,
-                    )
+                with self.subTest(module=module, exception=exception_type.__name__):
+                    with self.assertRaises(exception_type) as caught:
+                        self._sonar_control(
+                            module=module,
+                            typed=True,
+                            public_export=True,
+                            issue_worker=True,
+                            initialize_prepare=True,
+                            cpu_index=0,
+                            factory_export=True,
+                            fault=fault,
+                            on_unwind=unwind,
+                        )
                     self.assertTrue(fired)
                     self.assertIs(caught.exception, original)
                     self.assertEqual(state, [(0, None)])
@@ -2097,15 +2413,19 @@ class Body2026Tests(unittest.TestCase):
                 "initialize_prepare": True,
             }
             _, baseline, _, _ = self._sonar_control(**options)
-            start = (
-                max(
-                    index
-                    for index, event in enumerate(baseline)
-                    if event["operation"] == "get_local_milliseconds_of_day"
+            clocks = [
+                index
+                for index, event in enumerate(baseline)
+                if event["operation"] == "get_local_milliseconds_of_day"
+            ]
+            # Entry and exit timing both belong to the real phase2 scope.
+            start = clocks[-2] + 1
+            self.assertTrue(
+                any(
+                    event["operation"] == "write_messages" for event in baseline[start:]
                 )
-                + 1
             )
-            for index in range(start, len(baseline)):
+            for index in range(start, clocks[-1]):
                 with (
                     self.subTest(module=module, index=index, control="cancel"),
                     self.assertRaises(InterruptedError),
@@ -2202,8 +2522,9 @@ class Body2026Tests(unittest.TestCase):
                 )
 
     def test_six_public_writer_exports_use_actual_worker_issued_target_and_flag(self):
-        # Actual getter/outer phase0 runs native34e10/3ddf0/3e710 first.
-        # This still does not claim the complete multiCPU/IG lifecycle.
+        # Real getter/outer import retains34e10; phase1 applies36800/3e710.
+        # These standalone writer calls consume actual worker73c/980, not a
+        # fabricated CONTROL target or the complete multiCPU/IG lifecycle.
         for module in (
             SONAR_WRITE,
             "TCUWP4CanAirbagFlashWriter.dll",

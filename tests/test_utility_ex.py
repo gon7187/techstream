@@ -1560,8 +1560,8 @@ class SuppliedSourceTests(unittest.TestCase):
             name: lambda *args: PrimitiveResult(status=0)
             for name in _SIS_DRIVER_SLOTS.values()
         }
+        exports["J2534CtrlInitialize"] = initialize
         context.sis_driver_exports = exports
-        context.sis_driver_exports["J2534CtrlInitialize"] = initialize
         engine = UtilityExEngine(context)
         for mode, broker in ((4, 20), (20, 17)):
             context._parameters[0x6F], context._parameters[0x70] = mode, broker
@@ -1581,6 +1581,94 @@ class SuppliedSourceTests(unittest.TestCase):
         self.assertEqual(calls, [2, 2])
         with self.assertRaises(ValueError):
             engine.invoke("_Ex2InitializeDoIP@0", (0,))
+
+    def test_actual_typlus_doip_initialize_uses_three_argument_controller(self):
+        from scripts.utility_ex_lifecycle import UtilityExSISDriver
+
+        root = Path(__file__).resolve().parents[1]
+        require_private(root / "analysis/evidence/no-car-83")
+        contract = json.loads(
+            (
+                root
+                / "analysis/evidence/no-car-83/sol-review/plus-doip-export-source-contract.json"
+            ).read_text()
+        )
+        for anchor in contract["anchors"]:
+            self.assertEqual(
+                hashlib.sha256((root / anchor["path"]).read_bytes()).hexdigest(),
+                anchor["sha256"],
+            )
+        context = self.plus_context(
+            "821bbfd9957679ceef4ac32c239b8840c984e98ac61050ce7348ac2bc88b04ce"
+        )
+        calls = []
+
+        def initialize(*args):
+            calls.append(args)
+            self.assertEqual(len(args), 3)
+            self.assertEqual((args[0], args[2]), (2, 0))
+            self.assertIs(type(args[1]), bytearray)
+            args[1][:] = (73).to_bytes(4, "little")
+            return PrimitiveResult(status=17)
+
+        context.sis_driver_exports = {
+            name: lambda *args: PrimitiveResult(status=0)
+            for name in _SIS_DRIVER_SLOTS.values()
+        }
+        context.sis_driver_exports["J2534CtrlInitialize"] = initialize
+        engine = UtilityExEngine(context)
+        for mode, protocol in ((20, 18), (21, 20)):
+            context.state["native_global:1013fa40"] = mode
+            context.state["native_global:1013fa44"] = protocol
+            context.state["native_global:10135be4"] = 99
+            self.assertIsNone(engine.invoke("Ex2InitializeDoIP"))
+            self.assertEqual(context.state["native_global:10135be4"], 0)
+        self.assertEqual(calls, [])
+
+        context.state["native_global:1013fa40"] = 20
+        context.state["native_global:1013fa44"] = 20
+        self.assertIsNone(engine.invoke("Ex2InitializeDoIP"))
+        driver = context.state[f"utility_ex:sis_driver:{context.module_sha256}"]
+        self.assertIsInstance(driver, UtilityExSISDriver)
+        assert isinstance(driver, UtilityExSISDriver)
+        self.assertEqual(driver.controller, 73)
+        self.assertIsNone(engine.invoke("Ex2InitializeDoIP"))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0::2], (2, 0))
+        self.assertEqual([bytes(call[1]) for call in calls], [b"I\0\0\0"] * 2)
+        context.state["native_global:10135be4"] = 44
+        with self.assertRaises(ValueError):
+            engine.invoke("Ex2InitializeDoIP", (0,))
+        self.assertEqual(context.state["native_global:10135be4"], 44)
+
+        other = self.plus_context(context.module_sha256)
+        other.sis_driver_exports = context.sis_driver_exports
+        foreign = UtilityExSISDriver(other, other.sis_driver_binding())
+        context.state[f"utility_ex:sis_driver:{context.module_sha256}"] = foreign
+        with self.assertRaisesRegex(TypeError, "same-context"):
+            engine.invoke("Ex2InitializeDoIP")
+
+    def test_actual_typlus_doip_initialize_preserves_host_exception_identity(self):
+        context = self.plus_context(
+            "821bbfd9957679ceef4ac32c239b8840c984e98ac61050ce7348ac2bc88b04ce"
+        )
+        failure = OSError("controller host fault")
+
+        def initialize(kind, output, flags):
+            self.assertEqual((kind, flags), (2, 0))
+            raise failure
+
+        exports: dict[str, Callable[..., object]] = {
+            name: lambda *args: PrimitiveResult(status=0)
+            for name in _SIS_DRIVER_SLOTS.values()
+        }
+        exports["J2534CtrlInitialize"] = initialize
+        context.sis_driver_exports = exports
+        context.state["native_global:1013fa40"] = 20
+        context.state["native_global:1013fa44"] = 20
+        with self.assertRaises(OSError) as caught:
+            UtilityExEngine(context).invoke("Ex2InitializeDoIP")
+        self.assertIs(caught.exception, failure)
 
     def test_ty18_sis_driver_table_has_independent_v0500_readiness(self):
         context = self.context()

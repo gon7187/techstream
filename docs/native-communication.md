@@ -141,6 +141,15 @@ retargeting or I/O. Inactive contexts may renew budgets, but cannot directly
 receive from another ECU's channel. Disconnecting the outer owner cleans the
 currently selected lower, including when the last exchange belonged to a sibling.
 
+`bind_selected_vehicle(session, selection, profile, ecu, bus_id=...,
+first_request=...)` is the source-authorized one-way transition from a concrete
+terminal `NativeVehicleSession` result to its associated ECU `VehicleProfile`.
+It validates the selector model and catalog association, then returns a sibling
+on the same outer controller. Its full vehicle/ECU identity remains active for
+validation while only the source-proved native category cache namespace is shared.
+Binding performs no adapter I/O; the caller still applies the selected context
+through `NativeFrameController.change_context` before transactions.
+
 Authored 12/18 integration checks cover forced 12→22 reconstruction, retained
 12→32 transport identity, selected inverse headers, exact log bytes, stale runtime
 rejection, and actual 1C NULL wakeup 03e0→0367 plus native81 metadata failure.

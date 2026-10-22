@@ -1007,6 +1007,7 @@ class SBRUtils2026:
         self.central_gateway = False
         self.identity: NativeModuleIdentity | None = None
         self.context: Vendor2026Context | None = None
+        self._control_ssm_issued = False
 
     @property
     def substitution(self) -> bytes:
@@ -1071,6 +1072,12 @@ class SBRUtils2026:
             raise ValueError("Native central-gateway flag required")
         answer = self.channel.call(b"\x22\xf1\0", b"\x62\xf1\0", 6, 100)
         self.ssm = answer[4 if central_gateway else 3]
+        if self._control_ssm_issued:
+            active = getattr(self.runtime._device_calls, "control_export", None)
+            if type(active) is not tuple or len(active) != 3:
+                raise ValueError("Issued SBR SSM producer left its CONTROL scope")
+            engine, _controller, _target = active
+            engine.worker.publish_sbr_ssm2026(self)
         return self.ssm
 
     def programming_session(self):
@@ -1231,6 +1238,14 @@ def prepare_sbr(
         wait_after_function=_flag(selection, "FlagToWaitAfterFuncReq"),
         cpu_type=selection.metadata.cpu.values.get("cputype", ""),
     )
+    utility.context = context
+    active = getattr(runtime._device_calls, "control_export", None)
+    if active is not None:
+        engine, controller, target = active
+        if controller.runtime is not runtime:
+            raise ValueError("Active source-issued SBR runtime required")
+        utility._control_ssm_issued = True
+        engine.worker._bind_sbr_ssm_producer2026(utility, target)
     central = _flag(selection, "FlagToCentralGateway")
     utility.central_gateway = central
     if retry_export and not _flag(selection, "FlagToSendAllOnPrepareRetry"):
@@ -1308,13 +1323,130 @@ def write_sbr(
         or not callable(notify)
     ):
         raise ValueError("Exact SBR2026 writer context and progress observer required")
+    progress = _sbr_control_progress2026(context, runtime)
+    if progress is None:
+        index = native2026_global_cpu_index(context.selection.metadata)
+        files = context.files
+    else:
+        index = progress["target"].entry_cpu_index
+        files = _sbr_control_cpu_files2026(progress, index)
     return _write_sbr_cpu(
         context,
         runtime,
-        native2026_global_cpu_index(context.selection.metadata),
-        context.files,
+        index,
+        files,
         notify,
+        progress,
     )
+
+
+def _sbr_control_progress2026(context, runtime):
+    active = getattr(runtime._device_calls, "control_export", None)
+    if active is None:
+        return None
+    from scripts.cuw_2026 import CUWEngine2026
+    from scripts.programming_2026_common import (
+        NativeControlContext2026,
+        NativeControlExportTarget2026,
+    )
+
+    if type(active) is not tuple or len(active) != 3:
+        raise ValueError("Exact scoped SBR CONTROL export required")
+    engine, controller, target = active
+    control = controller.native_control_context2026(engine)
+    if (
+        type(engine) is not CUWEngine2026
+        or type(control) is not NativeControlContext2026
+        or type(target) is not NativeControlExportTarget2026
+        or controller.runtime is not runtime
+        or engine._controller_execution is not controller
+        or engine.worker.controller is not controller
+        or engine.worker.runtime is not runtime
+        or engine._controller_export_target2026 is not target
+        or target._context is not control
+        or target.binding.operation != "write"
+        or target.module_binding.module_name != "TCUWCanSBRFlashWriter.dll"
+        or context.family != "SBR"
+        or context.stage != "write"
+        or context.identity.module_name != "TCUWCanSBRFlashWriter.dll"
+        or context.selection is not target.binding
+    ):
+        raise ValueError("Exact source-issued SBR writer progress scope required")
+    target.validate(engine, controller)
+    counts, percentages = control.count_scratch, control.percentage_scratch
+    capacity = min(len(counts), len(percentages), len(control.target_indices))
+    if not 0 <= target.entry_cpu_index < capacity:
+        raise ValueError("SBR writer entry CPU is outside CONTROL scratch")
+    return {
+        "context": context,
+        "runtime": runtime,
+        "engine": engine,
+        "controller": controller,
+        "target": target,
+        "control": control,
+        # ponytail: Load source geometry only when the native loop enters a CPU;
+        # malformed future rows must not preempt current-CPU I/O.
+        "files": [None] * capacity,
+        "totals": [None] * capacity,
+        "cumulative": [0] * capacity,
+    }
+
+
+def _sbr_control_cpu_files2026(progress, index):
+    files = progress["files"][index]
+    if files is None:
+        files = _sbr_files(
+            progress["control"].metadata_for_cpu(index).cpu,
+            progress["context"].selection,
+        )
+        progress["files"][index] = files
+        progress["totals"][index] = sum(file.size for file in files)
+    return files
+
+
+def _validate_sbr_control_progress2026(progress) -> None:
+    context = progress["context"]
+    expected_runtime = progress["runtime"]
+    engine, controller, target, control = (
+        progress[key] for key in ("engine", "controller", "target", "control")
+    )
+    runtime = controller.runtime
+    if (
+        runtime is not expected_runtime
+        or type(context) is not Vendor2026Context
+        or context.family != "SBR"
+        or context.stage != "write"
+        or context.identity.module_name != "TCUWCanSBRFlashWriter.dll"
+        or context.selection is not target.binding
+        or getattr(runtime._device_calls, "control_export", None)
+        != (engine, controller, target)
+        or engine._controller_execution is not controller
+        or engine.worker.controller is not controller
+        or engine.worker.runtime is not runtime
+        or engine._controller_export_target2026 is not target
+        or controller.native_control_context2026(engine) is not control
+        or target._context is not control
+    ):
+        raise ValueError("SBR writer progress scope expired or was replaced")
+    target.validate(engine, controller)
+
+
+def _publish_sbr_control_progress2026(progress, kind, index, *, cleanup=False):
+    _validate_sbr_control_progress2026(progress)
+    if kind not in ("count", "percent"):
+        raise ValueError("Native SBR progress callback kind required")
+    control = progress["control"]
+    if type(index) is not int or not 0 <= index < len(progress["files"]):
+        raise ValueError("SBR writer progress CPU index is outside CONTROL scratch")
+    if kind == "count":
+        value = control.count_scratch[index]
+        operation = "notify_progress_count"
+        fields = {"cpu_index": index, "transferred_bytes": value}
+    else:
+        value = control.percentage_scratch[index]
+        operation = "notify_progress_percent"
+        fields = {"cpu_index": index, "progress": value}
+    progress["controller"].runtime.call(operation, cleanup=cleanup, **fields)
 
 
 def _write_sbr_cpu(
@@ -1323,15 +1455,33 @@ def _write_sbr_cpu(
     index: int,
     files: tuple[SBRFile, ...],
     notify,
+    control_progress=None,
 ) -> dict:
-    if index >= len(context.address_groups):
+    cpu_count = (
+        len(control_progress["files"])
+        if control_progress is not None
+        else native2026_cpu_count(context.selection.metadata)
+    )
+    if index >= cpu_count or index >= len(context.address_groups):
         raise ValueError("Native SBR CPU-indexed address vector absent")
     runtime.call("set_timeout", milliseconds=5000)
-    total = sum(file.size for file in files)
-    if (
-        context.native_percentages[index] == 100
-        and context.native_counts[index] == total
-    ):
+    total = (
+        control_progress["totals"][index]
+        if control_progress is not None
+        else sum(file.size for file in files)
+    )
+    if control_progress is None:
+        completed = (
+            context.native_percentages[index] == 100
+            and context.native_counts[index] == total
+        )
+    else:
+        _validate_sbr_control_progress2026(control_progress)
+        completed = (
+            control_progress["control"].percentage_scratch[index] == 100
+            and control_progress["control"].count_scratch[index] == total
+        )
+    if completed:
         return {
             "state": "writer_completed",
             "transferred": 0,
@@ -1346,9 +1496,9 @@ def _write_sbr_cpu(
         channel, wait_after_function=_flag(context.selection, "FlagToWaitAfterFuncReq")
     )
     identifier = channel.diag.start_filter(*_vendor_headers(channel.address))
-    transferred = context.native_counts[index]
+    transferred = 0 if control_progress is not None else context.native_counts[index]
     writing = False
-    total = sum(file.size for file in files)
+    total = total or sum(file.size for file in files)
     failure = None
 
     def routine(file, checking):
@@ -1407,10 +1557,28 @@ def _write_sbr_cpu(
                 channel.call(payload, bytes((0x76, counter)), 2, 34)
                 utility.tester()
                 transferred += len(chunk)
-                runtime.check()
-                notify("count", transferred)
-                runtime.check()
-                notify("percent", transferred * 100 // total)
+                if control_progress is None:
+                    runtime.check()
+                    notify("count", transferred)
+                    runtime.check()
+                    notify("percent", transferred * 100 // total)
+                else:
+                    cumulative = control_progress["cumulative"][index] + len(chunk)
+                    control_progress["cumulative"][index] = cumulative
+                    _publish_sbr_control_progress2026(control_progress, "count", index)
+                    count = int((float(cumulative) / float(total)) * float(total))
+                    control_progress["control"]._store_count2026(
+                        control_progress["target"], index, count & 0xFFFFFFFF
+                    )
+                    percentage = int((float(cumulative) / float(total)) * 100.0)
+                    control_progress["control"]._store_percentage2026(
+                        control_progress["target"],
+                        index,
+                        percentage & 0xFFFFFFFF,
+                    )
+                    _publish_sbr_control_progress2026(
+                        control_progress, "percent", index
+                    )
                 runtime.check()
             channel.call(b"\x37", b"\x77", 1, 28)
             utility.tester()
@@ -1426,9 +1594,25 @@ def _write_sbr_cpu(
         failure = error
         error.__dict__["native_writing"] = writing
         runtime.check()
-        notify("count", 0)
-        runtime.check()
-        notify("percent", 0)
+        if control_progress is None:
+            runtime.check()
+            notify("count", 0)
+            runtime.check()
+            notify("percent", 0)
+        else:
+            _validate_sbr_control_progress2026(control_progress)
+            control_progress["control"]._store_count2026(
+                control_progress["target"], index, 0
+            )
+            _publish_sbr_control_progress2026(
+                control_progress, "count", index, cleanup=True
+            )
+            control_progress["control"]._store_percentage2026(
+                control_progress["target"], index, 0
+            )
+            _publish_sbr_control_progress2026(
+                control_progress, "percent", index, cleanup=True
+            )
         runtime.check()
         raise
     except BaseException as error:
@@ -1445,18 +1629,25 @@ def _write_sbr_cpu(
             else:
                 raise
     next_cpu_index = index + 1
-    if not _flag(
-        context.selection, "CpuLoopBetweenPrepareAndWriteFlag"
-    ) and index + 1 < native2026_cpu_count(context.selection.metadata):
+    if (
+        not _flag(context.selection, "CpuLoopBetweenPrepareAndWriteFlag")
+        and index + 1 < cpu_count
+    ):
         # Native ctor10b0 retains its one CParameter pointer throughout1aa0.
-        next_files = _sbr_files(
-            native2026_metadata_for_cpu(context.selection.metadata, index + 1).cpu,
-            context.selection,
+        next_files = (
+            _sbr_control_cpu_files2026(control_progress, index + 1)
+            if control_progress is not None
+            else _sbr_files(
+                native2026_metadata_for_cpu(context.selection.metadata, index + 1).cpu,
+                context.selection,
+            )
         )
         runtime.check()
         notify("next_cpu", index + 1)
         runtime.check()
-        next_result = _write_sbr_cpu(context, runtime, index + 1, next_files, notify)
+        next_result = _write_sbr_cpu(
+            context, runtime, index + 1, next_files, notify, control_progress
+        )
         transferred += next_result["transferred"]
         next_cpu_index = next_result["next_cpu_index"]
     return {
@@ -1466,7 +1657,7 @@ def _write_sbr_cpu(
         "native_error_kind": 0,
         "native_flag_964": False,
         "native_flag_978": _flag(context.selection, "CpuLoopBetweenPrepareAndWriteFlag")
-        and index + 1 < native2026_cpu_count(context.selection.metadata),
+        and index + 1 < cpu_count,
         "native_cpu_loop": not _flag(
             context.selection, "CpuLoopBetweenPrepareAndWriteFlag"
         ),

@@ -92,12 +92,15 @@ missing crypto/online bindings, and host-fault/cancellation injection. Original
 PEs are only read and disassembled; no OEM executable, vehicle, adapter or
 licensed network service is used. Physical behavior remains unconfirmed.
 
-A frozen215-event Sonar SDK chronology runs the actual controller CID getter,
-native target selection, phase1 startup and public writer on one engine,
-runtime and distinct device pair. Sonar consumes real980 by using10000ms for
-the first ID read and writes2048 bytes. A separate216-event BodyFlash chronology
-proves crossownership; that writer does not consume980. Both traces and cleanup
-are consumed fully. Full normal prepare/write and
-multiCPU controller orchestration remain separate open acceptance work.
+A derived215-event Sonar chronology and216-event BodyFlash chronology retain
+the original rows and move only engine open/connect rows0/1 after the phase0
+getter exit. Source confirms that the getter imports `ReceiveTimeoutBeforeGetCID`
+33 into ENGINE, so the eight phase1 startup reads now record timeout33. All
+responses, row order, and other request fields remain unchanged. The actual
+controller getter, ordinary paired return import, native CID selection, phase1
+startup and public writers now pass on one engine/runtime/device pair; Sonar
+still consumes real980 through its10000ms initial ID read. Full normal
+prepare/write and multiCPU controller orchestration remain separate open
+acceptance work.
 
 Run `python -m unittest discover -s tests -p test_cuw_gateway_startup.py -v`.

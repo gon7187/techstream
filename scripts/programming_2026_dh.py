@@ -35,7 +35,7 @@ from scripts.programming_2026_common import (
     CanDiag2026,
     CommonResponseError,
     NativeBytes2026,
-    NativeEmptyControlParameter2026,
+    NativeControlParameterBase2026,
     NativeGeneralParameters2026,
     NativeParameterBinding2026,
     NativeRuntime2026,
@@ -1773,7 +1773,7 @@ class DHGateway2026:
     selection: (
         CalibrationSelection
         | NativeParameterBinding2026
-        | NativeEmptyControlParameter2026
+        | NativeControlParameterBase2026
     )
     identity: NativeModuleIdentity
     secret_info: SecretInfoClient = field(repr=False)
@@ -1789,7 +1789,7 @@ class DHGateway2026:
                 (
                     CalibrationSelection,
                     NativeParameterBinding2026,
-                    NativeEmptyControlParameter2026,
+                    NativeControlParameterBase2026,
                 ),
             )
             or not isinstance(self.secret_info, SecretInfoClient)
@@ -1803,29 +1803,44 @@ class DHGateway2026:
                 "Actual native parameter selection, private secret binding and exact DHUtils identity required"
             )
         self._validate_selection()
-        if self.engine_state is not None and (
-            not isinstance(self.engine_state, DHControllerState2026)
-            or not isinstance(
+        if self.engine_state is not None:
+            if not isinstance(
+                self.engine_state, DHControllerState2026
+            ) or not isinstance(
                 self.selection,
-                (NativeParameterBinding2026, NativeEmptyControlParameter2026),
-            )
-            or self.engine_state.metadata != self.selection.metadata
-        ):
-            raise ValueError("Actual same-metadata engine DH gateway state required")
+                (NativeParameterBinding2026, NativeControlParameterBase2026),
+            ):
+                raise ValueError("Actual engine DH gateway state required")
+            if isinstance(self.selection, NativeControlParameterBase2026):
+                engine = self.selection.engine
+                if self.selection._pool is not None:
+                    if self.engine_state is not engine.dh_state:
+                        raise ValueError(
+                            "Pool BASE gateway must use its exact engine DH state"
+                        )
+                elif self.engine_state.metadata != self.selection.metadata:
+                    raise ValueError(
+                        "Constructor-empty gateway metadata differs from engine state"
+                    )
+            elif self.engine_state.metadata != self.selection.metadata:
+                raise ValueError(
+                    "Actual same-metadata engine DH gateway state required"
+                )
         self.diag = CanDiag2026(self.runtime)
 
     def _validate_selection(self) -> None:
-        if isinstance(self.selection, NativeEmptyControlParameter2026):
+        if isinstance(self.selection, NativeControlParameterBase2026):
             if not isinstance(self.engine_state, DHControllerState2026):
-                raise TypeError(
-                    "Source-issued empty control parameter requires its engine state"
-                )
+                raise TypeError("Source-issued CONTROL BASE requires its engine state")
             engine = self.engine_state.engine
             self.selection.validate(engine)
+            if (
+                self.selection._pool is not None
+                and self.engine_state is not engine.dh_state
+            ):
+                raise ValueError("Pool BASE gateway state differs from its engine")
             if engine.worker.runtime is not self.runtime:
-                raise ValueError(
-                    "Empty control parameter runtime differs from its worker"
-                )
+                raise ValueError("CONTROL BASE runtime differs from its worker")
 
     def assign(self, other: "DHGateway2026") -> "DHGateway2026":
         """Native RVA15c0 assignment copies dependencies and state without I/O."""
@@ -1863,7 +1878,7 @@ class DHGateway2026:
         self._validate_selection()
         if isinstance(
             self.selection,
-            (NativeParameterBinding2026, NativeEmptyControlParameter2026),
+            (NativeParameterBinding2026, NativeControlParameterBase2026),
         ):
             return self.selection.parameter.boolean(name) or False
         text = self.selection.value(name)
@@ -2138,7 +2153,7 @@ class DHGateway2026:
 
 def bind_gateway_client(
     runtime: NativeRuntime2026,
-    selection: NativeParameterBinding2026 | NativeEmptyControlParameter2026,
+    selection: NativeParameterBinding2026 | NativeControlParameterBase2026,
     state: DHControllerState2026,
     *,
     dh_utils_module: bytes,
@@ -2149,7 +2164,7 @@ def bind_gateway_client(
     if (
         not isinstance(runtime, NativeRuntime2026)
         or not isinstance(
-            selection, (NativeParameterBinding2026, NativeEmptyControlParameter2026)
+            selection, (NativeParameterBinding2026, NativeControlParameterBase2026)
         )
         or not isinstance(state, DHControllerState2026)
         or any(
@@ -2160,11 +2175,16 @@ def bind_gateway_client(
         raise ValueError(
             "Actual shared-engine gateway parameter and immutable native bytes required"
         )
-    if isinstance(selection, NativeEmptyControlParameter2026):
+    if isinstance(selection, NativeControlParameterBase2026):
         selection.validate(state.engine)
         if state.engine.worker.runtime is not runtime:
-            raise ValueError("Empty gateway capability belongs to another runtime")
-    if selection.metadata != state.metadata:
+            raise ValueError("CONTROL BASE capability belongs to another runtime")
+        if selection._pool is not None and state is not state.engine.dh_state:
+            raise ValueError("CONTROL BASE capability requires its exact engine state")
+    if (
+        not isinstance(selection, NativeControlParameterBase2026)
+        or selection._pool is None
+    ) and (selection.metadata != state.metadata):
         raise ValueError("Gateway parameter metadata differs from the actual engine")
     if hashlib.sha256(cuw_module).hexdigest() != state.engine_sha256:
         raise ValueError(
@@ -4905,9 +4925,42 @@ def _execute_context(context: DHExecutionContext, runtime: NativeRuntime2026) ->
 
 def execute_context(context: DHExecutionContext, runtime: NativeRuntime2026) -> dict:
     """Host faults propagate unchanged after every remaining resource is released."""
+    borrowed_control = False
+    if type(runtime) is NativeRuntime2026:
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.programming_2026_common import (
+            _NATIVE_CONTROL_RAW_EXECUTIONS_2026,
+            ControlCommPhase2026,
+            NativeControlExportTarget2026,
+        )
+
+        try:
+            active = getattr(runtime._device_calls, "control_export", None)
+            if type(active) is tuple and len(active) == 3:
+                engine, controller, target = active
+                if (
+                    type(engine) is CUWEngine2026
+                    and type(controller) is ControlCommPhase2026
+                    and type(target) is NativeControlExportTarget2026
+                    and controller.runtime is runtime
+                    and engine.worker.controller is controller
+                    and engine.worker.runtime is runtime
+                    and engine._controller_execution is controller
+                    and engine._controller_export_target2026 is target
+                ):
+                    token = controller._native_control_raw_execution2026
+                    control_context = controller.native_control_context2026(engine)
+                    borrowed_control = (
+                        token is not None
+                        and _NATIVE_CONTROL_RAW_EXECUTIONS_2026.get(id(token))
+                        == (token, engine, controller, control_context)
+                        and target.validate(engine, controller) is None
+                    )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            borrowed_control = False
     try:
         return _execute_context(context, runtime)
     except BaseException:
-        if isinstance(runtime, NativeRuntime2026):
+        if isinstance(runtime, NativeRuntime2026) and not borrowed_control:
             runtime.close()
         raise

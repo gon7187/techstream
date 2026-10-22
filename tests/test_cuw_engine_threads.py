@@ -223,6 +223,615 @@ class ThreadOwnershipTests(unittest.TestCase):
         self.assertTrue(job.state.child_alive)
         self.assertFalse(job.native_work_pending)
 
+    def test_control_handoffs_require_the_actual_child_thread(self):
+        engine, _controller, job, _session = self.imported_prepare(operation="get_cid")
+        with self.assertRaisesRegex(ValueError, "actual child"):
+            job.dispatch_control_progress(object(), "count")
+        with self.assertRaisesRegex(ValueError, "actual child"):
+            job.dispatch_control_getter_return()
+        self.assertEqual(engine.dh_state.transferred_bytes, (0,))
+
+    def test_ordinary_false_getter_imports_pair_on_outer_thread(self):
+        from tests.test_programming_2026_common import RawControlStageMachineTests
+
+        fixture = RawControlStageMachineTests()
+        self.addCleanup(fixture.doCleanups)
+        engine, controller, session = fixture.fixture(
+            operation="get_cid",
+            paired=True,
+            dependencies=("TCUWControlCommPhase.dll",),
+        )
+        job = engine.bind_thread_job(controller)
+        self.addCleanup(job.stop)
+        pair = engine.interface_pair
+        assert pair is not None
+        runner_calls = []
+
+        def ordinary_false_getter(*_args):
+            runner_calls.append(True)
+            return lambda: {"native_success": False, "identifiers": (b"CID",)}
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        with (
+            patch.object(ProgrammingReplay, "_runner", ordinary_false_getter),
+            patch.object(pair, "import_into", wraps=pair.import_into) as imports,
+        ):
+            job.start(session)
+            report = job.result(5)
+
+        self.assertIs(report["native_return"], False, report)
+        self.assertEqual(report["identifiers"], (b"CID",))
+        self.assertEqual(runner_calls, [True])
+        self.assertEqual(
+            [call.args[0] for call in imports.call_args_list],
+            [pair.control, pair.engine],
+        )
+        self.assertEqual(engine.received_identifiers, (b"CID",))
+
+    def test_actual_p5_false_getter_imports_pair_through_thread_job(self):
+        from pathlib import Path
+
+        from scripts.j2534_2026 import (
+            DriverMetadata2026,
+            J2534Device2026,
+            J2534InterfacePair2026,
+            NativeMessage,
+            NativeReadBatch2026,
+            PrimitiveResult,
+        )
+        from scripts.programming_2026_p5_getters import run_native_context
+        from scripts.programming_replay import _native_request
+        from tests.private_evidence import read_private_bytes
+        from tests.test_calibration_2026 import cuw
+        from tests.test_cuw_engine_worker import encoded_table
+        from tests.test_programming_2026_common import make_raw_control_fixture2026
+        from tests.test_programming_2026_p5_getters import (
+            P5,
+            fixture,
+            p5,
+            typed_runtime,
+        )
+
+        native, container, binding = fixture(P5, "0100/0108\n0200/0208", allow="")
+        provider_runtime, device, _provider_events = typed_runtime(
+            (p5(b"ONE"), b"SECOND")
+        )
+        rows = []
+        reads = 0
+
+        def typed_value(value):
+            if value is None:
+                return {"type": "none", "value": None}
+            if type(value) is bool:
+                return {"type": "bool", "value": value}
+            if type(value) is int:
+                return {"type": "int", "value": value}
+            if isinstance(value, bytes):
+                return {"type": "bytes", "value": value.hex()}
+            if type(value) is NativeMessage:
+                return {
+                    "type": "mapping",
+                    "value": {
+                        "_native_type": {"type": "text", "value": "PASSTHRU_MSG_2026"},
+                        **{key: typed_value(item) for key, item in vars(value).items()},
+                    },
+                }
+            if type(value) is NativeReadBatch2026:
+                return {
+                    "type": "mapping",
+                    "value": {
+                        "_native_type": {"type": "text", "value": "READ_BATCH_2026"},
+                        "messages": typed_value(value.messages),
+                        "count": typed_value(value.count),
+                    },
+                }
+            if isinstance(value, tuple):
+                return {"type": "tuple", "value": [typed_value(item) for item in value]}
+            if isinstance(value, list):
+                return {
+                    "type": "sequence",
+                    "value": [typed_value(item) for item in value],
+                }
+            if isinstance(value, dict):
+                return {
+                    "type": "mapping",
+                    "value": {key: typed_value(item) for key, item in value.items()},
+                }
+            raise TypeError(f"Unsupported typed driver value: {type(value)!r}")
+
+        original_provider = device.provider
+
+        def capture_driver(event, remaining):
+            nonlocal reads
+            result = original_provider(event, remaining)
+            if event["operation"] == "create_mutex":
+                result = PrimitiveResult(value=1)
+            elif event["operation"] == "wait_handle":
+                result = PrimitiveResult(value=0)
+            elif event["operation"] == "load_library":
+                result = PrimitiveResult(value=2)
+            elif event["operation"] == "get_symbol":
+                result = PrimitiveResult(value=3)
+            if event["operation"] == "passthru_read":
+                reads += 1
+                if reads == 4:
+                    result = PrimitiveResult(status=16)
+            rows.append(
+                {
+                    "kind": "action",
+                    "request": _native_request(event),
+                    "result": typed_value(
+                        {"status": result.status, "value": result.value}
+                    ),
+                    "elapsed_ms": 1,
+                }
+            )
+            return result
+
+        device.provider = capture_driver
+        peer = J2534Device2026(
+            device.provider,
+            clock=device.clock,
+            cancelled=device.cancelled,
+            background_workers=False,
+        )
+        direct_pair = J2534InterfacePair2026(peer, device)
+        for view in (direct_pair.engine, direct_pair.control):
+            view.set_current_driver(DriverMetadata2026("Authored", "authored.dll"))
+        device.have_ownership()
+        direct = run_native_context(native, provider_runtime)
+        self.assertIs(direct["bool_out"], False)
+        self.assertEqual(direct["cids"], (b"ONE",))
+        values = {
+            key: "\n".join(value)
+            for key, value in binding.values.items()
+            if key != "ParamFileKeySystemProtocolMicon"
+        }
+        values["EnableDLLVersionInformation"] = "0\n0\n0\n0"
+        catalog = {
+            "8P5" + cpu + ".ini": encoded_table(
+                ("ParamFileKeySystemProtocolMicon", *values),
+                (("8P5" + cpu, *values.values()),),
+            )
+            for cpu in ("A", "B")
+        }
+        catalog["Parameter.ini"] = encoded_table(
+            (
+                "ParamFileKeySystemProtocolMicon",
+                "M16CTypeFlag",
+                "FlagToChangeToReprogGWModeForCentralGW",
+                "FORESTTypeFlag",
+                "PasswordAddress",
+                "ByteOrder",
+            ),
+            tuple(("8P5" + cpu, "0", "0", "0", "00", "1") for cpu in ("A", "B")),
+        )
+        source = cuw(
+            container.attached.data.decode("ascii"),
+            tuple(record.data for record in container.records),
+        )
+        engine, controller, session = make_raw_control_fixture2026(
+            self,
+            source=source,
+            catalog=catalog,
+            module_files={
+                P5: read_private_bytes(Path("runtime/no-car-21/recovered") / P5),
+                "TCUWControlCommPhase.dll": read_private_bytes(
+                    Path("runtime/no-car-21/recovered/TCUWControlCommPhase.dll")
+                ),
+            },
+            operation="get_cid",
+            events=rows,
+            paired=True,
+        )
+        fixed_clock = lambda: 1000
+        session.trace.native_local_milliseconds_of_day = fixed_clock
+        controller.runtime.local_milliseconds_of_day = fixed_clock
+        job = engine.bind_thread_job(controller)
+        self.addCleanup(job.stop)
+        pair = engine.interface_pair
+        assert pair is not None
+        runner_calls = []
+        from scripts.programming_replay import ProgrammingReplay
+
+        original_runner = ProgrammingReplay._runner
+
+        def runner(*args):
+            runner_calls.append(True)
+            return original_runner(*args)
+
+        with (
+            patch.object(ProgrammingReplay, "_runner", runner),
+            patch.object(pair, "import_into", wraps=pair.import_into) as imports,
+        ):
+            job.start(session)
+            try:
+                report = job.result(5)
+            except ValueError as error:
+                raise AssertionError(
+                    f"raw P5 child stopped at event {session.trace.position}; "
+                    f"runner calls={runner_calls}; captured={[row['request'].get('operation') for row in rows]}; "
+                    f"next={session.trace.rows[session.trace.position : session.trace.position + 1]}"
+                ) from error
+
+        self.assertIs(report["native_return"], False, report)
+        self.assertEqual(report["identifiers"], (b"ONE",))
+        self.assertEqual(runner_calls, [True])
+        self.assertEqual(
+            [call.args[0] for call in imports.call_args_list],
+            [pair.control, pair.engine],
+        )
+        self.assertEqual(engine.received_identifiers, (b"ONE",))
+
+    def test_prepare_return_does_not_import_getter_snapshot(self):
+        from tests.test_programming_2026_common import RawControlStageMachineTests
+
+        fixture = RawControlStageMachineTests()
+        self.addCleanup(fixture.doCleanups)
+        engine, controller, session = fixture.fixture(
+            operation="prepare",
+            paired=True,
+            dependencies=("TCUWControlCommPhase.dll",),
+            events=(
+                fixture.event("set_communication_log_mode", mode=2),
+                fixture.event("set_communication_log_mode", mode=0),
+            ),
+        )
+        job = engine.bind_thread_job(controller)
+        self.addCleanup(job.stop)
+        pair = engine.interface_pair
+        assert pair is not None
+        from scripts.programming_replay import ProgrammingReplay
+
+        with (
+            patch.object(
+                ProgrammingReplay,
+                "_runner",
+                return_value=lambda: {"native_return": True},
+            ),
+            patch.object(pair, "import_into", wraps=pair.import_into) as imports,
+        ):
+            job.start(session)
+            report = job.result(5)
+
+        self.assertIs(report["native_return"], True)
+        self.assertEqual(
+            [call.args[0] for call in imports.call_args_list], [pair.control]
+        )
+
+    def test_raw_getter_throw_does_not_import_return_snapshot(self):
+        from tests.test_programming_2026_common import RawControlStageMachineTests
+
+        fixture = RawControlStageMachineTests()
+        self.addCleanup(fixture.doCleanups)
+        engine, controller, session = fixture.fixture(
+            operation="get_cid",
+            paired=True,
+            dependencies=("TCUWControlCommPhase.dll",),
+        )
+        job = engine.bind_thread_job(controller)
+        self.addCleanup(job.stop)
+        pair = engine.interface_pair
+        assert pair is not None
+        fault = RuntimeError("authored raw getter fault")
+
+        def throwing_getter(*_args):
+            raise fault
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        with (
+            patch.object(ProgrammingReplay, "_runner", throwing_getter),
+            patch.object(pair, "import_into", wraps=pair.import_into) as imports,
+        ):
+            job.start(session)
+            with self.assertRaises(RuntimeError) as caught:
+                job.result(5)
+
+        self.assertIs(caught.exception, fault)
+        self.assertEqual(
+            [call.args[0] for call in imports.call_args_list], [pair.control]
+        )
+
+    def test_actual_dh_progress_publishes_before_percent_observer_fault(self):
+        import tempfile
+        from pathlib import Path
+
+        from scripts.calibration import CalibrationContainer
+        from scripts.calibration_2026 import parse_cuw_2026
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+        from scripts.native_modules import identify_native_module
+        from scripts.programming_2026_common import NativeRuntime2026
+        from scripts.programming_2026_dh import (
+            bind_native_context,
+            execute_context,
+        )
+        from scripts.programming_replay import _native_request
+        from tests.test_cuw_engine_worker import encoded_table
+        from tests.test_programming_2026_common import make_raw_control_fixture2026
+        from tests.test_programming_2026_dh import (
+            DHUDSGetterLifecycle,
+            bind_dh_parameter_fixture,
+            table,
+        )
+
+        source_case = DHUDSGetterLifecycle(
+            "test_loaded_control_base_binds_gateway_without_reselecting_row"
+        )
+        self.addCleanup(source_case.doCleanups)
+        source_engine = source_case.engine_fixture(
+            cpu_count=1, image_data=b"S1071000646174614E\nS9031000EC\n"
+        )
+        source = source_engine._source
+        assert source is not None
+        container = parse_cuw_2026(source)
+        assert isinstance(container, CalibrationContainer)
+        module_name = "TCUWCanDHGatewayFlashWriter.dll"
+        profile_values = {
+            "CanIDForPrepareWrite": "0700/0708",
+            "StartAddress": "00001000",
+        }
+        profile_fields = (
+            "ParamFileKeySystemProtocolMicon",
+            "DLLFileNameForPrepareWrite",
+            "DLLFileNameForFlashWrite",
+            "DLLFileNameForGetCID",
+            "DLLFileNameForChangeToReprogGatewayMode",
+            "EnableDLLVersionInformation",
+            "GetCANIDFunctionNameForFlashWrite",
+            "AlternateDLLFileNamesForGetCID",
+            "EnableAlternateDLLVersionsInformationForGetCID",
+            *profile_values,
+        )
+        profile_row = (
+            "108CAN383",
+            "TCUWSilPrepareWriter.dll",
+            module_name,
+            "TCUWSilCIDGetter.dll",
+            "",
+            "0\n0\n0\n0",
+            "GetCanIDsFromParamForPrepareWrite",
+            "",
+            "0",
+            *profile_values.values(),
+        )
+        catalog = {
+            "108CAN383.ini": encoded_table(profile_fields, (profile_row,)),
+            "Parameter.ini": encoded_table(
+                (
+                    "ParamFileKeySystemProtocolMicon",
+                    "M16CTypeFlag",
+                    "FORESTTypeFlag",
+                    "PasswordAddress",
+                    "ByteOrder",
+                    "FlagToNonChangeReprogGWModeProcess",
+                ),
+                (("108CAN383", "0", "0", "00", "1", "1"),),
+            ),
+        }
+        image_root = Path("runtime/no-car-21/recovered")
+        module_files = {
+            name: read_private_bytes(image_root / name)
+            for name in (
+                module_name,
+                "TCUWControlCommPhase.dll",
+                "TCUWSilPrepareWriter.dll",
+                "TCUWSilCIDGetter.dll",
+                "TCUWDHUtils.dll",
+                "SecretInfo.dll",
+                "CUW.dll",
+            )
+        }
+        identity = identify_native_module(
+            hashlib.sha256(module_files[module_name]).hexdigest(), module_name
+        )
+        family_selection = bind_dh_parameter_fixture(
+            container,
+            {
+                "108CAN383.ini": table(
+                    [
+                        "ParamFileKeySystemProtocolMicon",
+                        "DLLFileNameForFlashWrite",
+                        "GetCANIDFunctionNameForFlashWrite",
+                        "CanIDForPrepareWrite",
+                        "StartAddress",
+                    ],
+                    [
+                        [
+                            "108CAN383",
+                            module_name,
+                            "GetCanIDsFromParamForPrepareWrite",
+                            profile_values["CanIDForPrepareWrite"],
+                            profile_values["StartAddress"],
+                        ]
+                    ],
+                )
+            },
+            "write",
+            encoded=False,
+        )
+        family_context = bind_native_context(
+            container,
+            1,
+            (),
+            family_selection,
+            identity,
+            {
+                "selected_module": module_files[module_name],
+                "dh_utils_module": module_files["TCUWDHUtils.dll"],
+                "secret_info_module": module_files["SecretInfo.dll"],
+                "cuw_module": module_files["CUW.dll"],
+            },
+            {"cpu_index": 0, "dh_state": source_engine.dh_state},
+        )
+        pending, rows = [], []
+
+        def capture(event, remaining):
+            operation = event["operation"]
+            if operation == "get_timeout":
+                result = 101
+            elif operation == "get_send_timeout":
+                result = 102
+            elif operation == "start_flow_control_filter":
+                result = 17
+            elif operation == "is_sending_sync_periodic":
+                result = False
+            elif operation == "write_messages":
+                pdu = event["data"][4:]
+                if pdu == bytes.fromhex("22fd10"):
+                    answer = bytes.fromhex("62fd10")
+                elif pdu == bytes.fromhex("3101f010"):
+                    answer = bytes.fromhex("7101f0109a")
+                elif pdu.startswith(b"\x34"):
+                    answer = bytes.fromhex("74200003")
+                elif pdu.startswith(b"\x36"):
+                    answer = b"\x76"
+                elif pdu == b"\x37":
+                    answer = b"\x77"
+                elif pdu.startswith(bytes.fromhex("3101f011000144")):
+                    answer = bytes.fromhex("7101f011200003")
+                elif pdu == bytes.fromhex("3101f01101"):
+                    answer = bytes.fromhex("7101f01100")
+                elif pdu == bytes.fromhex("1101"):
+                    answer = b"\x51"
+                else:
+                    raise AssertionError(f"Unexpected native writer PDU: {pdu.hex()}")
+                pending.append(answer)
+                result = 1
+            elif operation == "read_specified_can_message":
+                result = bytes.fromhex("00000708") + pending.pop(0)
+            else:
+                result = None
+            rows.append(
+                {
+                    "kind": "action",
+                    "request": _native_request(event),
+                    "result": {
+                        "type": (
+                            "none"
+                            if result is None
+                            else "bool"
+                            if type(result) is bool
+                            else "int"
+                            if type(result) is int
+                            else "bytes"
+                        ),
+                        "value": result.hex() if type(result) is bytes else result,
+                    },
+                    "elapsed_ms": 1,
+                }
+            )
+            return result
+
+        direct_runtime = NativeRuntime2026(capture)
+        direct_result = execute_context(family_context, direct_runtime)
+        self.assertIs(direct_result["native_return"], True)
+        self.assertTrue(
+            any(
+                row["request"]["operation"] == "notify_progress_percent" for row in rows
+            )
+        )
+        clock_start = {
+            "kind": "action",
+            "request": {"operation": "get_local_milliseconds_of_day"},
+            "result": {"type": "int", "value": 1000},
+            "elapsed_ms": 1,
+        }
+        clock_end = {**clock_start, "result": {"type": "int", "value": 2000}}
+        mode_start = {
+            "kind": "action",
+            "request": {"operation": "set_communication_log_mode", "mode": 2},
+            "result": {"type": "int", "value": 0},
+            "elapsed_ms": 1,
+        }
+        mode_end = {
+            **mode_start,
+            "request": {"operation": "set_communication_log_mode", "mode": 0},
+        }
+        engine, controller, session = make_raw_control_fixture2026(
+            self,
+            source=source,
+            catalog=catalog,
+            module_files=module_files,
+            operation="write",
+            events=(clock_start, mode_start, *rows, mode_end, clock_end),
+        )
+        self.addCleanup(engine.close)
+        self.addCleanup(session.trace.close)
+        output = tempfile.TemporaryDirectory(dir="runtime/no-car-33")
+        self.addCleanup(output.cleanup)
+        assert engine._source is not None
+        engine.bind_persistence(
+            CUWPersistence(
+                Path(output.name),
+                ReproInfoState((RecoveryCalibration("authored.cuw", engine._source),)),
+            )
+        )
+        initial_counts = tuple(range(101, 117))
+        initial_percentages = tuple(range(11, 27))
+        engine.dh_state._transferred_bytes = initial_counts
+        engine.dh_state._progress = initial_percentages
+        job = engine.bind_thread_job(controller)
+        self.addCleanup(job.stop)
+        self.assertEqual(job.worker._control_count_scratch2026, [0] * 16)
+        self.assertEqual(
+            job.worker._control_percent_scratch2026, list(initial_percentages)
+        )
+        observed = []
+        original_action = session.trace.action
+
+        def faulting_observer(event, remaining):
+            if event["operation"] in (
+                "notify_progress_count",
+                "notify_progress_percent",
+            ):
+                observed.append(
+                    (
+                        event["operation"],
+                        engine.dh_state._transferred_bytes,
+                        engine.dh_state._progress,
+                        job.worker._previous_percentages2026,
+                    )
+                )
+                if event["operation"] == "notify_progress_percent":
+                    raise RuntimeError("authored progress observer fault")
+            return original_action(event, remaining)
+
+        session.trace.action = faulting_observer
+        controller.runtime.action = faulting_observer
+        job.start(session)
+        with self.assertRaisesRegex(RuntimeError, "authored progress observer fault"):
+            job.result(5)
+        self.assertEqual(
+            observed,
+            [
+                (
+                    "notify_progress_count",
+                    (2, *([0] * 15)),
+                    initial_percentages,
+                    (),
+                ),
+                (
+                    "notify_progress_percent",
+                    (2, *([0] * 15)),
+                    (50, *initial_percentages[1:]),
+                    initial_percentages,
+                ),
+            ],
+        )
+        self.assertEqual(engine.dh_state._transferred_bytes, (2, *([0] * 15)))
+        self.assertEqual(engine.dh_state._progress, (50, *initial_percentages[1:]))
+        self.assertEqual(job.worker._previous_percentages2026, initial_percentages)
+        self.assertEqual(
+            job.worker._control_percent_scratch2026,
+            [50, *initial_percentages[1:]],
+        )
+
     def test_missing_profile_loader_uses_actual_general_fallback(self):
         for legacy_flag in (True, False):
             with self.subTest(legacy_flag=legacy_flag):

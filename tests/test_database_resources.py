@@ -3601,6 +3601,11 @@ class NativeRamTests(unittest.TestCase):
 
     def test_p5_saved_log_disconnect_precedes_Stop_and_primary_status_survives(self):
         from scripts.native_communication import ConnectionResult, NativeFrameController
+        from tests.test_frame_transport import (
+            DriverPrimitive,
+            native_operations,
+            selected_profile,
+        )
 
         attributes = DdrAttributeCapture(
             initial_ddr_p5_attribute_plan(self.profile), (), 10, 1
@@ -3622,10 +3627,10 @@ class NativeRamTests(unittest.TestCase):
             (0, 0xC0040101, 0x90020706, 0xC0040101),
         ):
             events = []
-            controller = create_autospec(NativeFrameController, instance=True)
-            controller.native_build = 18
-            controller.disconnect.side_effect = lambda flag, events=events, **kwargs: (
-                events.append(("disconnect", flag)) or 0x90020301
+            controller_profile = selected_profile(2)
+            backend = DriverPrimitive()
+            controller = NativeFrameController(
+                native_operations(backend, bus=2, profile=controller_profile)
             )
             channel = NativeCommunication(
                 self.profile, controller, "authored-ecu", bus_id=2
@@ -3659,6 +3664,13 @@ class NativeRamTests(unittest.TestCase):
                         "connection_no_buffer",
                         side_effect=lambda events=events: (
                             events.append("connect") or ConnectionResult(0, True, None)
+                        ),
+                    ),
+                    patch.object(
+                        controller,
+                        "disconnect",
+                        side_effect=lambda flag, events=events, **kwargs: (
+                            events.append(("disconnect", flag)) or 0x90020301
                         ),
                     ),
                     patch(

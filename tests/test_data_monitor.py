@@ -2939,6 +2939,151 @@ class DataMonitorTests(unittest.TestCase):
             select_provider(4, 1, None)
 
 
+class RetainedNormalFactoryTests(unittest.TestCase):
+    def test_selected_factory_forwards_concrete_owner_for_normal_p4(self):
+        from dataclasses import replace
+
+        from scripts.data_monitor import (
+            MonitorAddress,
+            P4Packing,
+            SelectedP4Monitor,
+            p4_setup_commands,
+        )
+        from scripts.monitor_support import monitor_source_identity
+        from scripts.native_communication import (
+            NativeCommunication,
+            NativeFrameController,
+        )
+        from tests.test_monitor_j2534 import authored_operations
+
+        operations, backend = authored_operations()
+        source = operations.profile
+        identity = monitor_source_identity(source, "")
+        packing = P4Packing(
+            1,
+            4,
+            (),
+            (b"\x01\x06\x00\x01A", b"\x01\x01B"),
+            ((0, 2),),
+            (),
+        )
+        plan = SelectedP4Monitor(
+            MonitorDefinitions((1,), (), (), "authored", identity),
+            packing,
+            (),
+            ((0, 2),),
+            p4_setup_commands(
+                packing,
+                interface_id=0x7E0,
+                buffer_468=source.category,
+                total_length=2,
+                standard_values=(),
+                attribute_2_23=False,
+            ),
+            (),
+            18,
+        )
+        connection = SelectedMonitorConnection(
+            source.category,
+            0x12,
+            MonitorAddress(0x7E0, 0x7E8, 0xFFFFFFFF),
+            10,
+            8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            operations.protocol_record,
+            None,
+            source_identity=identity,
+        )
+        communication = NativeCommunication(
+            source,
+            NativeFrameController(operations),
+            "selected",
+            bus_id=0x12,
+            source_build=18,
+            clock=lambda: 0,
+        )
+        foreign = NativeCommunication(
+            replace(source, vehicle_name_key=1),
+            NativeFrameController(operations),
+            "selected",
+            bus_id=0x12,
+            source_build=18,
+            clock=lambda: 0,
+        )
+        with self.assertRaisesRegex(MonitorError, "source/controller context"):
+            selected_normal_monitor_worker(
+                operations, plan, connection, communication=foreign
+            )
+        self.assertEqual(backend.calls, [])
+
+        worker = selected_normal_monitor_worker(
+            operations, plan, connection, communication=communication, clock=lambda: 0
+        )
+
+        from scripts.monitor_j2534 import DirectJ2534Worker
+
+        self.assertIsInstance(worker, DirectJ2534Worker)
+        self.assertIs(worker.communication, communication)
+        assert isinstance(communication.operations, NativeFrameController)
+        self.assertIs(communication.operations.operations, operations)
+        self.assertEqual(backend.calls, [])
+
+    def test_retained_factory_rejects_a8_before_backend_io(self):
+        from scripts.frame_transport import DriverProperties, J2534Result
+        from scripts.frame_transport_variants import create_lower_transport
+        from scripts.native_communication import (
+            NativeCommunication,
+            NativeFrameController,
+        )
+        from tests.test_monitor_packet_a8 import profile, selected
+
+        class Backend:
+            def __init__(self):
+                self.calls = []
+
+            def invoke(self, operation, fields, *, deadline, cancelled):
+                self.calls.append(operation)
+                return J2534Result()
+
+        source = profile()
+        plan = selected(source, functions=(8,))
+        connection = selected_p4_connection(
+            source,
+            bus_id=0x12,
+            diagnostic_mode=bytes(16),
+            controller_category_flags=9,
+        )
+        backend = Backend()
+        operations = create_lower_transport(
+            source,
+            plan.packing.setup_requests[0],
+            backend,
+            native_build=18,
+            bus_id=0x12,
+            driver=DriverProperties(0, b"04.04", "authored"),
+            device_kind=8,
+            clock=lambda: 0,
+        )
+        communication = NativeCommunication(
+            source,
+            NativeFrameController(operations),
+            "selected",
+            bus_id=0x12,
+            source_build=18,
+            clock=lambda: 0,
+        )
+
+        with self.assertRaisesRegex(MonitorError, "only supports selected P4/P5"):
+            selected_normal_monitor_worker(
+                operations, plan, connection, communication=communication
+            )
+        self.assertEqual(backend.calls, [])
+
+
 class SelectedLegacyRuntimeTests(unittest.TestCase):
     def test_selected_legacy_factory_actual_run_and_recording_lifetime(self):
         from itertools import product

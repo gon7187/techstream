@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from typing import cast
 
 import gi
 
@@ -44,9 +45,19 @@ from scripts.database_resources import RamReplay, create_ram_examples
 from scripts.demo import create_demo
 from scripts.demo_calibration import create_calibration_examples
 from scripts.diagnostic_db import DiagnosticCatalog
+from scripts.drive_recorder import (
+    CONTAINER_TABLES,
+    DrsFile,
+    DrsTable,
+    NativeMonitorBuffer,
+    NativeTriggerInfo,
+    NativeTriggerParameters,
+    NativeVehicleSelection,
+    decode_command,
+)
 from scripts.jlr import discover_jlr, probe_adapter
 from scripts.local_files import read_regular
-from scripts.monitor_replay import load_monitor_recording
+from scripts.monitor_replay import MonitorReplay, load_monitor_recording
 from scripts.native_procedures import (
     create_example_files,
     open_utility,
@@ -225,6 +236,27 @@ class Catalog(Adw.Application):
         self.vehicle_generation = 0
         self.vehicle_thread = None
         self.vehicle_loading = False
+        self.native_vehicle_owner = None
+        self.native_vehicle_owner_generation = 0
+        self.native_vehicle_cleanup_generation = 0
+        self.native_vehicle_load_token = None
+        self.native_vehicle_busy = False
+        self.native_vehicle_cancel = threading.Event()
+        self.native_vehicle_thread = None
+        self.native_vehicle_closed = True
+        self.native_vehicle_selection: NativeVehicleSelection | None = None
+        self.native_vehicle_systems = ()
+        self.native_vehicle_trigger = None
+        self.native_vehicle_parameters = None
+        self.native_vehicle_selected_pairs = ()
+        self.native_vehicle_categories_applied = False
+        self.native_vehicle_recording_path = None
+        self.native_vehicle_settings_path = None
+        self.native_vehicle_codec = "cp1252"
+        self.monitor_config_source = None
+        self.native_vehicle_expected_owner = None
+        self.native_vehicle_pending_restart = None
+        self.native_vehicle_menu_serial = 0
         self.utility_ui = None
         self.active_session = None
         self.active_sources: tuple[Path, ...] = ()
@@ -242,6 +274,8 @@ class Catalog(Adw.Application):
         self.adapter_cancel.set()
         self.session_cancel.set()
         self.offline_cancel.set()
+        self.vehicle_generation += 1
+        self.native_vehicle_cancel.set()
         if self.adapter_thread is not None:
             self.adapter_thread.join()
         if self.session_thread is not None:
@@ -250,6 +284,28 @@ class Catalog(Adw.Application):
             self.offline_thread.join()
         if self.vehicle_thread is not None:
             self.vehicle_thread.join()
+        if self.native_vehicle_thread is not None:
+            self.native_vehicle_thread.join()
+        owner = self.native_vehicle_owner
+        if owner is not None:
+            self.native_vehicle_closed = True
+            try:
+                status = owner.close_native_vehicle()
+                if status:
+                    print(
+                        f"Native vehicle cleanup returned status 0x{status:08X} during shutdown",
+                        file=sys.stderr,
+                    )
+                if owner.native_vehicle_cleanup_pending:
+                    print(
+                        "Native vehicle cleanup remains pending during shutdown",
+                        file=sys.stderr,
+                    )
+            except Exception as exc:  # noqa: BLE001 - shutdown has no live dialog.
+                print(
+                    f"Native vehicle cleanup failed during shutdown: {exc}",
+                    file=sys.stderr,
+                )
 
     def activate_window(self, *_args):
         if hasattr(self, "window"):
@@ -621,6 +677,850 @@ class Catalog(Adw.Application):
         )
         return view
 
+    def choose_native_vehicle_recording(self, *_args):
+        if self.native_vehicle_busy or self.closed:
+            return
+        chooser = Gtk.FileDialog(title="Открыть запись нативного монитора")
+
+        def finished(dialog, result):
+            try:
+                path = dialog.open_finish(result).get_path()
+                if path is None:
+                    raise ValueError("Выберите локальную запись")
+                self.choose_native_vehicle_settings(Path(path))
+            except GLib.Error as exc:
+                self.dialog_error(exc)
+            except (OSError, ValueError) as exc:
+                self.toast(str(exc))
+
+        chooser.open(self.window, None, finished)
+
+    def choose_native_vehicle_settings(self, recording_path):
+        chooser = Gtk.FileDialog(
+            title="Выбрать DRS с параметрами записи",
+            initial_name=(
+                self.recorder_settings_path.name
+                if self.recorder_settings_path is not None
+                else "settings.drs"
+            ),
+        )
+
+        def finished(dialog, result):
+            try:
+                settings_path = dialog.open_finish(result).get_path()
+                if settings_path is None:
+                    raise ValueError("Выберите DRS-файл с таблицами триггера")
+                self.start_native_vehicle_selection(recording_path, Path(settings_path))
+            except GLib.Error as exc:
+                self.dialog_error(exc)
+            except (OSError, ValueError) as exc:
+                self.toast(str(exc))
+
+        chooser.open(self.window, None, finished)
+
+    def _native_vehicle_request(self):
+        try:
+            text = self.native_vehicle_info_ids.get_text().strip()
+            info_ids = tuple(int(item.strip(), 0) for item in text.split(","))
+            if not info_ids or any(not 0 <= item <= 0xFFFF for item in info_ids):
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("Укажите номера нужных полей через запятую") from exc
+        encodings = ("cp1252", "cp932", "utf-8")
+        encoding = encodings[self.native_vehicle_encoding.get_selected()]
+        return info_ids, encoding, self.native_vehicle_division.get_value_as_int()
+
+    def start_native_vehicle_selection(
+        self, recording_path, settings_path, *, source_root=None
+    ):
+        if self.native_vehicle_busy or self.closed:
+            return
+        owner = self.native_vehicle_owner
+        if owner is not None:
+            self.native_vehicle_pending_restart = (
+                recording_path,
+                settings_path,
+                source_root,
+            )
+            self.cancel_native_vehicle()
+            return
+        try:
+            info_ids, encoding, division = self._native_vehicle_request()
+        except ValueError as exc:
+            self.native_vehicle_status.set_text(str(exc))
+            self.native_vehicle_panel.set_visible(True)
+            return
+        self.set_native_vehicle_catalog_visible(False)
+        for widget in (
+            self.native_vehicle_info_ids,
+            self.native_vehicle_encoding,
+            self.native_vehicle_division,
+            self.native_vehicle_judge,
+            self.native_vehicle_request_row,
+            self.native_vehicle_menu,
+            self.native_vehicle_continue,
+            self.native_vehicle_select,
+            self.native_vehicle_cancel_button,
+            self.native_vehicle_ecu_list,
+            self.native_vehicle_run,
+        ):
+            widget.set_visible(True)
+        self.vehicle_generation += 1
+        generation = self.vehicle_generation
+        load_token = object()
+        self.native_vehicle_load_token = load_token
+        self.native_vehicle_cancel.clear()
+        self.native_vehicle_cancel_button.set_label("Отменить выбор")
+        self.native_vehicle_selected_pairs = ()
+        self.native_vehicle_categories_applied = False
+        self.native_vehicle_recording_path = recording_path
+        self.native_vehicle_settings_path = settings_path
+        self.native_vehicle_codec = encoding
+        self.native_vehicle_owner = None
+        self.native_vehicle_closed = True
+        self.native_vehicle_selection = None
+        self.native_vehicle_systems = ()
+        self.native_vehicle_model_summary.set_text("")
+        self.native_vehicle_model_summary.set_visible(False)
+        self.native_vehicle_continue.set_sensitive(False)
+        self.native_vehicle_select.set_sensitive(False)
+        self.native_vehicle_answer_button.set_sensitive(False)
+        self.native_vehicle_answer_row.set_visible(False)
+        self.native_vehicle_run.set_sensitive(False)
+        while child := self.native_vehicle_menu.get_first_child():
+            self.native_vehicle_menu.remove(child)
+        while child := self.native_vehicle_ecu_list.get_first_child():
+            self.native_vehicle_ecu_list.remove(child)
+        self.native_vehicle_panel.set_visible(True)
+        self.native_vehicle_status.set_text("Загрузка записи и нативного меню…")
+        self.set_native_vehicle_busy(True)
+        self.native_vehicle_busy = True
+        self.native_vehicle_closed = True
+        bus_judge = int(self.native_vehicle_judge.get_active())
+
+        def work():
+            owner = None
+            close_attempted = False
+            close_status = 0
+            close_error = ""
+
+            def close_owner():
+                nonlocal close_attempted, close_status, close_error
+                if owner is None or close_attempted:
+                    return close_status, close_error
+                close_attempted = True
+                try:
+                    close_status = owner.close_native_vehicle()
+                except Exception as exc:  # noqa: BLE001 - preserve actual close outcome.
+                    close_error = str(exc)
+                return close_status, close_error
+
+            result = None
+            error = ""
+            cancelled = False
+            try:
+                region = self.root.parent.name.removeprefix("Techstream_Data_")
+                replay_source_root = source_root or (
+                    self.root.parent.parent / f"Techstream_DB_{region}"
+                )
+                owner = load_monitor_recording(
+                    recording_path,
+                    replay_source_root,
+                    cancelled=self.native_vehicle_cancel.is_set,
+                )
+                settings = DrsFile.parse(
+                    read_regular(settings_path, limit=64 * 1024 * 1024)
+                )
+                trigger_tables = []
+                parameter_tables = []
+                pending = list(settings.tables)
+                while pending:
+                    table = pending.pop(0)
+                    if table.table_id in (5, 6):
+                        decoded = decode_command(table)["trigger"]
+                        (
+                            trigger_tables if table.table_id == 5 else parameter_tables
+                        ).append(decoded)
+                    elif table.table_id in CONTAINER_TABLES:
+                        children = decode_command(table).get("children", ())
+                        if isinstance(children, tuple):
+                            pending.extend(cast(tuple[DrsTable, ...], children))
+                if len(trigger_tables) != 1 or not isinstance(
+                    trigger_tables[0], NativeTriggerInfo
+                ):
+                    raise ValueError(
+                        "В DRS нужна ровно одна таблица параметров триггера"
+                    )
+                if len(parameter_tables) != 1 or not isinstance(
+                    parameter_tables[0], NativeTriggerParameters
+                ):
+                    raise ValueError("В DRS нужна ровно одна таблица условий записи")
+                owner.begin_native_vehicle(
+                    info_ids=info_ids, text_encoding=encoding, division=division
+                )
+                menu = owner.native_categories((), bus_judge=bus_judge)
+                result = (menu, trigger_tables[0], parameter_tables[0])
+            except Exception as exc:  # noqa: BLE001 - backend errors must be visible.
+                error = str(exc)
+            cancelled = self.native_vehicle_cancel.is_set() or self.closed
+            if cancelled or error:
+                close_owner()
+            pending = bool(owner and owner.native_vehicle_cleanup_pending)
+            return (
+                owner,
+                result,
+                error,
+                close_status,
+                close_error,
+                pending,
+                cancelled,
+                close_attempted,
+            )
+
+        self.native_vehicle_thread = threading.Thread(
+            target=lambda: self._finish_native_vehicle_load(
+                generation, load_token, work
+            ),
+            name="techstream-native-vehicle",
+        )
+        self.native_vehicle_thread.start()
+
+    def _finish_native_vehicle_load(self, generation, load_token, work):
+        (
+            owner,
+            result,
+            error,
+            close_status,
+            close_error,
+            pending,
+            cancelled,
+            close_attempted,
+        ) = work()
+        self.native_vehicle_owner = owner
+        self.native_vehicle_owner_generation += 1
+        owner_generation = self.native_vehicle_owner_generation
+        self.native_vehicle_closed = owner is None or bool(error) or cancelled
+        GLib.idle_add(
+            self.native_vehicle_load_ready,
+            generation,
+            load_token,
+            owner,
+            owner_generation,
+            result,
+            error,
+            close_status,
+            close_error,
+            pending,
+            cancelled,
+            close_attempted,
+        )
+
+    def native_vehicle_load_ready(
+        self,
+        generation,
+        load_token,
+        owner,
+        owner_generation,
+        result,
+        error,
+        close_status,
+        close_error,
+        pending,
+        cancelled,
+        close_attempted,
+    ):
+        if (
+            self.closed
+            or load_token is not self.native_vehicle_load_token
+            or owner_generation != self.native_vehicle_owner_generation
+            or owner is not self.native_vehicle_owner
+        ):
+            return GLib.SOURCE_REMOVE
+        self.native_vehicle_busy = False
+        self.set_native_vehicle_busy(False)
+        stale = generation != self.vehicle_generation or cancelled
+        if owner is not None and (pending or error) and not self.native_vehicle_closed:
+            self.native_vehicle_closed = True
+        if pending:
+            self.native_vehicle_closed = True
+            self.native_vehicle_status.set_text(
+                self._native_vehicle_close_status(close_status, close_error or error)
+            )
+            self.native_vehicle_cancel_button.set_label("Повторить закрытие")
+            self.set_native_vehicle_busy(False)
+            return GLib.SOURCE_REMOVE
+        if stale or error:
+            if stale and owner is not None and not close_attempted:
+                self.native_vehicle_closed = True
+                self.native_vehicle_status.set_text(
+                    error or "Отмена запрошена. Закрытие нативной сессии…"
+                )
+                self.cancel_native_vehicle(
+                    increment_generation=False, context_error=error or close_error
+                )
+                return GLib.SOURCE_REMOVE
+            self.native_vehicle_owner = None
+            self.native_vehicle_owner_generation += 1
+            self.native_vehicle_closed = True
+            self.set_native_vehicle_catalog_visible(True)
+            self.native_vehicle_cancel_button.set_label("Отменить выбор")
+            self.native_vehicle_status.set_text(
+                error or close_error or "Выбор отменён."
+            )
+            self.vehicle_recording.set_sensitive(True)
+            if stale and not error and self.native_vehicle_pending_restart is not None:
+                self._resume_native_vehicle_restart()
+            return GLib.SOURCE_REMOVE
+        self.native_vehicle_closed = False
+        menu, self.native_vehicle_trigger, self.native_vehicle_parameters = result
+        self.native_vehicle_status.set_text(
+            "Запись загружена. Выберите варианты в порядке нативного меню."
+        )
+        self.render_native_vehicle_menu(menu)
+        self.set_native_vehicle_busy(False)
+        return GLib.SOURCE_REMOVE
+
+    def _native_vehicle_close_status(self, status, error):
+        details = []
+        if status:
+            details.append(f"код 0x{status:08X}")
+        if error:
+            details.append(error)
+        if details:
+            return f"Не удалось закрыть нативную сессию · {'; '.join(details)}"
+        return "Закрытие нативной сессии ещё не подтверждено. Повторите закрытие."
+
+    def _resume_native_vehicle_restart(self):
+        restart = self.native_vehicle_pending_restart
+        self.native_vehicle_pending_restart = None
+        if restart is not None:
+            recording_path, settings_path, source_root = restart
+            self.start_native_vehicle_selection(
+                recording_path, settings_path, source_root=source_root
+            )
+
+    def _start_native_vehicle_operation(self, operation, action):
+        owner = self.native_vehicle_owner
+        if (
+            owner is None
+            or self.native_vehicle_busy
+            or self.closed
+            or self.native_vehicle_closed
+            or owner.native_vehicle_cleanup_pending
+        ):
+            return
+        generation = self.vehicle_generation
+        owner_generation = self.native_vehicle_owner_generation
+        self.native_vehicle_cleanup_generation += 1
+        cleanup_generation = self.native_vehicle_cleanup_generation
+        self.native_vehicle_busy = True
+        self.set_native_vehicle_busy(True)
+        self.native_vehicle_status.set_text("Выполняется операция по записи…")
+
+        def work():
+            result, error = None, ""
+            close_attempted = False
+            close_status = 0
+            close_error = ""
+
+            def close_owner():
+                nonlocal close_attempted, close_status, close_error
+                if close_attempted:
+                    return close_status, close_error
+                close_attempted = True
+                try:
+                    close_status = owner.close_native_vehicle()
+                except Exception as exc:  # noqa: BLE001 - preserve actual close outcome.
+                    close_error = str(exc)
+                return close_status, close_error
+
+            try:
+                result = operation(owner)
+            except Exception as exc:  # noqa: BLE001 - backend errors must be visible.
+                error = str(exc)
+                if not owner.native_vehicle_cleanup_pending:
+                    close_owner()
+            stale = (
+                self.native_vehicle_cancel.is_set()
+                or generation != self.vehicle_generation
+                or self.closed
+            )
+            if stale:
+                if not close_attempted:
+                    close_owner()
+                pending = owner.native_vehicle_cleanup_pending
+                GLib.idle_add(
+                    self.native_vehicle_cleanup_ready,
+                    generation,
+                    owner_generation,
+                    cleanup_generation,
+                    owner,
+                    close_status,
+                    close_error or error,
+                    pending,
+                )
+                return
+            pending = owner.native_vehicle_cleanup_pending
+            GLib.idle_add(
+                self.native_vehicle_ready,
+                generation,
+                owner_generation,
+                owner,
+                result,
+                error,
+                action,
+                close_status,
+                close_error,
+                pending,
+            )
+
+        self.native_vehicle_thread = threading.Thread(
+            target=work, name="techstream-native-vehicle"
+        )
+        self.native_vehicle_thread.start()
+
+    def native_vehicle_cleanup_ready(
+        self,
+        generation,
+        owner_generation,
+        cleanup_generation,
+        owner,
+        status,
+        error,
+        pending,
+    ):
+        if (
+            self.closed
+            or owner is not self.native_vehicle_owner
+            or owner_generation != self.native_vehicle_owner_generation
+            or cleanup_generation != self.native_vehicle_cleanup_generation
+            or generation > self.vehicle_generation
+        ):
+            return GLib.SOURCE_REMOVE
+        self.native_vehicle_busy = False
+        self.native_vehicle_closed = True
+        if pending:
+            self.native_vehicle_status.set_text(
+                self._native_vehicle_close_status(status, error)
+            )
+            self.native_vehicle_cancel_button.set_label("Повторить закрытие")
+            self.set_native_vehicle_busy(False)
+            return GLib.SOURCE_REMOVE
+        self.native_vehicle_owner = None
+        self.native_vehicle_owner_generation += 1
+        self.native_vehicle_cancel_button.set_label("Отменить выбор")
+        self.set_native_vehicle_catalog_visible(True)
+        self.native_vehicle_status.set_text(error or "Выбор отменён.")
+        self.set_native_vehicle_busy(False)
+        self.vehicle_recording.set_sensitive(True)
+        if not error:
+            self._resume_native_vehicle_restart()
+        else:
+            self.native_vehicle_pending_restart = None
+        return GLib.SOURCE_REMOVE
+
+    def native_vehicle_ready(
+        self,
+        generation,
+        owner_generation,
+        owner,
+        result,
+        error,
+        action,
+        close_status,
+        close_error,
+        pending,
+    ):
+        if (
+            self.closed
+            or self.native_vehicle_owner is not owner
+            or owner_generation != self.native_vehicle_owner_generation
+        ):
+            return GLib.SOURCE_REMOVE
+        if generation != self.vehicle_generation:
+            self.native_vehicle_busy = False
+            self.native_vehicle_closed = True
+            self.native_vehicle_status.set_text(
+                error or "Отмена запрошена. Закрытие нативной сессии…"
+            )
+            self.cancel_native_vehicle(
+                increment_generation=False, context_error=error or close_error
+            )
+            return GLib.SOURCE_REMOVE
+        self.native_vehicle_busy = False
+        if error:
+            self.native_vehicle_closed = True
+            if pending:
+                self.native_vehicle_status.set_text(
+                    self._native_vehicle_close_status(
+                        close_status, close_error or error
+                    )
+                )
+                self.native_vehicle_cancel_button.set_label("Повторить закрытие")
+                self.set_native_vehicle_busy(False)
+                return GLib.SOURCE_REMOVE
+            self.native_vehicle_owner = None
+            self.native_vehicle_owner_generation += 1
+            self.set_native_vehicle_catalog_visible(True)
+            self.native_vehicle_cancel_button.set_label("Отменить выбор")
+            self.native_vehicle_status.set_text(
+                f"Операция не выполнена: {error}"
+                + (f"; ошибка закрытия: {close_error}" if close_error else "")
+            )
+            self.set_native_vehicle_busy(False)
+            self.vehicle_recording.set_sensitive(True)
+            return GLib.SOURCE_REMOVE
+        self.set_native_vehicle_busy(False)
+        if action == "categories":
+            self.native_vehicle_categories_applied = True
+            self.native_vehicle_status.set_text("Нативное меню обновлено.")
+            self.render_native_vehicle_menu(result)
+            self._start_native_vehicle_operation(
+                lambda replay: replay.native_select(), "selection"
+            )
+        elif action == "selection":
+            selection = result
+            model = selection.trailing_words[1]
+            index = selection.trailing_words[0]
+            self.native_vehicle_selection = selection
+            if model == 0xFFFF:
+                self.finish_native_vehicle_menu()
+                self.native_vehicle_status.set_text(
+                    "В записи указан ответ «автомобиль не выбран»."
+                )
+            elif model == 0:
+                self.native_vehicle_status.set_text(
+                    f"Нужен ответ на вопрос записи (Index {index})."
+                )
+                self.render_native_vehicle_options(selection)
+            else:
+                self.native_vehicle_answer_row.set_visible(False)
+                self._start_native_vehicle_operation(
+                    lambda replay: replay.native_vehicle_systems(), "systems"
+                )
+        elif action == "answer":
+            selection = result
+            self.native_vehicle_selection = selection
+            if selection.trailing_words[1] in (0, 0xFFFF):
+                self.native_vehicle_status.set_text(
+                    "Запись не вернула конечную модель. Можно ответить на следующий вопрос."
+                )
+                self.render_native_vehicle_options(selection)
+            else:
+                self.native_vehicle_answer_row.set_visible(False)
+                self._start_native_vehicle_operation(
+                    lambda replay: replay.native_vehicle_systems(), "systems"
+                )
+        elif action == "systems":
+            self.finish_native_vehicle_menu()
+            self.native_vehicle_systems = tuple(result)
+            selection = cast(NativeVehicleSelection, self.native_vehicle_selection)
+            names = tuple(
+                entry.text.data.decode(self.native_vehicle_codec, errors="replace")
+                for entry in selection.select_names
+                if entry.text.data
+            )
+            detail = " · ".join(names[:3])
+            self.native_vehicle_model_summary.set_text(
+                f"Модель {selection.trailing_words[1]}"
+                + (f" · {detail}" if detail else "")
+            )
+            self.native_vehicle_model_summary.set_visible(True)
+            self.native_vehicle_status.set_text(
+                f"Модель {selection.trailing_words[1]}"
+                + (f" · {detail}" if detail else "")
+                + f" · систем по записи: {len(result)}"
+            )
+            while child := self.native_vehicle_ecu_list.get_first_child():
+                self.native_vehicle_ecu_list.remove(child)
+            for system in result:
+                row = Adw.ActionRow(
+                    title=GLib.markup_escape_text(system["name"] or system["file"]),
+                    subtitle=f"{system['file']} · категория {system['category']}",
+                    activatable=True,
+                )
+                row.connect("activated", self.bind_native_vehicle_system, system)
+                self.native_vehicle_ecu_list.append(row)
+        elif action == "bound":
+            self.native_vehicle_status.set_text(result)
+            self.native_vehicle_run.set_sensitive(True)
+        elif action == "run":
+            if pending:
+                self.native_vehicle_closed = True
+                self.native_vehicle_status.set_text(
+                    self._native_vehicle_close_status(close_status, close_error)
+                )
+                self.native_vehicle_cancel_button.set_label("Повторить закрытие")
+                self.set_native_vehicle_busy(False)
+                return GLib.SOURCE_REMOVE
+            report = result
+            report["_monitor_state"] = owner
+            replay_owner = cast(MonitorReplay, owner)
+            report["source_paths"] = [str(path) for path in replay_owner.sources]
+            self.monitor_config_source = self.native_vehicle_settings_path
+            self.native_vehicle_owner = None
+            self.native_vehicle_owner_generation += 1
+            self.native_vehicle_closed = True
+            self.set_native_vehicle_catalog_visible(True)
+            self.vehicle_recording.set_sensitive(True)
+            self.select_navigation(self.navigation.get_row_at_index(6))
+            self.start_offline(
+                self.native_vehicle_recording_path,
+                operation=lambda: report,
+                sources=replay_owner.sources,
+            )
+        self.set_native_vehicle_busy(False)
+        return GLib.SOURCE_REMOVE
+
+    def set_native_vehicle_catalog_visible(self, visible):
+        for widget in self.native_vehicle_catalog_widgets:
+            widget.set_visible(visible)
+
+    def finish_native_vehicle_menu(self):
+        for widget in (
+            self.native_vehicle_info_ids,
+            self.native_vehicle_encoding,
+            self.native_vehicle_division,
+            self.native_vehicle_judge,
+            self.native_vehicle_request_row,
+            self.native_vehicle_menu,
+            self.native_vehicle_continue,
+            self.native_vehicle_select,
+            self.native_vehicle_answer_row,
+        ):
+            widget.set_visible(False)
+
+    def render_native_vehicle_menu(self, menu):
+        self.native_vehicle_menu_serial += 1
+        while child := self.native_vehicle_menu.get_first_child():
+            self.native_vehicle_menu.remove(child)
+        self.native_vehicle_pairs: list[tuple[int, Gtk.DropDown]] = []
+        self.native_vehicle_choice_ids: dict[Gtk.DropDown, tuple[int | None, ...]] = {}
+        self.native_vehicle_answer_ids: tuple[int | None, ...] = ()
+        self.native_vehicle_choice_ids = {}
+        self.native_vehicle_answer_ids = ()
+        for item in menu.items:
+            row = box(vertical=False, spacing=8)
+            row.append(label(f"Уровень {item.level}: {item.label}", hexpand=True))
+            choices = item.choices
+            if choices:
+                dropdown = Gtk.DropDown(
+                    model=Gtk.StringList.new(
+                        ["Выберите вариант…", *(choice.label for choice in choices)]
+                    ),
+                    hexpand=True,
+                )
+                self.native_vehicle_choice_ids[dropdown] = (
+                    None,
+                    *(choice.value for choice in choices),
+                )
+                dropdown.set_selected(0)
+                dropdown.set_tooltip_text("Выберите вариант из нативной записи")
+                dropdown.connect("notify::selected", self.update_native_choice_tooltip)
+                row.append(dropdown)
+                self.native_vehicle_pairs.append((item.level, dropdown))
+            else:
+                row.append(label("Нет доступных вариантов", "dim-label"))
+            self.native_vehicle_menu.append(row)
+        self.native_vehicle_continue.set_visible(
+            bool(menu.items) and not self.native_vehicle_categories_applied
+        )
+        self.native_vehicle_continue.set_sensitive(False)
+        self.native_vehicle_select.set_sensitive(
+            not menu.items or not any(item.choices for item in menu.items)
+        )
+
+    def set_native_vehicle_busy(self, busy):
+        owner = self.native_vehicle_owner
+        cleanup_pending = bool(
+            owner is not None and owner.native_vehicle_cleanup_pending
+        )
+        business_enabled = (
+            not busy
+            and owner is not None
+            and not self.native_vehicle_closed
+            and not cleanup_pending
+        )
+        self.vehicle_recording.set_sensitive(not busy and not cleanup_pending)
+        for widget in (
+            self.native_vehicle_info_ids,
+            self.native_vehicle_encoding,
+            self.native_vehicle_division,
+            self.native_vehicle_judge,
+            self.native_vehicle_continue,
+            self.native_vehicle_select,
+            self.native_vehicle_answer,
+            self.native_vehicle_answer_button,
+            self.native_vehicle_run,
+        ):
+            widget.set_sensitive(business_enabled)
+        self.native_vehicle_cancel_button.set_sensitive(busy or owner is not None)
+        for _level, dropdown in self.native_vehicle_pairs:
+            dropdown.set_sensitive(business_enabled)
+
+    def update_native_choice_tooltip(self, dropdown, *_args):
+        values = self.native_vehicle_choice_ids.get(dropdown, ())
+        index = dropdown.get_selected()
+        if index < len(values) and values[index] is not None:
+            dropdown.set_tooltip_text(f"WORD ID: 0x{values[index]:04X}")
+        self.native_vehicle_continue.set_sensitive(
+            bool(self.native_vehicle_pairs)
+            and all(item.get_selected() > 0 for _, item in self.native_vehicle_pairs)
+        )
+
+    def continue_native_categories(self, *_args):
+        if self.native_vehicle_categories_applied:
+            return
+        pairs: list[tuple[int, int]] = list(self.native_vehicle_selected_pairs)
+        for level, dropdown in self.native_vehicle_pairs:
+            index = dropdown.get_selected()
+            values = self.native_vehicle_choice_ids.get(dropdown, ())
+            if 0 < index < len(values):
+                pairs.append((level, values[index]))
+        self.native_vehicle_selected_pairs = tuple(pairs)
+        selected_pairs = self.native_vehicle_selected_pairs
+        bus_judge = int(self.native_vehicle_judge.get_active())
+        self._start_native_vehicle_operation(
+            lambda replay: replay.native_categories(
+                selected_pairs, bus_judge=bus_judge
+            ),
+            "categories",
+        )
+
+    def native_vehicle_select_model(self, *_args):
+        self._start_native_vehicle_operation(
+            lambda replay: replay.native_select(), "selection"
+        )
+
+    def render_native_vehicle_options(self, selection):
+        entries = selection.options
+        labels = [
+            entry.text.data.decode(self.native_vehicle_codec, errors="replace")
+            for entry in entries
+        ]
+        self.native_vehicle_answer.set_model(
+            Gtk.StringList.new(["Выберите вариант…", *labels])
+        )
+        self.native_vehicle_answer_ids = (
+            None,
+            *(entry.values[0] for entry in entries),
+        )
+        self.native_vehicle_answer.set_selected(0)
+        self.native_vehicle_answer.set_sensitive(bool(entries))
+        self.native_vehicle_answer_row.set_visible(bool(entries))
+        self.native_vehicle_answer_button.set_sensitive(False)
+
+    def update_native_answer_sensitive(self, *_args):
+        self.native_vehicle_answer_button.set_sensitive(
+            self.native_vehicle_answer.get_selected() > 0
+        )
+
+    def native_vehicle_answer_option(self, *_args):
+        selection = self.native_vehicle_selection
+        if selection is None:
+            return
+        index = selection.trailing_words[0]
+        if index == 0:
+            self._start_native_vehicle_operation(
+                lambda replay: replay.native_select(), "selection"
+            )
+            return
+        answer_index = self.native_vehicle_answer.get_selected()
+        values = self.native_vehicle_answer_ids
+        if answer_index <= 0 or answer_index >= len(values):
+            return
+        raw_select_id = values[answer_index]
+        self._start_native_vehicle_operation(
+            lambda replay: replay.native_answer(index, raw_select_id), "answer"
+        )
+
+    def bind_native_vehicle_system(self, _row, system):
+        self.native_vehicle_run.set_sensitive(False)
+        self._start_native_vehicle_operation(
+            lambda replay: (
+                replay.bind_native_vehicle_system(system["category"]),
+                f"ЭБУ связан: {system['name'] or system['file']}",
+            )[1],
+            "bound",
+        )
+
+    def run_native_vehicle_monitor(self, *_args):
+        trigger = self.native_vehicle_trigger
+        parameters = self.native_vehicle_parameters
+        if trigger is None or parameters is None:
+            self.native_vehicle_status.set_text(
+                "Нужны таблицы триггера и условий записи из DRS-файла."
+            )
+            return
+
+        def run(replay):
+            return replay.run(trigger=trigger, parameters=parameters)
+
+        self.native_vehicle_run.set_sensitive(False)
+        self._start_native_vehicle_operation(run, "run")
+
+    def cancel_native_vehicle(self, *, increment_generation=True, context_error=""):
+        if increment_generation:
+            self.vehicle_generation += 1
+        self.native_vehicle_cancel.set()
+        owner = self.native_vehicle_owner
+        if owner is None:
+            if self.native_vehicle_busy:
+                self.native_vehicle_closed = True
+                self.vehicle_recording.set_sensitive(False)
+                self.native_vehicle_status.set_text(
+                    "Отмена запрошена. Ожидание завершения загрузки."
+                )
+                return
+            self.set_native_vehicle_catalog_visible(True)
+            self.native_vehicle_status.set_text("Выбор отменён.")
+            self.vehicle_recording.set_sensitive(True)
+            return
+        if self.native_vehicle_busy:
+            self.native_vehicle_closed = True
+            self.vehicle_recording.set_sensitive(False)
+            self.native_vehicle_status.set_text(
+                "Отмена запрошена. Текущая операция завершит очистку."
+            )
+            return
+        self.native_vehicle_busy = True
+        self.native_vehicle_closed = True
+        owner_generation = self.native_vehicle_owner_generation
+        self.native_vehicle_cleanup_generation += 1
+        cleanup_generation = self.native_vehicle_cleanup_generation
+        self.set_native_vehicle_busy(True)
+        self.vehicle_recording.set_sensitive(False)
+        self.native_vehicle_cancel_button.set_label("Повторить закрытие")
+        self.native_vehicle_status.set_text(
+            "Повторная попытка закрытия…"
+            if owner.native_vehicle_cleanup_pending
+            else "Закрытие нативного выбора…"
+        )
+        generation = self.vehicle_generation
+
+        def close():
+            status, error = 0, context_error
+            try:
+                status = owner.close_native_vehicle()
+            except Exception as exc:  # noqa: BLE001 - cleanup failure remains visible.
+                error = f"{error}; {exc}" if error else str(exc)
+            pending = owner.native_vehicle_cleanup_pending
+            GLib.idle_add(
+                self.native_vehicle_cleanup_ready,
+                generation,
+                owner_generation,
+                cleanup_generation,
+                owner,
+                status,
+                error,
+                pending,
+            )
+
+        self.native_vehicle_thread = threading.Thread(
+            target=close, name="techstream-native-vehicle-close"
+        )
+        self.native_vehicle_thread.start()
+
     def build_docs(self):
         view = Adw.ToolbarView()
         view.add_top_bar(self.header("Документация"))
@@ -829,13 +1729,12 @@ class Catalog(Adw.Application):
         view.add_top_bar(self.header("Автомобиль"))
         page = box(margin=22)
         page.append(label("Выбор автомобиля и систем", "workspace-title", wrap=True))
-        page.append(
-            label(
-                "Каталог выбранного региона. Модель, год и комплектация определяют перечень систем из базы; наличие блоков на автомобиле ещё не проверено.",
-                "dim-label",
-                wrap=True,
-            )
+        self.vehicle_description = label(
+            "Каталог выбранного региона. Модель, год и комплектация определяют перечень систем из базы; наличие блоков на автомобиле ещё не проверено.",
+            "dim-label",
+            wrap=True,
         )
+        page.append(self.vehicle_description)
         self.vehicle_region = Gtk.DropDown()
         self.vehicle_region.set_tooltip_text("Регион каталога автомобилей")
         self.vehicle_region.connect("notify::selected", self.change_vehicle_region)
@@ -844,6 +1743,91 @@ class Catalog(Adw.Application):
             "Откройте раздел, чтобы загрузить каталог.", wrap=True
         )
         page.append(self.vehicle_status)
+        self.vehicle_recording = Gtk.Button(
+            label="Выбрать автомобиль по записи монитора…",
+            halign=Gtk.Align.START,
+        )
+        self.vehicle_recording.connect("clicked", self.choose_native_vehicle_recording)
+        page.append(self.vehicle_recording)
+        self.native_vehicle_panel = box(spacing=8)
+        self.native_vehicle_panel.set_visible(False)
+        self.native_vehicle_status = label(
+            "Запись не загружена", "dim-label", wrap=True
+        )
+        self.native_vehicle_panel.append(self.native_vehicle_status)
+        self.native_vehicle_model_summary = label("", "heading", wrap=True)
+        self.native_vehicle_model_summary.set_visible(False)
+        self.native_vehicle_panel.append(self.native_vehicle_model_summary)
+        request_row = box(vertical=False, spacing=8)
+        request_row.append(label("ID сведений", "dim-label"))
+        self.native_vehicle_info_ids = Gtk.Entry(text="4", width_chars=12)
+        self.native_vehicle_info_ids.set_tooltip_text(
+            "Упорядоченные ID сведений автомобиля, WORD 0–65535"
+        )
+        request_row.append(self.native_vehicle_info_ids)
+        request_row.append(label("Кодировка", "dim-label"))
+        self.native_vehicle_encoding = Gtk.DropDown(
+            model=Gtk.StringList.new(["cp1252", "cp932", "utf-8"])
+        )
+        self.native_vehicle_encoding.set_selected(0)
+        request_row.append(self.native_vehicle_encoding)
+        request_row.append(label("Разделение", "dim-label"))
+        self.native_vehicle_division = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(value=0, lower=0, upper=65535, step_increment=1),
+            numeric=True,
+        )
+        request_row.append(self.native_vehicle_division)
+        self.native_vehicle_panel.append(request_row)
+        self.native_vehicle_request_row = request_row
+        self.native_vehicle_judge = Gtk.CheckButton(label="Проверять протокол")
+        self.native_vehicle_panel.append(self.native_vehicle_judge)
+        self.native_vehicle_menu = box(spacing=4)
+        self.native_vehicle_panel.append(self.native_vehicle_menu)
+        self.native_vehicle_pairs = []
+        self.native_vehicle_continue = Gtk.Button(
+            label="Применить варианты и определить модель",
+            sensitive=False,
+            halign=Gtk.Align.START,
+        )
+        self.native_vehicle_continue.connect("clicked", self.continue_native_categories)
+        self.native_vehicle_panel.append(self.native_vehicle_continue)
+        self.native_vehicle_cancel_button = Gtk.Button(
+            label="Отменить выбор", halign=Gtk.Align.START
+        )
+        self.native_vehicle_cancel_button.connect(
+            "clicked", lambda *_: self.cancel_native_vehicle()
+        )
+        self.native_vehicle_panel.append(self.native_vehicle_cancel_button)
+        self.native_vehicle_select = Gtk.Button(
+            label="Определить модель по записи", sensitive=False, halign=Gtk.Align.START
+        )
+        self.native_vehicle_select.connect("clicked", self.native_vehicle_select_model)
+        self.native_vehicle_panel.append(self.native_vehicle_select)
+        self.native_vehicle_answer_row = box(vertical=False, spacing=8)
+        self.native_vehicle_answer = Gtk.DropDown(sensitive=False, hexpand=True)
+        self.native_vehicle_answer.connect(
+            "notify::selected", self.update_native_answer_sensitive
+        )
+        self.native_vehicle_answer_row.append(self.native_vehicle_answer)
+        self.native_vehicle_answer_button = Gtk.Button(
+            label="Ответить", sensitive=False
+        )
+        self.native_vehicle_answer_button.connect(
+            "clicked", self.native_vehicle_answer_option
+        )
+        self.native_vehicle_answer_row.append(self.native_vehicle_answer_button)
+        self.native_vehicle_panel.append(self.native_vehicle_answer_row)
+        self.native_vehicle_ecu_list = Gtk.ListBox(
+            selection_mode=Gtk.SelectionMode.NONE
+        )
+        self.native_vehicle_ecu_list.add_css_class("boxed-list")
+        self.native_vehicle_panel.append(self.native_vehicle_ecu_list)
+        self.native_vehicle_run = Gtk.Button(
+            label="Собрать DRS и DM по записи", sensitive=False, halign=Gtk.Align.START
+        )
+        self.native_vehicle_run.connect("clicked", self.run_native_vehicle_monitor)
+        self.native_vehicle_panel.append(self.native_vehicle_run)
+        page.append(self.native_vehicle_panel)
         self.vehicle_filters = box(spacing=6)
         page.append(self.vehicle_filters)
         self.vehicle_variants = Gtk.DropDown(enable_search=True, sensitive=False)
@@ -854,12 +1838,25 @@ class Catalog(Adw.Application):
         page.append(self.vehicle_options)
         self.vehicle_system_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.vehicle_system_list.add_css_class("boxed-list")
-        page.append(Gtk.ScrolledWindow(child=self.vehicle_system_list, vexpand=True))
+        self.vehicle_system_scroller = Gtk.ScrolledWindow(
+            child=self.vehicle_system_list, vexpand=True
+        )
+        page.append(self.vehicle_system_scroller)
         self.vehicle_reload = Gtk.Button(
             label="Загрузить каталог заново", halign=Gtk.Align.START
         )
         self.vehicle_reload.connect("clicked", lambda *_: self.load_vehicle_catalog())
         page.append(self.vehicle_reload)
+        self.native_vehicle_catalog_widgets = (
+            self.vehicle_description,
+            self.vehicle_region,
+            self.vehicle_status,
+            self.vehicle_filters,
+            self.vehicle_variants,
+            self.vehicle_options,
+            self.vehicle_system_scroller,
+            self.vehicle_reload,
+        )
         view.set_content(
             Gtk.ScrolledWindow(child=page, hscrollbar_policy=Gtk.PolicyType.NEVER)
         )
@@ -875,6 +1872,8 @@ class Catalog(Adw.Application):
         if self.vehicle_loading or self.closed:
             return
         self.vehicle_generation += 1
+        self.set_native_vehicle_catalog_visible(True)
+        self.cancel_native_vehicle(increment_generation=False)
         generation = self.vehicle_generation
         region = self.root.parent.name.removeprefix("Techstream_Data_")
         root = self.root.parent.parent / f"Techstream_DB_{region}"
@@ -3052,6 +4051,7 @@ class Catalog(Adw.Application):
     def start_monitor_recording(self, path, source_root=None):
         if self.offline_busy or self.closed:
             return
+        self.monitor_config_source = None
         if source_root is None:
             region = self.root.parent.name.removeprefix("Techstream_Data_")
             source_root = self.root.parent.parent / f"Techstream_DB_{region}"
@@ -3090,6 +4090,11 @@ class Catalog(Adw.Application):
                 path = dialog.save_finish(result).get_path()
                 if path is None:
                     raise ValueError("Выберите локальный файл")
+                if (
+                    self.monitor_config_source is not None
+                    and Path(path).resolve() == self.monitor_config_source.resolve()
+                ):
+                    raise ValueError("Нельзя перезаписать DRS с настройками триггера")
                 self.start_offline_write(
                     lambda: session.save_output(Path(path), stream=stream),
                     "Настройки DRS сохранены."
@@ -5641,6 +6646,7 @@ class Catalog(Adw.Application):
 
     def load_catalog(self):
         self.vehicle_generation += 1
+        self.cancel_native_vehicle(increment_generation=False)
         self.vehicle_loading = False
         self.vehicle_catalog = None
         self.vehicle_variants.set_sensitive(False)
@@ -5933,6 +6939,8 @@ class Catalog(Adw.Application):
         page = row.get_index()
         if getattr(self, "navigation_page", None) == page:
             return
+        if getattr(self, "navigation_page", None) == 7 and page != 7:
+            self.cancel_native_vehicle()
         previous_row = self.navigation.get_row_at_index(
             getattr(self, "navigation_page", 0)
         )
@@ -7652,19 +8660,133 @@ class Catalog(Adw.Application):
 
     def check_vehicle_smoke(self):
         try:
+            if not getattr(self, "vehicle_smoke_catalog_checked", False):
+                assert self.vehicle_catalog is not None, self.vehicle_status.get_text()
+                assert len(self.vehicle_filter_choices) == 4
+                assert len(self.vehicle_candidates) == 1
+                option = self.vehicle_options.get_first_child()
+                assert option is not None
+                option.emit("activated")
+                assert self.vehicle_selection["vehicle_name_key"] == 10001
+                assert self.vehicle_system_list.get_first_child() is not None
+                self.vehicle_filter_choices[2][1].set_selected(1)
+                assert self.vehicle_answers == []
+                assert self.vehicle_options.get_first_child() is not None
+                self.vehicle_options.get_first_child().emit("activated")
+                assert self.vehicle_selection["vehicle_name_key"] == 10001
+                self.vehicle_smoke_catalog_checked = True
+            recording = os.environ.get("TECHSTREAM_NATIVE_VEHICLE_SMOKE_RECORDING")
+            settings = os.environ.get("TECHSTREAM_NATIVE_VEHICLE_SMOKE_DRS")
+            source_root = os.environ.get("TECHSTREAM_NATIVE_VEHICLE_SMOKE_SOURCE_ROOT")
+            if (
+                recording
+                and settings
+                and source_root
+                and not getattr(self, "native_vehicle_smoke_complete", False)
+            ):
+                self.native_vehicle_smoke_source_root = Path(source_root)
+                self.native_vehicle_smoke_recording = Path(recording)
+                self.native_vehicle_smoke_settings = Path(settings)
+                retry_recording = os.environ.get(
+                    "TECHSTREAM_NATIVE_VEHICLE_CLOSE_RETRY_SMOKE_RECORDING"
+                )
+                retry_source = os.environ.get(
+                    "TECHSTREAM_NATIVE_VEHICLE_CLOSE_RETRY_SMOKE_SOURCE_ROOT"
+                )
+                load_cancel_recording = os.environ.get(
+                    "TECHSTREAM_NATIVE_VEHICLE_LOAD_CANCEL_SMOKE_RECORDING"
+                )
+                selection_cancel_recording = os.environ.get(
+                    "TECHSTREAM_NATIVE_VEHICLE_SELECTION_CANCEL_SMOKE_RECORDING"
+                )
+                self.native_vehicle_smoke_race_fixtures = bool(
+                    retry_recording
+                    and retry_source
+                    and load_cancel_recording
+                    and selection_cancel_recording
+                )
+                if self.native_vehicle_smoke_race_fixtures:
+                    from unittest.mock import patch
+
+                    assert retry_recording is not None
+                    assert retry_source is not None
+                    assert load_cancel_recording is not None
+                    assert selection_cancel_recording is not None
+                    self.native_vehicle_smoke_retry_recording = Path(retry_recording)
+                    self.native_vehicle_smoke_retry_source_root = Path(retry_source)
+                    self.native_vehicle_smoke_load_cancel_recording = (
+                        Path(load_cancel_recording) if load_cancel_recording else None
+                    )
+                    self.native_vehicle_smoke_selection_cancel_recording = (
+                        Path(selection_cancel_recording)
+                        if selection_cancel_recording
+                        else None
+                    )
+                    self.native_vehicle_smoke_hold_kind = "load"
+                    self.native_vehicle_smoke_held_callback = None
+                    self.native_vehicle_smoke_callback_released = False
+                    self.native_vehicle_smoke_idle_add = GLib.idle_add
+
+                    def gated_idle_add(callback, *args, **kwargs):
+                        hold_kind = self.native_vehicle_smoke_hold_kind
+                        should_hold = (
+                            hold_kind == "load"
+                            and callback == self.native_vehicle_load_ready
+                        ) or (
+                            hold_kind == "selection"
+                            and callback == self.native_vehicle_ready
+                            and len(args) > 5
+                            and args[5] == "systems"
+                        )
+                        if should_hold:
+                            self.native_vehicle_smoke_held_callback = (callback, args)
+                            self.native_vehicle_smoke_hold_kind = None
+                            self.native_vehicle_smoke_callback_released = False
+
+                            def deliver_held_callback():
+                                if not self.native_vehicle_smoke_callback_released:
+                                    return GLib.SOURCE_CONTINUE
+                                self.native_vehicle_smoke_held_callback = None
+                                callback(*args)
+                                return GLib.SOURCE_REMOVE
+
+                            self.native_vehicle_smoke_release_callback = lambda: (
+                                setattr(
+                                    self, "native_vehicle_smoke_callback_released", True
+                                )
+                            )
+                            return self.native_vehicle_smoke_idle_add(
+                                deliver_held_callback
+                            )
+                        return self.native_vehicle_smoke_idle_add(
+                            callback, *args, **kwargs
+                        )
+
+                    self.native_vehicle_smoke_idle_patch = patch.object(
+                        GLib, "idle_add", side_effect=gated_idle_add
+                    )
+                    self.native_vehicle_smoke_idle_patch.start()
+                self.native_vehicle_smoke_stage = (
+                    "load_race_loading"
+                    if self.native_vehicle_smoke_race_fixtures
+                    else "loading"
+                )
+                self.native_vehicle_smoke_menu_serial = 0
+                self.native_vehicle_smoke_completed_runs = 0
+                self.native_vehicle_smoke_run_started = False
+                self.native_vehicle_smoke_bind_started = False
+                self.start_native_vehicle_selection(
+                    (
+                        self.native_vehicle_smoke_load_cancel_recording
+                        if self.native_vehicle_smoke_race_fixtures
+                        else self.native_vehicle_smoke_recording
+                    ),
+                    self.native_vehicle_smoke_settings,
+                    source_root=self.native_vehicle_smoke_source_root,
+                )
+                GLib.timeout_add(50, self.check_native_vehicle_smoke)
+                return GLib.SOURCE_REMOVE
             assert self.vehicle_catalog is not None, self.vehicle_status.get_text()
-            assert len(self.vehicle_filter_choices) == 4
-            assert len(self.vehicle_candidates) == 1
-            option = self.vehicle_options.get_first_child()
-            assert option is not None
-            option.emit("activated")
-            assert self.vehicle_selection["vehicle_name_key"] == 10001
-            assert self.vehicle_system_list.get_first_child() is not None
-            self.vehicle_filter_choices[2][1].set_selected(1)
-            assert self.vehicle_answers == []
-            assert self.vehicle_options.get_first_child() is not None
-            self.vehicle_options.get_first_child().emit("activated")
-            assert self.vehicle_selection["vehicle_name_key"] == 10001
             system = self.vehicle_catalog.vehicle_systems(10001)[0]
             self.open_vehicle_system(None, system)
             assert self.pages.get_visible_child_name() == "diagnostics"
@@ -7674,6 +8796,288 @@ class Catalog(Adw.Application):
         except Exception as exc:  # noqa: BLE001 - propagate every GUI assertion.
             self.finish_smoke(exc)
         return GLib.SOURCE_REMOVE
+
+    def check_native_vehicle_smoke(self):
+        try:
+            if self.closed:
+                return GLib.SOURCE_REMOVE
+            stage = self.native_vehicle_smoke_stage
+            held = getattr(self, "native_vehicle_smoke_held_callback", None)
+            if stage == "load_race_loading" and held is not None:
+                self.cancel_native_vehicle()
+                self.native_vehicle_smoke_stage = "load_race_delivery"
+                self.native_vehicle_smoke_release_callback()
+                return GLib.SOURCE_CONTINUE
+            if stage == "operation_race_menu" and held is not None:
+                self.cancel_native_vehicle()
+                self.native_vehicle_smoke_stage = "operation_race_delivery"
+                self.native_vehicle_smoke_release_callback()
+                return GLib.SOURCE_CONTINUE
+            if self.native_vehicle_busy or self.offline_busy:
+                return GLib.SOURCE_CONTINUE
+            stage = self.native_vehicle_smoke_stage
+            catalog_visible = all(
+                widget.get_visible() for widget in self.native_vehicle_catalog_widgets
+            )
+            if stage == "loading":
+                assert self.native_vehicle_owner is not None, (
+                    self.native_vehicle_status.get_text()
+                )
+                self.native_vehicle_smoke_stage = "menu"
+                return GLib.SOURCE_CONTINUE
+            if stage == "load_race_delivery":
+                assert self.native_vehicle_owner is None
+                assert catalog_visible
+                self.native_vehicle_smoke_hold_kind = "selection"
+                self.native_vehicle_smoke_stage = "operation_race_loading"
+                self.start_native_vehicle_selection(
+                    self.native_vehicle_smoke_selection_cancel_recording,
+                    self.native_vehicle_smoke_settings,
+                    source_root=self.native_vehicle_smoke_source_root,
+                )
+                return GLib.SOURCE_CONTINUE
+            if stage == "operation_race_loading":
+                assert self.native_vehicle_owner is not None, (
+                    self.native_vehicle_status.get_text()
+                )
+                self.native_vehicle_smoke_stage = "operation_race_menu"
+                return GLib.SOURCE_CONTINUE
+            if stage == "operation_race_delivery":
+                assert self.native_vehicle_owner is None
+                assert catalog_visible
+                self.native_vehicle_smoke_hold_kind = None
+                self.native_vehicle_smoke_menu_serial = self.native_vehicle_menu_serial
+                self.native_vehicle_smoke_bind_started = False
+                self.native_vehicle_smoke_stage = "loading"
+                self.start_native_vehicle_selection(
+                    self.native_vehicle_smoke_recording,
+                    self.native_vehicle_smoke_settings,
+                    source_root=self.native_vehicle_smoke_source_root,
+                )
+                return GLib.SOURCE_CONTINUE
+            if stage in (
+                "menu",
+                "retry_menu",
+                "restart_menu",
+                "operation_race_menu",
+            ):
+                if (
+                    self.native_vehicle_smoke_menu_serial
+                    < self.native_vehicle_menu_serial
+                ):
+                    self.native_vehicle_smoke_menu_serial = (
+                        self.native_vehicle_menu_serial
+                    )
+                    if not self.native_vehicle_categories_applied:
+                        if self.native_vehicle_pairs:
+                            for _level, dropdown in self.native_vehicle_pairs:
+                                assert self.native_vehicle_choice_ids[dropdown][1:]
+                                dropdown.set_selected(1)
+                            self.continue_native_categories()
+                        else:
+                            self.native_vehicle_select_model()
+                        return GLib.SOURCE_CONTINUE
+                if self.native_vehicle_selection is not None:
+                    if self.native_vehicle_selection.trailing_words[1] == 0:
+                        assert self.native_vehicle_answer_ids[1:]
+                        self.native_vehicle_answer.set_selected(1)
+                        self.native_vehicle_answer_option()
+                        return GLib.SOURCE_CONTINUE
+                    if (
+                        self.native_vehicle_systems
+                        and not self.native_vehicle_smoke_bind_started
+                    ):
+                        if stage == "retry_menu":
+                            owner = self.native_vehicle_owner
+                            assert owner is not None
+                            assert not self.native_vehicle_busy
+                            self.native_vehicle_smoke_failed_owner = owner
+                            self.native_vehicle_smoke_stage = "idle_failure_close"
+                            self.native_vehicle_cancel_button.emit("clicked")
+                            return GLib.SOURCE_CONTINUE
+                        row = self.native_vehicle_ecu_list.get_first_child()
+                        assert row is not None
+                        self.native_vehicle_smoke_bind_started = True
+                        row.emit("activated")
+                        self.native_vehicle_smoke_stage = "bound"
+                        return GLib.SOURCE_CONTINUE
+            if stage == "bound" and self.native_vehicle_run.get_sensitive():
+                selection = self.native_vehicle_selection
+                assert selection is not None
+                assert self.native_vehicle_model_summary.get_visible()
+                assert self.native_vehicle_model_summary.get_mapped()
+                assert str(selection.trailing_words[1]) in (
+                    self.native_vehicle_model_summary.get_text()
+                )
+                self.native_vehicle_smoke_run_started = True
+                self.native_vehicle_smoke_stage = "run"
+                self.run_native_vehicle_monitor()
+                return GLib.SOURCE_CONTINUE
+            if stage == "run" and self.offline_report is not None:
+                selection = self.native_vehicle_selection
+                assert selection is not None
+                assert self.native_vehicle_model_summary.get_visible()
+                assert str(selection.trailing_words[1]) in (
+                    self.native_vehicle_model_summary.get_text()
+                )
+                report = self.offline_report
+                assert report.get("workflow") == "monitor_replay", "unexpected workflow"
+                assert report.get("status") == "completed", (
+                    "native run did not complete"
+                )
+                outputs = report["result"]["outputs"]
+                by_id = {entry["id"]: entry for entry in outputs}
+                assert {"monitor", "recording"} <= by_id.keys(), (
+                    "DM or DRS output is missing"
+                )
+                self.native_vehicle_smoke_stage = "verify_dm"
+                dm = bytes.fromhex(by_id["monitor"]["native_dm_hex"])
+                parsed_dm = parse_snapshot(dm)
+                assert isinstance(parsed_dm, TableFile), (
+                    "DM export is not a native table file"
+                )
+                assert parsed_dm.magic == 0x80000002, (
+                    "monitor export has wrong file type"
+                )
+                self.native_vehicle_smoke_stage = "verify_drs"
+                drs = DrsFile.parse(bytes.fromhex(by_id["recording"]["native_drs_hex"]))
+                self.native_vehicle_smoke_stage = "verify_selection"
+                assert (
+                    decode_command(drs.tables[0])["selection"]
+                    == self.native_vehicle_selection
+                )
+                self.native_vehicle_smoke_stage = "verify_monitor_table"
+                monitor_table = next(
+                    table for table in drs.tables if table.table_id == 2
+                )
+                native_monitor = cast(
+                    NativeMonitorBuffer, decode_command(monitor_table)["monitor"]
+                )
+                assert (
+                    NativeMonitorBuffer.parse(native_monitor.encode()) == native_monitor
+                )
+                self.native_vehicle_smoke_menu_serial = self.native_vehicle_menu_serial
+                self.native_vehicle_smoke_cancel_generation = self.vehicle_generation
+                self.native_vehicle_smoke_completed_runs += 1
+                if self.native_vehicle_smoke_completed_runs == 2:
+                    self.select_navigation(self.navigation.get_row_at_index(7))
+                    self.native_vehicle_smoke_stage = "run_complete"
+                    return GLib.SOURCE_CONTINUE
+                self.native_vehicle_smoke_stage = "cancel_wait"
+                self.select_navigation(self.navigation.get_row_at_index(7))
+                self.start_native_vehicle_selection(
+                    self.native_vehicle_smoke_recording,
+                    self.native_vehicle_smoke_settings,
+                    source_root=self.native_vehicle_smoke_source_root,
+                )
+                self.native_vehicle_smoke_stale_generation = self.vehicle_generation
+                self.cancel_native_vehicle()
+                return GLib.SOURCE_CONTINUE
+            if stage == "cancel_wait":
+                assert self.native_vehicle_owner is None
+                assert (
+                    self.vehicle_generation
+                    > self.native_vehicle_smoke_stale_generation
+                    > self.native_vehicle_smoke_cancel_generation
+                )
+                assert (
+                    self.native_vehicle_menu_serial
+                    == self.native_vehicle_smoke_menu_serial
+                )
+                assert catalog_visible
+                if not hasattr(self, "native_vehicle_smoke_retry_recording"):
+                    self.native_vehicle_smoke_complete = True
+                    self.native_vehicle_smoke_stage = "complete"
+                    self.select_navigation(self.navigation.get_row_at_index(7))
+                    GLib.idle_add(self.check_vehicle_smoke)
+                    return GLib.SOURCE_REMOVE
+                self.native_vehicle_smoke_menu_serial = self.native_vehicle_menu_serial
+                self.native_vehicle_smoke_bind_started = False
+                self.native_vehicle_smoke_stage = "idle_retry_loading"
+                self.start_native_vehicle_selection(
+                    self.native_vehicle_smoke_retry_recording,
+                    self.native_vehicle_smoke_settings,
+                    source_root=self.native_vehicle_smoke_retry_source_root,
+                )
+                return GLib.SOURCE_CONTINUE
+            if stage == "idle_retry_loading":
+                assert self.native_vehicle_owner is not None, (
+                    self.native_vehicle_status.get_text()
+                )
+                self.native_vehicle_smoke_stage = "retry_menu"
+                return GLib.SOURCE_CONTINUE
+            if stage == "idle_failure_close":
+                assert self.pages.get_visible_child_name() == "vehicle"
+                assert self.native_vehicle_cancel_button.get_mapped()
+                owner = self.native_vehicle_smoke_failed_owner
+                assert self.native_vehicle_owner is owner
+                assert owner.native_vehicle_cleanup_pending
+                assert self.native_vehicle_closed
+                assert "0x91010009" in self.native_vehicle_status.get_text(), (
+                    self.native_vehicle_status.get_text()
+                )
+                assert self.native_vehicle_cancel_button.get_sensitive()
+                assert not self.vehicle_recording.get_sensitive()
+                assert not any(
+                    widget.get_visible()
+                    for widget in self.native_vehicle_catalog_widgets
+                )
+                self.native_vehicle_cancel_button.emit("clicked")
+                self.native_vehicle_smoke_stage = "idle_failure_retry"
+                return GLib.SOURCE_CONTINUE
+            if stage == "idle_failure_retry":
+                assert self.native_vehicle_owner is None
+                assert catalog_visible
+                self.native_vehicle_smoke_menu_serial = self.native_vehicle_menu_serial
+                self.native_vehicle_smoke_bind_started = False
+                self.native_vehicle_smoke_stage = "restart_loading"
+                self.start_native_vehicle_selection(
+                    self.native_vehicle_smoke_recording,
+                    self.native_vehicle_smoke_settings,
+                    source_root=self.native_vehicle_smoke_source_root,
+                )
+                return GLib.SOURCE_CONTINUE
+            if stage == "restart_loading":
+                assert self.native_vehicle_owner is not None, (
+                    self.native_vehicle_status.get_text()
+                )
+                self.native_vehicle_smoke_stage = "restart_menu"
+                return GLib.SOURCE_CONTINUE
+            if stage == "run_complete" and self.offline_report is not None:
+                assert self.pages.get_visible_child_name() == "vehicle"
+                assert self.native_vehicle_cancel_button.get_mapped()
+                selection = self.native_vehicle_selection
+                assert selection is not None
+                assert self.native_vehicle_model_summary.get_visible()
+                assert self.native_vehicle_model_summary.get_mapped()
+                assert str(selection.trailing_words[1]) in (
+                    self.native_vehicle_model_summary.get_text()
+                )
+                assert catalog_visible
+                assert self.native_vehicle_smoke_completed_runs == 2
+                self.native_vehicle_smoke_complete = True
+                self.native_vehicle_smoke_stage = "complete"
+                if hasattr(self, "native_vehicle_smoke_idle_patch"):
+                    self.native_vehicle_smoke_idle_patch.stop()
+                self.select_navigation(self.navigation.get_row_at_index(7))
+                GLib.idle_add(self.check_vehicle_smoke)
+                return GLib.SOURCE_REMOVE
+            if (
+                stage == "run"
+                and not self.native_vehicle_owner
+                and not self.offline_busy
+            ):
+                assert self.offline_report is not None, (
+                    self.native_vehicle_status.get_text()
+                )
+        except Exception as exc:  # noqa: BLE001 - propagate every GUI assertion.
+            stage = getattr(self, "native_vehicle_smoke_stage", "starting")
+            status = self.native_vehicle_status.get_text()
+            self.finish_smoke(
+                AssertionError(f"native smoke stage={stage}, status={status}: {exc}")
+            )
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
 
     def check_adapter_smoke(self):
         from unittest.mock import patch
@@ -7722,6 +9126,8 @@ class Catalog(Adw.Application):
         self.refresh_devices()
 
     def finish_smoke(self, error=None):
+        if hasattr(self, "native_vehicle_smoke_idle_patch"):
+            self.native_vehicle_smoke_idle_patch.stop()
         if error is not None:
             print(f"GTK smoke failed: {error}", file=sys.stderr)
             traceback.print_exception(error)

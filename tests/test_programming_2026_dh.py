@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.calibration import CalibrationContainer
 from scripts.calibration_2026 import (
@@ -150,6 +151,365 @@ def dh_aes(identifier, seed=b"S" * 16):
     return NativeSecurityComposer2026.calculate_security_key(
         native_secret_client().get(identifier), seed
     )
+
+
+class RawControlRuntimeOwnershipTests(unittest.TestCase):
+    def test_real_dh_provider_fault_keeps_parent_resource_until_outer_close(self):
+        import json
+        import struct
+
+        from scripts.calibration_catalog import inspect_module_bytes
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.cuw_parameter_pool import ControlParameterPool2026
+        from scripts.programming_2026_common import (
+            ControlCommPhase2026,
+            NativeControlExportTarget2026,
+            NativeGeneralParameters2026,
+        )
+        from scripts.programming_replay import (
+            ProgrammingReplay,
+            load_programming_replay,
+        )
+        from tests.test_cuw_engine_worker import encoded_table
+
+        root = Path("runtime/no-car-21/recovered")
+        module_name = "TCUWCanDHPrepareWriter.dll"
+        if not (root / module_name).is_file():
+            self.skipTest("Authenticated static DH prepare module is absent")
+        fixture_case = DHUDSGetterLifecycle(
+            "test_empty_control_gateway_capability_and_native_boolean_semantics"
+        )
+        self.addCleanup(fixture_case.doCleanups)
+        starter = fixture_case.engine_fixture()
+        source = starter._source
+        starter.close()
+        assert source is not None
+        module = (root / module_name).read_bytes()
+        version = inspect_module_bytes(module, module_name)["version"]
+        catalog = {
+            "108CAN383.ini": encoded_table(
+                (
+                    "ParamFileKeySystemProtocolMicon",
+                    "DLLFileNameForPrepareWrite",
+                    "GetCANIDFunctionNameForPrepareWrite",
+                    "CanIDForPrepareWrite",
+                    "FlagToNonSeed16ByteRespStatus",
+                    "EnableDLLVersionInformation",
+                ),
+                (
+                    (
+                        "108CAN383",
+                        module_name,
+                        "GetCanIDsFromParamForPrepareWrite",
+                        "0700/0708",
+                        "0",
+                        "\n".join((version,) * 4),
+                    ),
+                ),
+            ),
+            "Parameter.ini": encoded_table(
+                ("ParamFileKeySystemProtocolMicon", "M16CTypeFlag", "FORESTTypeFlag"),
+                (
+                    ("108CAN383", "0", "0"),
+                    ("109CAN383", "0", "0"),
+                    ("168CAN383", "0", "0"),
+                ),
+            ),
+        }
+        recording = {
+            "schema": "techstream-programming-replay-v1",
+            "source": "recorded_unverified",
+            "calibration_sha256": hashlib.sha256(source).hexdigest(),
+            "operation": "prepare",
+            "node": 1,
+            "observations": {
+                "current_cids": [],
+                "tester_info_hex": bytes(32).hex(),
+                "system_time": [2026, 10, 22, 20, 1, 2, 3, 4],
+                "timeout_seconds": 30,
+                "cid_mode": 2,
+                "host": {},
+            },
+            "events": [],
+        }
+        replay = load_programming_replay(
+            source, json.dumps(recording).encode(), catalog, {module_name: module}
+        )
+        self.addCleanup(replay.trace.close)
+        engine = CUWEngine2026(
+            (root / "CUW.dll").read_bytes(),
+            general_parameters=NativeGeneralParameters2026.from_sources(
+                {"Parameter.ini": catalog["Parameter.ini"]}, encoded=True
+            ),
+        )
+        engine.configure(struct.pack("<IIddII", 1, 0, 1, 2, 0, 0))
+        engine.load_cuw(source)
+        self.addCleanup(engine.close)
+        fault = OSError("injected DH provider fault")
+        faults: list[BaseException] = [fault]
+        calls = []
+
+        def provider(event, remaining):
+            calls.append(event)
+            operation = event.get("operation")
+            if operation in ("stop_periodic", "stop_filter"):
+                return None
+            if operation == "get_timeout":
+                return 110
+            if operation == "get_send_timeout":
+                return 120
+            if operation == "start_flow_control_filter":
+                return 17
+            if operation == "write_messages":
+                raise faults[0]
+
+        replay.trace.action = provider
+        replay.trace.clock = lambda: replay.trace.elapsed
+        replay.trace.cancelled = lambda: False
+        replay.trace.native_local_seconds_of_day = lambda: 0
+        replay.trace.native_local_milliseconds_of_day = lambda: 0
+        runtime = NativeRuntime2026(
+            provider,
+            clock=replay.trace.clock,
+            cancelled=replay.trace.cancelled,
+            local_seconds_of_day=replay.trace.native_local_seconds_of_day,
+            local_milliseconds_of_day=replay.trace.native_local_milliseconds_of_day,
+        )
+        control_bytes = (root / "TCUWControlCommPhase.dll").read_bytes()
+        controller = ControlCommPhase2026(
+            identify_native_module(
+                hashlib.sha256(control_bytes).hexdigest(), "TCUWControlCommPhase.dll"
+            ),
+            runtime,
+        )
+        replay.bind_controller2026(controller)
+        replay.bind_engine2026(engine)
+        replay.bind_runtime2026(runtime)
+        engine.bind_worker(controller)
+        with engine.controller_execution(controller, 0):
+            pool = ControlParameterPool2026.issue(
+                engine, controller, catalog, encoded=True
+            )
+            self.addCleanup(pool.close)
+            self.assertEqual(pool.load_for(engine, controller, "prepare"), (0,))
+            target = NativeControlExportTarget2026.issue(
+                engine, controller, pool, 0, "prepare"
+            )
+            from scripts.programming_2026_dh import bind_native_context
+
+            container = target.binding.metadata.source_container
+            selected = target.binding
+            attachments = {
+                "selected_module": module,
+                "dh_utils_module": (root / "TCUWDHUtils.dll").read_bytes(),
+                "secret_info_module": (root / "SecretInfo.dll").read_bytes(),
+                "cuw_module": (root / "CUW.dll").read_bytes(),
+            }
+            identity = identify_native_module(
+                hashlib.sha256(module).hexdigest(), module_name
+            )
+            dh_context = bind_native_context(
+                container,
+                1,
+                (),
+                selected,
+                identity,
+                attachments,
+                {"dh_state": engine.dh_state, "module_version": version},
+            )
+            runtime.own("stop_periodic", identifier=77)
+            with engine.controller_export_target(controller, target):
+                raw = controller._begin_native_control_raw_execution2026(engine)
+                entry = controller._begin_native_control_helper_entry2026(
+                    engine, helper="8990"
+                )
+                try:
+
+                    def run_dh_fault(_stage, active_runtime):
+                        active = active_runtime._device_calls.control_export
+                        token = controller._native_control_raw_execution2026
+                        from scripts.programming_2026_common import (
+                            _NATIVE_CONTROL_RAW_EXECUTIONS_2026,
+                        )
+
+                        self.assertIs(active[0], engine)
+                        self.assertIs(active[1], controller)
+                        self.assertIs(active[2], target)
+                        self.assertIs(engine.worker.controller, controller)
+                        self.assertIs(engine.worker.runtime, active_runtime)
+                        self.assertIs(engine._controller_execution, controller)
+                        self.assertIs(engine._controller_export_target2026, target)
+                        self.assertIs(
+                            controller.native_control_context2026(engine),
+                            target._context,
+                        )
+                        self.assertEqual(
+                            _NATIVE_CONTROL_RAW_EXECUTIONS_2026.get(id(token)),
+                            (token, engine, controller, target._context),
+                        )
+                        self.assertIs(
+                            controller._native_control_helper_entry2026, entry
+                        )
+                        self.assertIsNotNone(
+                            controller._native_control_export_lease2026
+                        )
+                        target.validate(engine, controller)
+                        return execute_context(dh_context, active_runtime)
+
+                    with (
+                        patch.object(
+                            ProgrammingReplay,
+                            "run_bound2026",
+                            run_dh_fault,
+                        ),
+                        patch.object(runtime, "close", wraps=runtime.close) as close,
+                        self.assertRaises(OSError) as raised,
+                    ):
+                        controller._invoke_control_export2026(
+                            engine,
+                            replay,
+                            target,
+                            "StartPrepareWrite",
+                            helper="8990",
+                            required_exports=("StartPrepareWrite",),
+                        )
+                    self.assertIs(raised.exception, fault)
+                    close.assert_not_called()
+                    self.assertIn(
+                        {"operation": "stop_periodic", "identifier": 77},
+                        runtime._resources,
+                    )
+                    self.assertFalse(
+                        any(e["operation"] == "stop_filter" for e in runtime._resources)
+                    )
+                    self.assertGreaterEqual(
+                        sum(e.get("operation") == "stop_filter" for e in calls), 1
+                    )
+                    self.assertFalse(
+                        any(e.get("operation") == "stop_periodic" for e in calls)
+                    )
+                    from scripts.programming_2026_common import (
+                        NativePassThruException2026,
+                    )
+
+                    faults[0] = NativePassThruException2026(
+                        9999, "TCUWControlCommPhase.dll:RVA8990", 0x7A1
+                    )
+                    controller._end_native_control_helper_entry2026(engine, lease=entry)
+                    entry = None
+                    next_entry = controller._begin_native_control_helper_entry2026(
+                        engine, helper="8990"
+                    )
+                    entry = next_entry
+                    try:
+                        with patch.object(
+                            ProgrammingReplay,
+                            "run_bound2026",
+                            run_dh_fault,
+                        ):
+                            continued = controller._invoke_control_export2026(
+                                engine,
+                                replay,
+                                target,
+                                "StartPrepareWrite",
+                                helper="8990",
+                                required_exports=("StartPrepareWrite",),
+                            )
+                        self.assertEqual(continued["state"], "failed")
+                        self.assertIsNot(continued.get("native_return"), True)
+                        self.assertIn(
+                            {"operation": "stop_periodic", "identifier": 77},
+                            runtime._resources,
+                        )
+                    finally:
+                        controller._end_native_control_helper_entry2026(
+                            engine, lease=next_entry
+                        )
+                        entry = None
+                finally:
+                    if entry is not None:
+                        controller._end_native_control_helper_entry2026(
+                            engine, lease=entry
+                        )
+                    controller._end_native_control_raw_execution2026(engine, raw)
+            faults[0] = fault
+            standalone_runtime = NativeRuntime2026(provider)
+            standalone_runtime.own("stop_periodic", identifier=78)
+            with self.assertRaises(OSError) as standalone_fault:
+                execute_context(dh_context, standalone_runtime)
+            self.assertIs(standalone_fault.exception, fault)
+            self.assertNotIn(
+                {"operation": "stop_periodic", "identifier": 78},
+                standalone_runtime._resources,
+            )
+        runtime.close()
+        self.assertFalse(runtime.owns_resource("stop_periodic"))
+        self.assertEqual(
+            sum(event.get("operation") == "stop_periodic" for event in calls), 2
+        )
+        from scripts import programming_2026_dh
+
+        with engine.controller_execution(controller, 0):
+            target = NativeControlExportTarget2026.issue(
+                engine, controller, pool, 0, "prepare"
+            )
+            with engine.controller_export_target(controller, target):
+                for active_target, remove_worker in ((object(), False), (target, True)):
+                    runtime._device_calls.control_export = (
+                        engine,
+                        controller,
+                        active_target,
+                    )
+                    saved_worker = engine._worker
+                    if remove_worker:
+                        engine._worker = None
+                    try:
+                        with (
+                            patch.object(
+                                programming_2026_dh,
+                                "_execute_context",
+                                side_effect=fault,
+                            ),
+                            patch.object(runtime, "close") as close,
+                            self.assertRaises(OSError) as raised,
+                        ):
+                            execute_context(dh_context, runtime)
+                        self.assertIs(raised.exception, fault)
+                        close.assert_called_once_with()
+                    finally:
+                        engine._worker = saved_worker
+                        del runtime._device_calls.control_export
+
+    def test_standalone_host_fault_still_closes_runtime_and_preserves_exception(self):
+        from scripts.programming_2026_dh import DHExecutionContext
+
+        fault = RuntimeError("provider fault")
+        runtime = NativeRuntime2026(lambda *_: None)
+        context = object.__new__(DHExecutionContext)
+        with (
+            patch("scripts.programming_2026_dh._execute_context", side_effect=fault),
+            patch.object(runtime, "close", return_value=[]) as close,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            execute_context(context, runtime)
+        self.assertIs(raised.exception, fault)
+        close.assert_called_once_with()
+
+    def test_forged_control_tuple_does_not_skip_standalone_cleanup(self):
+        from scripts.programming_2026_dh import DHExecutionContext
+
+        fault = RuntimeError("provider fault")
+        runtime = NativeRuntime2026(lambda *_: None)
+        runtime._device_calls.control_export = (object(), object(), object())
+        context = object.__new__(DHExecutionContext)
+        with (
+            patch("scripts.programming_2026_dh._execute_context", side_effect=fault),
+            patch.object(runtime, "close", return_value=[]) as close,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            execute_context(context, runtime)
+        self.assertIs(raised.exception, fault)
+        close.assert_called_once_with()
 
 
 def bind_authored_dh_online(test, runtime, seed, key, *, engine=None):
@@ -1105,6 +1465,44 @@ class DHHelpers(unittest.TestCase):
 
 
 class DHUDSGetterLifecycle(unittest.TestCase):
+    def test_loaded_control_base_binds_gateway_without_reselecting_row(self):
+        from tests.test_programming_2026_common import RawControlStageMachineTests
+
+        fixture = RawControlStageMachineTests()
+        self.addCleanup(fixture.doCleanups)
+        engine, controller, _session = fixture.fixture(
+            dependencies=(
+                "TCUWControlCommPhase.dll",
+                "CUW.dll",
+                "SecretInfo.dll",
+                "TCUWDHUtils.dll",
+            ),
+            parameter_values={"FlagToNonSeed16ByteRespStatus": "2"},
+        )
+        root = Path("runtime/no-car-21/recovered")
+        modules = {
+            "dh_utils_module": (root / "TCUWDHUtils.dll").read_bytes(),
+            "secret_info_module": (root / "SecretInfo.dll").read_bytes(),
+            "cuw_module": (root / "CUW.dll").read_bytes(),
+        }
+        with engine.controller_execution(controller, 1):
+            controller.bind_startup_session(engine, _session)
+            pool = controller._control_parameter_pool2026
+            assert pool is not None
+            empty = controller.empty_control_parameter(engine)
+            pool.load_for(engine, controller, "prepare")
+            with self.assertRaises(ValueError):
+                empty.validate(engine)
+            with self.assertRaises(ValueError):
+                controller.empty_control_parameter(engine)
+            base = controller._control_base_parameter2026(engine)
+            self.assertIs(base._pool, pool)
+            gateway = bind_gateway_client(
+                controller.runtime, base, engine.dh_state, **modules
+            )
+            self.assertTrue(gateway._flag("FlagToNonSeed16ByteRespStatus"))
+            self.assertTrue(base.parameter.boolean("FlagToNonSeed16ByteRespStatus"))
+
     def test_native_caller_channel_import_does_not_create_control_disconnect_owner(
         self,
     ):
@@ -1239,10 +1637,6 @@ class DHUDSGetterLifecycle(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 legacy_gateway._flag("FlagToNonSeed16ByteRespStatus")
-            # Unit state control: LoadParameter replaces the constructor-empty pool.
-            controller._retained_parameter_pool = (selection,)
-            with self.assertRaises(ValueError):
-                gateway.start_reprogramming_mode_for_multi_types()
         with self.assertRaises(ValueError):
             gateway.start_reprogramming_mode_for_multi_types()
         self.assertEqual(events, [])

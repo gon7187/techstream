@@ -67,6 +67,58 @@ keeps the current percentage lookup.
 The remaining `3f620` terminal, periodic-message, next-FILE and notification
 branches are not represented by the logical-boundary helper.
 
+## Held CONTROL FILE capture
+
+At the engine's once-only `59ab0` identifier import, the active worker can issue
+one `ControlFileCapture2026`. It freezes the exact imported metadata projection,
+ordered CPU mapping, target vector and scalar `control_cpu_start` from the same
+boundary. `metadata_for_cpu(index)` accepts only an unsigned ordered index and
+maps through that held projection; it never consults a later selected FILE.
+
+The capture remains valid through legitimate FILE/CPU changes in the owning
+phase, then the worker invalidates it during phase finish or failure. Copied,
+forged, foreign-thread and expired captures fail validation. The engine import
+hook must set `_identifier_context_importing` only around the real identifier
+copy and call `worker.capture_control_file2026(controller)` there; calling the
+worker API elsewhere is rejected. This capture preserves FILE ownership and
+does not provide a cursor setter or extend authority after unwind.
+
+## CONTROL output buffers
+
+The worker creates count scratch once from the engine's native output length
+with zero values, and percentage scratch once as a copy of the engine's current
+percentage vector. Repeated `59ab0` imports retain these buffers. A new worker
+starts fresh from the then-current engine outputs. Context observation returns
+immutable tuples; target-bound DWORD stores update scratch only.
+
+`publish_control_count2026(context)` copies the whole count vector. Percentage
+publication first snapshots the old whole engine percentage vector into the
+existing `_cpu_percentages` C48/C4C observation vector, then copies the whole
+scratch vector. Both methods
+validate the active source-issued context and fixed vector lengths. They do not
+publish implicitly during import or phase cleanup.
+
+The worker also exposes narrowly scoped source hooks for SBR byte publication,
+the shared DH gateway type, and the ordinary raw return snapshot. Its SBR hook
+requires the retained internal parent `Vendor2026Context`, the exact selected
+CONTROL binding, and its active runtime export scope; a standalone SBR utility
+has no engine publication authority. The internal `prepare_sbr` path issues this
+context, and `read_ssm` publishes its actual byte immediately after storing it.
+The ordinary snapshot is accepted only after the common raw-tail registry issues
+the exact pair snapshot; getter-only
+import occurs at the outer getter handoff and is marked consumed after the pair
+import and identifier commit succeed. Post-export 28/2f cache reads require the
+authenticated 8990 primary-return receipt and read the worker's C25/C08 values.
+The C08 setter accepts a DH `PrepareRetry` write only while the exact
+`PrepareRetry` export and its 4c10/5c30 helper lease are active; ordinary write
+exports and alternate export names do not grant that publication authority.
+
+The private `_record_control_helper_cpass2026` path accepts only the native CPass
+error domain while a common-owned family-helper entry lease is active. It writes
+the exception code into the native primary-error field, preserves the existing
+error kind and J2534 status, sets native fatal state, and leaves write-failure
+state unchanged. The outer loader-prelude catch remains a separate transition.
+
 ## Control and retry state
 
 Host faults and cancellation change lifecycle state only; they do not create

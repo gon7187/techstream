@@ -1,8 +1,12 @@
 # Normal direct polling
 
 `selected_normal_poll_worker` binds an explicitly selected source12/18 P4 or P5
-monitor plan and selected connection to `NativeFrameOperations`. These direct
-workers require observed device8; device4 selects its separate native DMCI
+monitor plan and selected connection to `NativeFrameOperations`. Its optional
+`communication` argument admits the exact source-bound `NativeCommunication`
+owner after a serialized context handoff. Retained routing is limited to normal
+P4 BASE/Packet and P5 plans; Variable, MultiMon, A8, Dual and instrument branches
+keep their distinct controller seams. These direct workers require observed
+device8; device4 selects its separate native DMCI
 interface. P4 uses the
 shared `DirectJ2534Worker`; P5 uses `NormalPollingWorker`. Construction
 and import perform no I/O. Calling `run(n)` explicitly invokes the injected
@@ -122,3 +126,12 @@ Additional source anchors: DM_ActVariable18 8610/8A30 and DataListIF18
 23760/23800/23d20); normal P4 dc50 category999 and DataListIF2a620
 `set_measure_mode`. Private evidence records exact source hashes and the native
 null-entry adaptation separately from successful acquisition.
+
+With a retained owner, construction snapshots lower and channel ownership;
+`start()` rechecks the selected source and controller context before I/O. The
+worker uses the retained outer controller and preserves its native state. Thread
+entry applies the lower's native temporary-config predicate. A cold lower stays
+closed until the first actual SendProc performs its usual lazy setup. P4 restores
+temporary config and returns the borrowed controller to the parent. P5 restores
+temporary config before disconnecting that same controller with the source
+release/fault flag; parent cleanup remains idempotent.

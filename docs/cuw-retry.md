@@ -90,24 +90,41 @@ paired reconnect, nonretry cleanup, a native reconnect fault followed by a new
 query/input, and unchanged host-exception identity. These checks execute the
 scoped `4780` helper; they do not substitute for the whole failed-family export.
 
-The private `verify_failed_sonar_retry.py` proof uses the actual CID getter,
-selection, preparation and Sonar writer export before entering scoped
-`3b90/4780`. A raw SDK status `24` produces native writer error `7`; captured
-public `5e950` decisions `0` and `1` then complete fresh exact replays with
-69 and 102 events. Sonar's shipped writer has no `PrepareRetry` export, so its
-source profile takes the false `PrepareRetryFlag` branch. This certifies that
-failed-family query consumer, not full `b3e0` or a repeated write export.
+The private `verify_failed_sonar_retry.py` and `verify_failed_dh_retry.py`
+callers now use new fixtures under `runtime/no-car-119`; the older27 fixtures
+remain untouched. A fresh raw phase2 `ControlCommPhase2026.execute` runs the
+actual failed writer and its natural4c10→3b90 query/retry path in one live helper
+context. An observer calls the original family runner and retains its concrete
+report and actual issued row; it does not substitute a family result. The UI
+thread supplies the real public `5e950` input after the actual query is published.
 
-The separate `verify_failed_dh_retry.py` proof uses the authenticated classic
-DH writer and preparation modules. Its engine connection and engine-to-control
-snapshot precede the failed writer. The source profile enables the real
-`PrepareRetry` export; captured public input `0` completes an 18-event replay
-without invoking it, while input `1` completes 97 events and invokes the retained
-`TCUWCanDHPrepareWriter` export, which returns native `True`. The bound writer
-uses its authenticated connected channel; no initial Connect is invented.
-This remains scoped `3b90/4780`, not full `b3e0` or a repeated write.
+The Sonar source profile retains false `PrepareRetryFlag`; its SDK status24
+produces native writer error7. The DH source profile retains true
+`PrepareRetryFlag`, primary1/status24 and its authentic retained PrepareRetry
+export. Input0 takes nonretry whole-engine cleanup; input1 takes the source
+retry branch. DH requires one actual native PrepareRetry only for input1, while
+Sonar requires none. Aggregate raw return and concrete failed/auxiliary reports
+are separate. This is a bounded raw phase2 composition, not a complete phase1
+prepare-to-write or vehicle lifecycle claim.
 
-`ControlCommPhase2026.execute` now composes `retry_failed_write` when the actual writer report returns native false. The retry loop keeps the original executed writer row, and a successful PrepareRetry clears only the primary and passthru errors. The failed flag, retry context, error kind and notifications remain available to the confirmation/IsFinish tail; its successful finish has a separate state consumer. The outer Execute still returns the original writer Boolean and reports `retry_decision` separately. This is public composition evidence only; the private failed-family oracle remains the acceptance boundary.
+Capture records only authored SDK/clock responses; final runs use fresh ordinary
+strict traces from position0 and require complete consumption. Original trace
+bytes/hashes are preserved under `control-sol/retry119-before`. DH inputs0/1
+consume18/97 events and invoke zero/one actual retained PrepareRetry exports.
+Sonar inputs0/1 consume103/132 events and invoke no auxiliary export. The two
+unchanged public retry methods pass all four decision cases. Additional actual
+query input-pump OSError/InterruptedError checks retain original host exception
+identity and leave native input history empty.
+
+The migration exposed three source seams corrected by their owning leaves:
+inactive pool detachment after real nonretry cleanup, removal of an internal
+auxiliary routing key before strict DH binding, and authentic PrepareRetry
+permission for the nested DH gateway-type setter. The latter requires the
+current registered export lease and actual DH identity; it grants no ordinary
+write permission. No removed `retry_failed_write`, `receive_cids` or
+`run_bound_export` API is restored. Frozen implementation evidence is recorded in
+`runtime/no-car-119/raw-phase2-migration-freeze.json`; independent review and the
+complete retry module remain root-owned.
 
 The private `verify_prepare_ack.py` proof replays an actual phase-1 prepare
 prefix through the missing Control-module loader branch, leaving the persistent
