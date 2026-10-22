@@ -48,6 +48,28 @@ If a later prepare entry sees nonrecovery `be8 == 1`,
 consumed. The thread owner returns without reserving a phase or dispatching a
 second export.
 
+## VBF prepare resume
+
+The external VBF prepare receipt path acknowledges the native `be8` decision:
+actual `1` is changed to `2` and requires the child wait; a non-`1` value is
+preserved and is admitted only when the persistent child is already parked.
+Recovery-mode VBF resume is outside this bounded path and is rejected before
+the prefix. The exact lexical prepare owner then runs the shared `36800` output
+prefix and reads local time once. Resume skips only the VBF-specific `3e710`
+rebuild; it still applies the common D308/D30C selection tail. It restores
+`be8` to `1` and records the prepared timestamp in the same receipt. When the
+actual adopting child starts phase1, it imports that timestamp and enters
+`running` without repeating the prefix, local-time read, or handshake write.
+Calls without a receipt retain the existing phase-start and `1 -> 3` behavior.
+
+An authenticated actual `141` FILE reset replaces the current FILE and CPU
+mapping while preserving the worker's prefix offset. The offset is native
+D30C state, distinct from current CPU D308 and the authored CPU count.
+
+These host-thread transitions do not establish successful programming or
+physical vehicle support; native and hardware outcomes retain their existing
+source-bound evidence requirements.
+
 ## Continuations
 
 `notify_next_cpu()` implements the `581a0` outer barrier. It verifies that both

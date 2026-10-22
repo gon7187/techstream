@@ -28,6 +28,16 @@ A session executes its captured operation and node once. A failed or uncertain
 operation cannot be resumed by calling it again. Recovery is a distinct captured
 native operation; it never implies permission to repeat a write.
 
+The source-bound native VBF ProcessBefore path can construct a fresh raw
+`prepare` root only from its issued, prepared request. That root copies the
+authenticated current FILE digest, node, CPU index and received identifiers,
+while retaining the same catalog, module bytes, attachments and chronological
+trace. Its nested observations are independent, and it carries no prior stage,
+selection or CONTROL target. The actual child still creates its held CONTROL
+context during admission. Constructing the root does not start or execute it and
+does not claim successful programming; physical behavior remains
+`PHYSICAL_UNCONFIRMED`.
+
 ## Source identity
 
 For `source="recorded_unverified"`, each supplied operation module must match the

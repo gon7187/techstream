@@ -2,7 +2,25 @@
 
 В проекте несколько уровней проверки. Зелёный синтетический тест подтверждает только авторский путь и данные, которые он запускал. Он не доказывает такое же поведение OEM-программы, адаптера, ЭБУ или автомобиля.
 
-## Контрольная точка 22 октября 2026 — POWER, CUW и RC
+## Контрольная точка 22 октября 2026 — VBF, ABS29, MultiMon и TSE
+
+Продолжение после `6d954d0` (PR #7). Полный локальный прогон зафиксирован на замороженных хешах кода и тестов; частные OEM-образы использовались только как данные. Выполнялись авторские Python-компоненты, фикстуры и replay, без OEM/Wine/JVM, адаптера или автомобиля.
+
+| Проверка | Измеренный результат | Граница |
+| --- | --- | --- |
+| Полный локальный private suite | **6 503 теста, 0 failures, 0 errors, 0 skips**, 146,116 с; `OFFLINE_CHECKS_PASSED` | Доступный частный корпус, `python -m scripts.offline_verify checks` |
+| Actual POWER/P4 VBF resume | PASS, один сквозной сценарий; strict trace **19/19** | Настоящие потоки, parked barrier, `36800`, новый raw root, прежний completion и точный host fault; не mapped-group `141` integration |
+| ABS29 source/consumer | **194 source/consumer checks PASS**, затронутые utility/chassis-модули **264 tests PASS** | Точные mode20/21 пары, selected SDK, normal/abort/host cleanup; нижние UDS/SID guards сохранены |
+| Выбранная запись Run87 | **104 module tests PASS**, 40 комбинаций, четыре actual recording consumers и четыре flag9 fallback cases PASS | Реальные factory → DRS → NativeDrsExecutor; CheckMode/VIN, порядок Begin/End/stop/dispose и независимое владение |
+| TSE KeyCycle и sequence-admission | **57 module tests PASS**; KeyCycle oracle **71 cases / 6 mutations**; sequence oracle **72 targets + 160 siblings + 12 ADS controls / 5 mutations** | Raw/provenance, positional predicates, short-circuit и бюджеты; precision 9+ и numeric sequence coordinates открыты |
+| Database → TSE consumer | **72 module tests PASS** | Настоящие selected database → wire encode/decode → view; точный единственный счётчик и KeyCycle provenance |
+| Независимое source/code review | Scoped PASS по перечисленным компонентам | Сверялись исходные байты и тот же candidate; полной no-car closure нет |
+
+Первый общий прогон обнаружил один старый positional assertion: `ddr_headers[0]` больше не обязан быть счётчиком, поскольку source-bound headers неоднородны. Исправлен только тест: он требует ровно один счётчик со значением 17 и дополнительно проверяет настоящий KeyCycle из database-produced section. Повторный полный прогон выше прошёл; production-код для исправления этого assertion не менялся.
+
+Mapped-group `141`/D30C и внешний VBF ещё не соединены через настоящие CID getter/cache/JudgeFlashable producers; worker reissue остаётся отдельным открытым сценарием. Это программные пробелы. Полный набор из 171 software obligations, полная запись ЭБУ и физическая совместимость не приняты. Снимок графа и его исходные хеши указаны отдельно в `graphify-out/source-manifest.json`.
+
+## Предыдущая контрольная точка 22 октября 2026 — POWER, CUW и RC
 
 Код и тесты пакета закреплены в [`c6613af`](https://github.com/gon7187/techstream/commit/c6613afce6e491d34ba95765c05fe4d79943f9d7), продолжение после `e0513f6`. Статус интеграции и проверки точного head доступны в [PR #7](https://github.com/gon7187/techstream/pull/7/checks).
 
@@ -92,7 +110,7 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 - **Skipped/unrun** означает неизвестный результат, а не pass. Это включает проверки, код которых написан, но не запускался до паузы.
 - **Red/error** остаётся активной проблемой, пока исправление не проверено по исходному контракту. Сохранять красный вывод как свидетельство.
 - **Source omission** или неучтённый export/module означает открытый контракт; это не безопасное исключение и не утверждение о физическом оборудовании.
-- **Открытый gate** означает, что работа ещё нужна, даже если многие leaf-тесты зелёные. Полная closure G1–G6 остаётся открытой; отдельные subgate уже PASS, включая G2 offline workflow check. Исторические CI и публичные прогоны относятся к указанным снимкам; для нового пакета используйте `c6613af` и PR #7 выше, для предыдущего — `0f99a6c` и PR #6.
+- **Открытый gate** означает, что работа ещё нужна, даже если многие leaf-тесты зелёные. Полная closure G1–G6 остаётся открытой; отдельные subgate уже PASS, включая G2 offline workflow check. Исторические CI и публичные прогоны относятся к указанным снимкам; текущий пакет продолжает `6d954d0`, предыдущий закреплён в `c6613af` и PR #7, более ранний — в `0f99a6c` и PR #6.
 
 Актуальные красные и ожидающие проверки перечислены в [handoff разработки](development-handoff.md#известные-красные-и-открытые-места). Локальные `analysis/evidence/no-car-*/` содержат команды, снимки и ограничения; это частные необязательные свидетельства, не требование публичной сборки.
 

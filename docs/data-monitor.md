@@ -382,3 +382,16 @@ released after recording finalization.
 Recording completion accepts only the exact controller/message pair returned by
 the selected factory. A foreign prepared message fails before any I/O or resource
 ownership is taken; it cannot cause cleanup of another recording's channels.
+
+`selected_variable_monitor_recording` is the synchronous Run87 producer. It
+retains selected support communications until the actual outer CheckMode and
+VIN producers finish, emits a single native DMCI constructor/global start around
+the selected target setup, and then closes every owned support communication.
+The enable mask participates in child exclusion before plan selection. Typed DRS
+metadata is validated before support I/O, and only authenticated target/controller
+communications enter cleanup ownership. ISO constructor data is selected for
+either device4 or device8 when the controller protocol is ISO. Writer groups follow
+Run87's Begin11/End11/Begin12/End12 chronology; an unconstructed interface returns
+the native C0050001 stop status, native preparation status is retained unless
+End12 overrides it, and host exceptions keep their identity through cleanup. This
+recording path does not alter the live runtime's channel lifetime or capacity.

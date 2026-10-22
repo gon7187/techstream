@@ -812,6 +812,38 @@ class NativeWrapperTests(unittest.TestCase):
             engine.context._parameters[0x6F] = 4
             self.assertEqual(engine.invoke("Ex2ECD_59_Dummy", (output,)), 99)
 
+    def test_abs29_public_wrappers_admit_exact_ty18_and_plus_pairs(self):
+        root = Path(__file__).resolve().parents[1]
+        images = {
+            "TY18": root
+            / "artifacts/extracted/techstream-18-application/Techstream_Bin/UtilityEx2TY.dll",
+            "TYPlus": root
+            / "artifacts/extracted/gtsplus-application/Setup_PF/GTSPlus/bin/UtilityEx2TY.dll",
+        }
+        exports = ("Ex2ABS_29_SupportCheck", "Ex2ABS_29_ShiftDealerMode")
+        for source, image in images.items():
+            for export in exports:
+                with self.subTest(source=source, export=export):
+                    require_private(image)
+                    self.assertEqual(_TY_THREAD_WRAPPERS[source][export], (0, 10000))
+                    for mode in (20, 21):
+                        host = Host()
+                        host.values[0x6F] = mode
+                        context = UtilityExContext(image.read_bytes(), host, None, None)
+                        engine = UtilityEx2TY(context)
+                        body_calls = []
+                        engine.run_body = lambda export, args=(), calls=body_calls: (
+                            calls.append((export, args)) or 47
+                        )
+                        self.assertIn(export, engine.supported_bodies())
+                        with self.assertRaises(ValueError):
+                            engine.invoke(export, (bytearray(),))
+                        self.assertEqual(engine.invoke(export), 15)
+                        self.assertEqual(engine.worker.get_status(), 47)
+                        self.assertEqual(body_calls, [(export, ())])
+                        context._parameters[0x6F] = 4
+                        self.assertEqual(engine.invoke(export), 99)
+
     def test_newer_nk_end_erase_cannot_inherit_older_argument_abi(self):
         for source in ("NKDS4", "NKPlus"):
             engine = self.engine()

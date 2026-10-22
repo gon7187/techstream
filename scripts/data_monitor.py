@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from threading import Lock
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 from scripts.profiles import ProtocolProfile, VehicleProfile
 from scripts.support import word
@@ -3767,6 +3767,517 @@ def _selected_variable_multi_lower(
     if lower.operations.channel is not None or lower.operations.owns_channel:
         raise MonitorError("Fresh variable MultiMon unexpectedly owns a channel")
     return lower
+
+
+def selected_variable_monitor_recording(
+    targets: tuple[LegacyCheckTarget, ...],
+    operations: NativeFrameOperations,
+    *,
+    connected_device: int,
+    controller_communication: NativeCommunication | None = None,
+    init_mode: int | None = None,
+    parameter_c0: int | None = None,
+    command_kind: int,
+    command_ecu: int,
+    allocation: int,
+    standard_values: tuple[Sequence[tuple[int, int]], ...],
+    names: tuple[bytes, ...],
+    text_encoding: str,
+    phase: int,
+    selection: NativeVehicleSelection,
+    system_information: dict,
+    trigger: NativeTriggerInfo,
+    parameters: NativeTriggerParameters,
+    enable_mode: int,
+    monitor_session: SelectedMonitorSession | None = None,
+    voltage_state: DLC12VoltageState | None = None,
+    voltage_observations: Mapping[int, DLC12VoltageObservation] | None = None,
+    limits: Limits | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    cancelled: Callable[[], bool] = lambda: False,
+) -> DrsFile:
+    """Synchronously build a selected variable Run87 recording and outer data."""
+    from scripts.drive_recorder import (
+        UnsupportedRecorderOperation,
+    )
+    from scripts.frame_transport import NativeFrameOperations
+    from scripts.monitor_legacy import (
+        LegacyCheckTarget,
+        LegacyDrsWriter,
+        LegacyRunTarget,
+    )
+    from scripts.monitor_variable import (
+        SelectedVariableMonitor,
+        VariableMonitorSource,
+        VariableNullController,
+        _variable_recording_stop,
+        check_variable_monitor,
+        selected_variable_monitor_from_cache,
+        selected_variable_packet_monitor,
+        selected_variable_recording_setup,
+        selected_variable_runtime_target,
+        selected_variable_voltage_monitor,
+        variable_target_mask,
+        variable_voltage_interface,
+    )
+    from scripts.native_communication import NativeCommunication, NativeFrameController
+
+    preflight_owned = []
+    if isinstance(targets, tuple):
+        for target in targets:
+            if (
+                isinstance(target, LegacyCheckTarget)
+                and isinstance(target.transaction, NativeCommunication)
+                and target.transaction not in preflight_owned
+            ):
+                preflight_owned.append(target.transaction)
+    try:
+        _ids((command_ecu,), 65535)
+        if (
+            not isinstance(targets, tuple)
+            or not 1 <= len(targets) <= 3
+            or any(not isinstance(target, LegacyCheckTarget) for target in targets)
+        ):
+            raise MonitorError("Variable recording requires1..3 selected targets")
+        if type(enable_mode) is not int or not 0 <= enable_mode <= 65535:
+            raise MonitorError("Variable recording enable mask must be ushort")
+        if (
+            not isinstance(operations, NativeFrameOperations)
+            or type(connected_device) is not int
+            or connected_device not in (4, 8)
+            or operations.device_kind != connected_device
+            or operations.native_build not in (12, 18)
+            or operations.channel is not None
+            or operations.owns_channel
+        ):
+            raise MonitorError(
+                "Variable recording requires fresh observed source context"
+            )
+        if (
+            not isinstance(standard_values, tuple)
+            or len(standard_values) != len(targets)
+            or not isinstance(names, tuple)
+            or len(names) != len(targets)
+            or any(not isinstance(name, bytes) for name in names)
+            or type(phase) is not int
+            or phase not in (0, 1)
+        ):
+            raise MonitorError("Variable recording display/standard selections differ")
+        communications = []
+        for target in targets:
+            communication = target.transaction
+            if (
+                not isinstance(communication, NativeCommunication)
+                or not isinstance(communication.operations, NativeFrameController)
+                or target.support_stream is not communication
+                or target.profile is not communication.profile
+                or target.ecu != communication.ecu
+                or target.bus_id != communication.bus_id
+                or target.source_build != communication.source_build
+                or target.packet_ecu != communication.profile.category
+                or target.packet_protocol != communication.bus_id
+                or communication.closed
+            ):
+                raise MonitorError(
+                    "Variable recording target lacks live selected communication"
+                )
+            VariableMonitorSource.for_build(target.source_build).check()
+            communication.cache.check_context()
+            communications.append(communication)
+        actual_controller = next(
+            (item for item in communications if item.profile.category == command_ecu),
+            None,
+        )
+        if controller_communication is None:
+            controller_communication = actual_controller
+        if (
+            not isinstance(controller_communication, NativeCommunication)
+            or not isinstance(
+                controller_communication.operations, NativeFrameController
+            )
+            or controller_communication.profile.category != command_ecu
+            or controller_communication.closed
+        ):
+            raise MonitorError(
+                "Variable recording requires actual command ECU communication"
+            )
+        for communication in (*communications, controller_communication):
+            if (
+                communication.source_build != controller_communication.source_build
+                or SelectedMonitorSession._context(communication.profile)
+                != SelectedMonitorSession._context(controller_communication.profile)
+            ):
+                raise MonitorError("Variable recording selected contexts differ")
+            if monitor_session is not None:
+                monitor_session.check(
+                    communication.profile, source_build=communication.source_build
+                )
+        if operations.native_build != controller_communication.source_build:
+            raise MonitorError("Variable recording source build differs")
+        native_lower = cast(
+            NativeFrameController, controller_communication.operations
+        ).operations
+        if (
+            operations.backend is not native_lower.backend
+            or operations.driver != native_lower.driver
+            or operations.bus_id != controller_communication.bus_id
+            or operations.diagnostic_mode != native_lower.diagnostic_mode
+            or SelectedMonitorSession._context(operations.profile)
+            != SelectedMonitorSession._context(controller_communication.profile)
+        ):
+            raise MonitorError("Variable recording native controller context differs")
+        # A supplied controller is not ours to close until its backend and
+        # source context have been authenticated against the selected operation.
+        if controller_communication not in preflight_owned:
+            preflight_owned.append(controller_communication)
+        if any(
+            cast(NativeFrameController, communication.operations).operations.backend
+            is not operations.backend
+            or cast(NativeFrameController, communication.operations).operations.driver
+            != operations.driver
+            or cast(
+                NativeFrameController, communication.operations
+            ).operations.device_kind
+            != connected_device
+            for communication in communications
+        ):
+            raise MonitorError("Variable recording target lower context differs")
+        if (
+            any(target.profile.category == 0x68 for target in targets)
+            and voltage_state is None
+        ):
+            raise MonitorError(
+                "Variable voltage recording requires actual selected state"
+            )
+        # Validate caller-owned DRS metadata before CheckStart/support exchange.
+        writer = LegacyDrsWriter(selection, system_information, trigger, parameters)
+        flags = controller_communication.profile.category_record[72]
+        if flags & 31 not in (4, 6, 9):
+            raise MonitorError("Variable recording controller provider unavailable")
+        controller_connection = selected_p4_connection(
+            controller_communication.profile,
+            bus_id=controller_communication.bus_id,
+            diagnostic_mode=controller_communication.operations.operations.diagnostic_mode,
+            controller_category_flags=flags,
+        )
+        controller_bus = controller_connection.bus_id
+        if any(
+            target.bus_id != controller_bus
+            and not (target.bus_id & 15 == controller_bus & 15 == 2)
+            for target in targets
+            if target.profile.category != 0x68
+        ):
+            raise MonitorError(
+                "Variable recording controller/target buses differ", 0xC0050001
+            )
+        iso_record = None
+        if controller_connection.bus_id & 15 == 1:
+            rows = controller_communication.profile.comm_info_iso_records(
+                word(controller_connection.protocol_record, 2)
+            )
+            if not rows or init_mode not in (1, 2) or parameter_c0 is None:
+                raise MonitorError("Variable recording ISO observations unavailable")
+            iso_record = rows[0]
+        excluded = variable_target_mask(
+            tuple((target.profile.category, target.bus_id) for target in targets),
+            connected_device=connected_device,
+        ) | ((~enable_mode) & 0xFFFF)
+    except BaseException as error:
+        for communication in preflight_owned:
+            try:
+                status = communication.close()
+                if status:
+                    error.add_note(
+                        f"Variable recording preflight cleanup status: {status:#x}"
+                    )
+            except BaseException as cleanup_error:  # noqa: BLE001 - release every passed owner
+                error.add_note(
+                    f"Variable recording preflight cleanup also failed: {cleanup_error}"
+                )
+        raise
+    owned = list(dict.fromkeys((*communications, controller_communication)))
+    primary: BaseException | None = None
+    constructed = False
+    writer_started = False
+    end11_attempted = False
+    begin12_attempted = False
+    end12_attempted = False
+    stop_attempted = 0
+    final_end_status: int | None = None
+    begin11_status: MonitorError | None = None
+    stop = _variable_recording_stop()
+    try:
+        if monitor_session is not None:
+            for target in targets:
+                if target.packet_cache is not None:
+                    target.packet_cache.disable_packet_ecu = (
+                        monitor_session.disable_packet_ecu
+                    )
+        checked = check_variable_monitor(
+            targets,
+            command_kind=command_kind,
+            allocation=allocation,
+            connected_device=connected_device,
+            command_ecu=command_ecu,
+            limits=limits,
+            clock=clock,
+            cancelled=cancelled,
+        )
+        if not checked.available or len(checked.measurements) != len(targets):
+            raise MonitorError("Variable recording selected check unavailable")
+        writer_started = True
+        try:
+            writer.begin(0x11)
+        except MonitorError as error:
+            if error.code is None:
+                raise
+            begin11_status = error
+        registered: dict[int, int | None] = {command_ecu: None}
+        for index, target in enumerate(targets):
+            registered[target.profile.category] = index
+        if len(registered) > 3:
+            raise MonitorError(
+                "Variable recording exceeds three registered slots", 0xC0050001
+            )
+        if registered[targets[0].profile.category] != 0:
+            raise UnsupportedRecorderOperation(
+                "Native Run87 first-original buffer metadata was overwritten"
+            )
+        selected: list[VariableRuntimeTarget] = []
+        null_controller = (
+            VariableNullController(
+                controller_communication.profile,
+                controller_connection,
+                controller_communication.source_build,
+            )
+            if registered[command_ecu] is None
+            else None
+        )
+        for index in registered.values():
+            if index is None:
+                continue
+            target = targets[index]
+            communication = cast(NativeCommunication, target.transaction)
+            if target.profile.category == 0x68:
+                assert voltage_state is not None
+                selected_variable_voltage_monitor(
+                    communication.cache,
+                    target.selected_ids,
+                    voltage_state=voltage_state,
+                    voltage_observations=voltage_observations,
+                )
+                variable_voltage_interface(
+                    VariableMonitorSource.for_build(target.source_build),
+                    limits=limits,
+                    clock=clock,
+                    cancelled=cancelled,
+                )
+                raise MonitorError(
+                    "Unreachable native variable voltage recorder result"
+                )
+            diagnostic = cast(
+                NativeFrameController, communication.operations
+            ).operations.diagnostic_mode
+            connection = selected_p4_connection(
+                target.profile,
+                bus_id=target.bus_id,
+                diagnostic_mode=diagnostic,
+                controller_category_flags=flags,
+            )
+            if flags & 31 == 9:
+                plan = selected_variable_packet_monitor(
+                    communication.cache,
+                    target.selected_ids,
+                    target.observed_functions,
+                    packet_cache=target.packet_cache,
+                    communication_protocol=target.bus_id,
+                    interface_id=connection.address.request_id,
+                    excluded=excluded,
+                    standard_values=standard_values[index],
+                    max_request=connection.maximum_request,
+                    max_reply=connection.maximum_reply,
+                    controller_category_flags=flags,
+                )
+            else:
+                plan = selected_variable_monitor_from_cache(
+                    communication.cache,
+                    target.selected_ids,
+                    target.observed_functions,
+                    attribute_3_31=True,
+                    communication_protocol=target.bus_id,
+                    interface_id=connection.address.request_id,
+                    excluded=excluded,
+                    standard_values=standard_values[index],
+                    max_request=connection.maximum_request,
+                    max_reply=connection.maximum_reply,
+                    controller_category_flags=flags,
+                )
+            selected_mode = (
+                plan.packing.mode_mask
+                if isinstance(plan, SelectedVariableMonitor)
+                else plan.packing.mode
+            )
+            if selected_mode & excluded:
+                raise MonitorError(
+                    "Variable recording child violates native exclusions", 0xC005100D
+                )
+            selected.append(
+                selected_variable_runtime_target(
+                    plan,
+                    communication.cache,
+                    connection,
+                    measurement=checked.measurements[index],
+                    diagnostic_mode=diagnostic,
+                    phase=phase,
+                    name=names[index],
+                    text_encoding=text_encoding,
+                )
+            )
+
+        def mark_writer_constructed() -> None:
+            nonlocal constructed
+            constructed = True
+
+        _, stop = selected_variable_recording_setup(
+            tuple(selected),
+            controller_connection,
+            connected_device=connected_device,
+            null_controller=null_controller,
+            iso_record=iso_record,
+            init_mode=init_mode,
+            parameter_c0=parameter_c0,
+            emit=writer.command,
+            on_construct=mark_writer_constructed,
+        )
+        end11_attempted = True
+        writer.end()
+        begin12_attempted = True
+        writer.begin(0x12)
+        for command in stop:
+            stop_attempted += 1
+            writer.command(command)
+        end12_attempted = True
+        try:
+            writer.end()
+        except MonitorError as error:
+            final_end_status = error.code
+            raise
+        if begin11_status is not None:
+            raise begin11_status
+        outer = cast(NativeCommunication, targets[0].transaction)
+        if cancelled():
+            raise Cancelled("Variable recording outer caller cancelled")
+        recording_target = LegacyRunTarget(
+            outer,
+            targets[0].selected_ids,
+            targets[0].observed_functions,
+            allocation_size=allocation,
+            name=names[0],
+            text_encoding=text_encoding,
+            standard_values=tuple(standard_values[0]),
+        )
+        result = writer.finalize(
+            next(
+                target.buffer
+                for target in selected
+                if target.cache.profile.category == targets[0].profile.category
+            ),
+            target=recording_target,
+            limits=limits or outer.limits,
+            clock=clock,
+            cancelled=cancelled,
+        )
+        for target in selected:
+            target.check()
+        return result
+    except BaseException as error:
+        primary = error
+        status = (
+            begin11_status.code
+            if begin11_status is not None
+            else error.code
+            if isinstance(error, MonitorError)
+            else None
+        )
+        end_status = final_end_status
+        if writer_started:
+            first_cleanup_status = None
+
+            def cleanup_stage(label: str, action: Callable[[], object]) -> None:
+                nonlocal first_cleanup_status, end_status
+                try:
+                    action()
+                except MonitorError as cleanup_error:
+                    if cleanup_error.code is not None:
+                        if label == "End12":
+                            end_status = cleanup_error.code
+                        elif first_cleanup_status is None:
+                            first_cleanup_status = cleanup_error.code
+                    else:
+                        error.add_note(
+                            f"Native Run87 {label} cleanup failed: {cleanup_error}"
+                        )
+                except BaseException as cleanup_error:  # noqa: BLE001 - retain primary identity
+                    error.add_note(
+                        f"Native Run87 {label} cleanup failed: {cleanup_error}"
+                    )
+
+            if writer.current == 0x11 and not end11_attempted:
+                end11_attempted = True
+                cleanup_stage("End11", writer.end)
+            if writer.current == 0x11:
+                # Host-side failed-framing cleanup: do not expose a partial
+                # group as successful DRS; independent native stop stages still run.
+                writer.current = None
+            if not begin12_attempted and 0x12 not in writer.groups:
+                begin12_attempted = True
+                cleanup_stage("Begin12", lambda: writer.begin(0x12))
+            if constructed:
+                while stop_attempted < len(stop):
+                    command = stop[stop_attempted]
+                    stop_attempted += 1
+                    cleanup_stage(
+                        "Stop7E50", lambda command=command: writer.command(command)
+                    )
+            elif status is None and first_cleanup_status is None:
+                first_cleanup_status = 0xC0050001
+            if begin12_attempted and not end12_attempted:
+                end12_attempted = True
+                cleanup_stage("End12", writer.end)
+            if status is None:
+                status = first_cleanup_status
+        if end_status:
+            if isinstance(error, MonitorError):
+                error.code = end_status
+            else:
+                error.add_note(f"Native Run87 final End12 status: {end_status:#x}")
+        elif status is not None and isinstance(error, MonitorError):
+            error.code = status
+        elif status is not None:
+            error.add_note(f"Native Run87 cleanup status: {status:#x}")
+        raise
+    finally:
+        failures = []
+        for communication in owned:
+            try:
+                status = communication.close()
+                if status:
+                    failures.append(
+                        MonitorError("Variable recording cleanup failed", status)
+                    )
+            except BaseException as error:  # noqa: BLE001 - release every owned support channel
+                failures.append(error)
+        if failures:
+            if primary is None:
+                cleanup_primary = failures.pop(0)
+                for error in failures:
+                    cleanup_primary.add_note(
+                        f"Additional variable recording cleanup failure: {error}"
+                    )
+                raise cleanup_primary
+            assert primary is not None
+            for error in failures:
+                primary.add_note(f"Variable recording cleanup also failed: {error}")
 
 
 def selected_variable_monitor_runtime(

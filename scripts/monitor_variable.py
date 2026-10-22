@@ -878,6 +878,71 @@ def selected_variable_recording(
     return result
 
 
+def selected_variable_recording_setup(
+    targets: tuple[VariableRuntimeTarget, ...],
+    controller_connection: SelectedMonitorConnection,
+    *,
+    connected_device: int,
+    null_controller: VariableNullController | None = None,
+    iso_record: bytes | None = None,
+    init_mode: int | None = None,
+    parameter_c0: int | None = None,
+    emit: Callable[[NativeDmciCommand], None] | None = None,
+    on_construct: Callable[[], None] | None = None,
+) -> tuple[tuple[NativeDmciCommand, ...], tuple[NativeDmciCommand, ...]]:
+    """Build one native recording constructor around selected target setup."""
+    if not isinstance(targets, tuple) or not 1 <= len(targets) <= 3:
+        raise MonitorError("Variable recording requires1..3 selected slots")
+    if type(connected_device) is not int or connected_device not in (4, 8):
+        raise MonitorError("Variable recording requires observed device4 or8")
+    commands: list[NativeDmciCommand] = []
+
+    def append(command: MonitorCommand, *, constructor: bool = False) -> None:
+        native = NativeDmciCommand.from_neutral(command.command_id, command.values)
+        commands.append(native)
+        if constructor and on_construct is not None:
+            on_construct()
+        if emit is not None:
+            emit(native)
+
+    for command in _variable_dmci_constructor(
+        controller_connection,
+        iso_record=iso_record,
+        init_mode=init_mode,
+        parameter_c0=parameter_c0,
+    ):
+        append(command, constructor=command.command_id in (0x100, 0x101))
+    if null_controller is not None:
+        null_controller.check_targets(targets)
+        if null_controller.connection != controller_connection:
+            raise MonitorError("Variable recording NULL slot connection differs")
+        append(_variable_id_map(controller_connection))
+    for target in targets:
+        target.check()
+        if (
+            not isinstance(
+                target.plan, (SelectedVariableMonitor, SelectedVariablePacketMonitor)
+            )
+            or target.connection is None
+        ):
+            raise MonitorError("Variable recording slot requires communication child")
+        for command in _variable_dmci_target_setup(target.plan, target.connection):
+            append(command)
+    append(MonitorCommand(0x10C, ()))
+    return tuple(commands), _variable_recording_stop()
+
+
+def _variable_recording_stop() -> tuple[NativeDmciCommand, ...]:
+    return tuple(
+        NativeDmciCommand.from_neutral(command.command_id, command.values)
+        for command in (
+            MonitorCommand(0x10E, ()),
+            MonitorCommand(0x108, ()),
+            MonitorCommand(0x104, ()),
+        )
+    )
+
+
 class _VariableVimClient(NativeVimClient):
     def dmci(
         self,

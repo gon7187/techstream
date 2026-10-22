@@ -257,6 +257,8 @@ PLUS_EXPORTS = frozenset(
         "Ex2ABS_47_ExitEndExtendedSession",
         "Ex2ABS_18_SupportCheck",
         "Ex2ABS_18_SetNeutralPos",
+        "Ex2ABS_29_SupportCheck",
+        "Ex2ABS_29_ShiftDealerMode",
         "Ex2ABS_21_SupportCheck",
         "Ex2ABS_21_ChangeMode",
         "Ex2ABS_21_CheckSensorStatus",
@@ -904,7 +906,7 @@ class ChassisEngine:
             _put(data, 40 + index * 4, int(bool(reply[offset] & mask)))
         return 0 if any(_word(data, offset) for offset in range(40, 80, 4)) else 1003
 
-    def _brake_support(self, comm: TYComm) -> int:
+    def _brake_support(self, comm: TYComm, *, positive_service: bool = True) -> int:
         # 9b350/88ff0 share five query predicates, not their status/restore policy.
         for request, minimum, offset, mask in (
             (b"\x22\1\1", 6, 5, 128),
@@ -914,13 +916,64 @@ class ChassisEngine:
             (b"\x31\1\x11\0", 6, 5, 0x10),
         ):
             status, reply = self._reply(
-                comm, request, minimum, 2 if request[0] == 0x22 else 3
+                comm,
+                request,
+                minimum,
+                2 if request[0] == 0x22 else 3,
+                positive_service=positive_service,
             )
             if status:
                 return status
             if reply[offset] & mask != mask:
                 return 3
         return 0
+
+    def _abs29(self, export: str, comm: TYComm, context: ChassisContext) -> int:
+        activated = False
+        try:
+            status = comm.initialize(0)
+            if status:
+                return status
+            activated = True
+            for field, value in (
+                (self.contract.retry_setter, 0),
+                (self.contract.pending_setter, 180000),
+                (self.contract.retries_setter, 0),
+            ):
+                comm.configure(field, value)
+            status = self._normal(comm)
+            if not status:
+                status = comm.session(3, 1)
+            if status:
+                return status
+            if export == "Ex2ABS_29_SupportCheck":
+                status = self._brake_support(comm, positive_service=False)
+                normal = self._normal(comm)
+                return 3 if status else normal
+            status, _ = self._reply(
+                comm,
+                b"\x31\1\x11\x0c\1",
+                4,
+                3,
+                positive_service=False,
+            )
+            if not status:
+                context.sleep(4000)
+                status, reply = self._reply(
+                    comm,
+                    b"\x22\x10\x2d",
+                    13,
+                    2,
+                    positive_service=False,
+                )
+                if not status and not reply[12] & 8:
+                    status = 3
+            self._normal(comm)
+            return 1006 if status else 0
+        except BaseException:
+            if activated:
+                self._cleanup_normal_after_host_fault(comm)
+            raise
 
     @staticmethod
     def _asus10_read(
@@ -5428,21 +5481,7 @@ class ChassisEngine:
                         return 1001 if status == 1001 else normal or 1002
                 return self._normal(comm)
             if export in ("Ex2ABS_29_SupportCheck", "Ex2ABS_29_ShiftDealerMode"):
-                status = self._initialize(comm)
-                if status:
-                    return status
-                if export == "Ex2ABS_29_SupportCheck":
-                    status = self._brake_support(comm)
-                    normal = self._normal(comm)
-                    return 3 if status else normal
-                status, _ = self._reply(comm, b"\x31\1\x11\x0c\1", 4, 3)
-                if not status:
-                    context.sleep(4000)
-                    status, reply = self._reply(comm, b"\x22\x10\x2d", 13, 2)
-                    if not status and not reply[12] & 8:
-                        status = 3
-                self._normal(comm)
-                return 1006 if status else 0
+                return self._abs29(export, comm, context)
             if export.startswith("Ex2ASUS_10_"):
                 return self._asus10(export, data, context, comm)
             if export == "Ex2EPB_05_SendMessage":
@@ -5790,6 +5829,8 @@ class ChassisEngine:
                 "Ex2ASUS_10_ChgAndGetStatOfHeightCtrlProhibition",
                 "Ex2ABS_52_ReadBrakePadResidualThickness",
                 "Ex2ABS_52_WriteBrakePadResidualThickness",
+                "Ex2ABS_29_SupportCheck",
+                "Ex2ABS_29_ShiftDealerMode",
             ):
                 cleanup = False
                 with suppress(BaseException):

@@ -22,6 +22,376 @@ if TYPE_CHECKING:
 _TOKEN = object()
 _ISSUED: dict[int, ThreadPhaseLease2026] = {}
 _LOCK = threading.RLock()
+_VBF_REQUESTS: dict[int, tuple[VbfProcessBeforeRequest2026, _VbfRequestRecord2026]] = {}
+_VBF_LOCK = threading.RLock()
+
+
+@dataclass
+class _VbfRequestRecord2026:
+    fields: dict
+    issuer: int
+    previous_record: _CompletionRecord2026 | None
+    source_descriptor: tuple
+    handshake_at_issue: int
+    root: ProgrammingReplay | None = None
+    lease: ThreadPhaseLease2026 | None = None
+
+
+class VbfProcessBeforeRequest2026:
+    """Opaque receipt for one authenticated ProcessBeforeReprogramming call."""
+
+    __slots__ = ()
+
+    def __init__(self, *, _token=None):
+        if _token is not _TOKEN:
+            raise TypeError("Engine-issued VBF ProcessBefore request required")
+
+    def __getattr__(self, name):
+        if name not in {
+            "job",
+            "engine",
+            "controller",
+            "worker",
+            "runtime",
+            "trace",
+            "previous_session",
+            "previous_sequence",
+            "previous_lease",
+            "state",
+            "wait_required",
+            "started_ms",
+            "metadata",
+            "container",
+            "file_sources",
+            "source_sha256",
+            "node",
+            "cpu_index",
+            "received_identifiers",
+        }:
+            raise AttributeError(name)
+        record = _vbf_record(self)
+        return record.fields[name]
+
+    def __setattr__(self, name, value):
+        raise AttributeError("VBF ProcessBefore request fields are read-only")
+
+
+def _vbf_record(request):
+    with _VBF_LOCK:
+        entry = _VBF_REQUESTS.get(id(request))
+        if entry is None or entry[0] is not request:
+            raise ValueError("Exact issued VBF ProcessBefore request required")
+        return entry[1]
+
+
+def _vbf_inflight_raw_root2026(job, session) -> bool:
+    """Prove the unused parent is inside its registered raw CONTROL Execute."""
+    from scripts.cuw_engine_worker import ControlFileCapture2026
+    from scripts.programming_2026_common import (
+        _NATIVE_CONTROL_CONTEXTS_2026,
+        _NATIVE_CONTROL_RAW_EXECUTIONS_2026,
+        ControlCommPhase2026,
+        NativeControlContext2026,
+    )
+    from scripts.programming_replay import ProgrammingReplay
+
+    child = job._child
+    lease = job._lease
+    engine = job.engine
+    controller = job.controller
+    worker = job.worker
+    if (
+        type(session) is not ProgrammingReplay
+        or session is not job._session
+        or session.used
+        or controller._parameter_session is not session
+        or session._engine2026 is not engine
+        or session._controller2026 is not controller
+        or session._runtime2026 is not controller.runtime
+        or type(controller) is not ControlCommPhase2026
+        or type(child) is not threading.Thread
+        or not child.is_alive()
+        or type(lease) is not ThreadPhaseLease2026
+        or lease.state != "adopted"
+        or lease._thread != child.ident
+        or engine._active is not True
+        or engine._phase_thread != child.ident
+        or engine._controller_execution is not controller
+        or engine.worker_phase != 1
+        or worker._phase_started_ms is None
+    ):
+        return False
+    try:
+        validate_thread_phase_lease(lease, engine, controller=controller, phase=1)
+    except (TypeError, ValueError):
+        return False
+    context = controller._native_control_context2026
+    token = controller._native_control_raw_execution2026
+    if (
+        type(context) is not NativeControlContext2026
+        or token is None
+        or engine._native_control_context2026 is not context
+        or _NATIVE_CONTROL_CONTEXTS_2026.get(id(context)) is not context
+        or context._expired
+        or context._engine is not engine
+        or context._controller is not controller
+        or context._worker is not worker
+        or context._runtime is not controller.runtime
+        or _NATIVE_CONTROL_RAW_EXECUTIONS_2026.get(id(token))
+        != (token, engine, controller, context)
+    ):
+        return False
+    capture = context._capture
+    if (
+        type(capture) is not ControlFileCapture2026
+        or worker._control_file_capture is not capture
+        or capture._worker_ref() is not worker
+        or capture._engine is not engine
+        or capture._controller is not controller
+        or capture._runtime is not controller.runtime
+        or capture._thread_job is not job
+        or capture._thread_id != child.ident
+        or capture._phase != 1
+        or capture._import_epoch != engine._identifier_context_epoch
+        or capture.metadata.source_container.digest != session.container.digest
+        or capture.metadata.source_sha256 != session.container.digest
+        or capture.metadata.node != session.node
+    ):
+        return False
+    from scripts.calibration_2026 import native2026_validate_runtime_metadata
+
+    try:
+        native2026_validate_runtime_metadata(capture.metadata)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _validate_vbf_source(job, record, *, freeze=False):
+    job.worker.validate_source(job.engine)
+    metadata = job.engine.native_metadata
+    job.engine._validate_persistence_source(metadata)
+    sources = job.engine.file_sources
+    if sources is not None:
+        from scripts.cuw_file_services import validate_file_sources_2026
+
+        validate_file_sources_2026(sources, job.engine)
+    from scripts.calibration_2026 import native2026_cpu_values
+
+    cpu = native2026_cpu_values(metadata, 0)
+    if ".vbf" not in cpu.get("cpuimagename", ""):
+        raise ValueError("Current first CPU is not a case-sensitive VBF source")
+    if metadata.source_container is None or not metadata.source_sha256:
+        raise ValueError("Authenticated current VBF FILE required")
+    if metadata.source_sha256 != metadata.source_container.digest:
+        raise ValueError("Current VBF FILE digest is not authenticated")
+    if metadata.source_sha256 != job.engine.source_sha256:
+        raise ValueError("Current VBF FILE differs from the engine source")
+    # An actual141 producer may replace the selected FILE while the captured
+    # old root remains the trace/sequence lineage.  worker.validate_source and
+    # engine persistence/file-source validation authenticate the live view;
+    # source_descriptor remains issue-time provenance, not an equality pin.
+    view = {
+        "metadata": metadata,
+        "container": metadata.source_container,
+        "file_sources": sources,
+        "source_sha256": metadata.source_sha256,
+        "node": metadata.node,
+        "cpu_index": job.engine.dh_state.selection_cpu_index,
+        "received_identifiers": job.worker._identifiers_for_file(
+            job.worker.source_state.current_file_index
+        ),
+    }
+    if any(type(item) is not bytes for item in view["received_identifiers"]):
+        raise ValueError("Authenticated native received identifiers required")
+    if freeze:
+        if record is None:
+            raise ValueError("VBF request record required to freeze source view")
+        record.fields.update(view)
+    elif (
+        record is not None
+        and record.fields["container"] is not None
+        and (
+            metadata.source_container is not record.fields["container"]
+            or metadata.source_sha256 != record.fields["source_sha256"]
+            or metadata.node != record.fields["node"]
+            or job.engine.dh_state.selection_cpu_index != record.fields["cpu_index"]
+            or sources is not record.fields["file_sources"]
+        )
+    ):
+        raise ValueError("VBF prepared FILE changed after its authenticated view")
+    return view
+
+
+def _validate_vbf_lineage(job, request, record):
+    fields = record.fields
+    job.validate_owner(fields["engine"], fields["controller"])
+    if (
+        fields["worker"] is not job.worker
+        or fields["runtime"] is not job.controller.runtime
+        or fields["runtime"] is not job.worker.runtime
+        or fields["trace"] is not fields["previous_session"].trace
+        or fields["previous_sequence"] <= 0
+        or job._completion_records.get(fields["previous_sequence"])
+        is not record.previous_record
+    ):
+        raise ValueError("Captured VBF generation lineage changed")
+    if (
+        job._stop
+        or job._host_stop
+        or job._outer is None
+        or not job._outer.is_alive()
+        or job._child is None
+        or not job._child.is_alive()
+    ):
+        raise ValueError("Live persistent VBF native threads required")
+    _validate_vbf_source(job, record)
+    state = fields["state"]
+    if state in ("reserved", "adopted"):
+        lease = record.lease
+        if (
+            lease is None
+            or lease.vbf_request is not request
+            or lease.phase != 1
+            or job._sequence != fields["previous_sequence"] + 1
+            or job._completion_records.get(job._sequence) is not job._active_record
+            or job._session is not record.root
+            or job._lease is not lease
+        ):
+            raise ValueError("Exact promoted VBF generation required")
+    else:
+        if job._sequence != fields["previous_sequence"]:
+            raise ValueError("Unrelated native generation superseded VBF request")
+        old_lease = fields["previous_lease"]
+        if job._lease is old_lease and job._session is fields["previous_session"]:
+            live = (
+                old_lease.state == "adopted"
+                and not record.previous_record.completed.is_set()
+            )
+            parked_cleanup = (
+                old_lease.state == "released"
+                and job._child_parked.is_set()
+                and not record.previous_record.completed.is_set()
+            )
+            if not (live or parked_cleanup):
+                raise ValueError("Exact live previous native generation required")
+        elif (
+            job._lease is not None
+            or job._session is not None
+            or old_lease.state != "released"
+            or not record.previous_record.completed.is_set()
+        ):
+            raise ValueError("Captured previous generation did not retire normally")
+
+
+def validate_vbf_process_before2026(
+    request, job, *, states: tuple[str, ...], lease=None
+) -> VbfProcessBeforeRequest2026:
+    """Validate the only issued receipt for a real VBF resume transition."""
+    if type(request) is not VbfProcessBeforeRequest2026:
+        raise TypeError("Concrete VBF ProcessBefore request required")
+    if type(job) is not EngineThreadJob2026:
+        raise TypeError("Concrete native engine thread job required")
+    if (
+        type(states) is not tuple
+        or not states
+        or any(type(item) is not str for item in states)
+    ):
+        raise ValueError("Explicit VBF request lifecycle states required")
+    record = _vbf_record(request)
+    assert record.previous_record is not None
+    if record.fields["job"] is not job:
+        raise ValueError("VBF request belongs to another native job")
+    with job._lock:
+        _validate_vbf_lineage(job, request, record)
+        if record.fields["state"] not in states:
+            raise ValueError("VBF request lifecycle state is not admitted")
+        if lease is not None and (
+            type(lease) is not ThreadPhaseLease2026
+            or record.lease is not lease
+            or lease.vbf_request is not request
+            or lease.engine is not job.engine
+            or lease.controller is not job.controller
+            or lease.phase != 1
+        ):
+            raise ValueError("Exact request-bound phase-one lease required")
+    return request
+
+
+def _queued_vbf_request(job):
+    with _VBF_LOCK:
+        matches = [
+            request
+            for request, record in _VBF_REQUESTS.values()
+            if record.fields["job"] is job and record.fields["state"] == "queued"
+        ]
+    if len(matches) > 1:
+        raise ValueError("Only one queued VBF source request is admitted")
+    return matches[0] if matches else None
+
+
+def _has_vbf_request2026(job) -> bool:
+    """Read-only admission guard for ordinary engine phase entry points."""
+    with _VBF_LOCK:
+        return any(
+            record.fields["job"] is job and record.fields["state"] != "abandoned"
+            for _, record in _VBF_REQUESTS.values()
+        )
+
+
+def _discard_unbound_queued_vbf(job, request):
+    if threading.current_thread() is not job._outer:
+        raise ValueError("Only the actual outer owner may discard queued VBF work")
+    with _VBF_LOCK:
+        entry = _VBF_REQUESTS.get(id(request))
+        if entry is None or entry[0] is not request:
+            return
+        record = entry[1]
+        if (
+            record.fields["job"] is job
+            and record.fields["state"] == "queued"
+            and record.lease is None
+        ):
+            record.fields["state"] = "abandoned"
+            del _VBF_REQUESTS[id(request)]
+
+
+def _promote_queued_vbf(job, request):
+    """Promote a source request only on the outer after captured work retires."""
+    validate_vbf_process_before2026(request, job, states=("queued",))
+    record = _vbf_record(request)
+    assert record.previous_record is not None
+    if (
+        threading.current_thread() is not job._outer
+        or job._lease is not None
+        or job._session is not None
+        or not record.previous_record.completed.is_set()
+        or record.fields["previous_lease"].state != "released"
+    ):
+        raise ValueError("Retired captured generation required for VBF promotion")
+    try:
+        next_lease = job.engine.reserve_phase(job.controller, 1, _vbf_request=request)
+        next_session = record.root
+        if next_session is None:
+            job.engine.release_reserved_phase(next_lease)
+            raise ValueError("Queued VBF source request lost its root")
+    except BaseException:
+        _discard_unbound_queued_vbf(job, request)
+        raise
+    next_sequence = record.fields["previous_sequence"] + 1
+    next_record = _CompletionRecord2026(next_sequence)
+    job._lease = next_lease
+    job._session = next_session
+    job._sequence = next_sequence
+    job._active_record = next_record
+    job._completion_records[next_sequence] = next_record
+    job._completed.clear()
+    job._child_done.clear()
+    job._child_parked.clear()
+    job._prepare_pending.clear()
+    job._result = job._error = job._continuation = None
+    job._child_exit = None
+    job._waiting = False
 
 
 class ThreadPhaseLease2026:
@@ -35,6 +405,7 @@ class ThreadPhaseLease2026:
         self._phase = phase
         self._state = "reserved"
         self._thread: int | None = None
+        self._vbf_request: VbfProcessBeforeRequest2026 | None = None
 
     @property
     def engine(self):
@@ -47,6 +418,10 @@ class ThreadPhaseLease2026:
     @property
     def phase(self) -> int:
         return self._phase
+
+    @property
+    def vbf_request(self):
+        return self._vbf_request
 
     @property
     def state(self) -> str:
@@ -72,7 +447,9 @@ class ThreadPhaseLease2026:
             del _ISSUED[id(self)]
 
 
-def _issue_thread_phase_lease(engine, controller, phase) -> ThreadPhaseLease2026:
+def _issue_thread_phase_lease(
+    engine, controller, phase, *, _vbf_request=None
+) -> ThreadPhaseLease2026:
     from scripts.cuw_2026 import CUWEngine2026
     from scripts.programming_2026_common import ControlCommPhase2026
 
@@ -88,6 +465,17 @@ def _issue_thread_phase_lease(engine, controller, phase) -> ThreadPhaseLease2026
     lease = ThreadPhaseLease2026(engine, controller, phase, _token=_TOKEN)
     with _LOCK:
         _ISSUED[id(lease)] = lease
+    if _vbf_request is not None:
+        try:
+            job = engine.thread_job
+            if job is None:
+                raise ValueError("Actual VBF thread job required for lease binding")
+            lease._vbf_request = _vbf_request
+            job._bind_vbf_phase_lease2026(_vbf_request, lease)
+        except BaseException:
+            with _LOCK:
+                _ISSUED.pop(id(lease), None)
+            raise
     return lease
 
 
@@ -187,6 +575,304 @@ class EngineThreadJob2026:
         ):
             raise ValueError("Native thread job controller identity changed")
 
+    def _begin_vbf_process_before2026(self):
+        from scripts.calibration_2026 import native2026_cpu_values
+        from scripts.programming_replay import ProgrammingReplay
+
+        caller = threading.current_thread()
+        with self._lock:
+            self.validate_owner(self.engine, self.controller)
+            raw_root_active = _vbf_inflight_raw_root2026(self, self._session)
+            if caller in (self._outer, self._child):
+                raise ValueError("External VBF ProcessBefore caller required")
+            if (
+                self._stop
+                or self._host_stop
+                or self._outer is None
+                or not self._outer.is_alive()
+                or self._child is None
+                or not self._child.is_alive()
+                or self._sequence <= 0
+                or self._active_record is None
+                or self._lease is None
+                or (
+                    self._lease.state != "adopted"
+                    and not (
+                        self._lease.state == "released"
+                        and self._child_parked.is_set()
+                        and not self._active_record.completed.is_set()
+                    )
+                )
+                or self._session is None
+                or type(self._session) is not ProgrammingReplay
+                or not (self._session.used or raw_root_active)
+                or self._active_record
+                is not self._completion_records.get(self._sequence)
+            ):
+                raise ValueError("Actual persistent native generation required")
+            if (
+                self.worker.native_prepare_handshake != 1
+                and not self._child_parked.is_set()
+            ):
+                raise ValueError("Non-handshake VBF admission requires parked child")
+            _validate_vbf_source(self, None)
+            metadata = self.engine.native_metadata
+            if ".vbf" not in native2026_cpu_values(metadata, 0).get("cpuimagename", ""):
+                raise ValueError("First effective CPU is not a case-sensitive VBF")
+            if self._session._runtime2026 is not self.controller.runtime:
+                raise ValueError("Active raw root belongs to another runtime")
+            previous_record = self._completion_records[self._sequence]
+            fields = {
+                "job": self,
+                "engine": self.engine,
+                "controller": self.controller,
+                "worker": self.worker,
+                "runtime": self.controller.runtime,
+                "trace": self._session.trace,
+                "previous_session": self._session,
+                "previous_sequence": self._sequence,
+                "previous_lease": self._lease,
+                "state": "issued",
+                "wait_required": None,
+                "started_ms": None,
+                "metadata": None,
+                "container": None,
+                "file_sources": None,
+                "source_sha256": None,
+                "node": None,
+                "cpu_index": None,
+                "received_identifiers": None,
+            }
+            source_descriptor = (
+                metadata.source_container,
+                metadata.source_sha256,
+                self.engine.file_sources,
+                self.worker.source_state.current_file_index,
+                metadata.node,
+                self.engine.dh_state.selection_cpu_index,
+            )
+            if (
+                source_descriptor[0] is not metadata.source_container
+                or source_descriptor[1] != metadata.source_sha256
+            ):
+                raise ValueError("Current authenticated VBF source descriptor changed")
+            request = VbfProcessBeforeRequest2026(_token=_TOKEN)
+            record = _VbfRequestRecord2026(
+                fields,
+                threading.get_ident(),
+                previous_record,
+                source_descriptor,
+                self.worker.native_prepare_handshake,
+            )
+            with _VBF_LOCK:
+                if any(
+                    item.fields["job"] is self
+                    and item.fields["state"]
+                    in (
+                        "issued",
+                        "acknowledged",
+                        "parked",
+                        "prepared",
+                        "queued",
+                        "reserved",
+                    )
+                    for _, item in _VBF_REQUESTS.values()
+                ):
+                    raise ValueError("VBF ProcessBefore request is already outstanding")
+                _VBF_REQUESTS[id(request)] = (request, record)
+            return request
+
+    def _record_vbf_acknowledgement2026(self, request, *, wait_required: bool) -> None:
+        if type(wait_required) is not bool:
+            raise TypeError("Actual native VBF wait decision required")
+        validate_vbf_process_before2026(request, self, states=("issued",))
+        record = _vbf_record(request)
+        assert record.previous_record is not None
+        if threading.get_ident() != record.issuer:
+            raise ValueError("VBF acknowledgement belongs to its issuing thread")
+        if wait_required:
+            if (
+                record.handshake_at_issue != 1
+                or self.worker.native_prepare_handshake != 2
+            ):
+                raise ValueError("Actual native prepare handshake transition required")
+        elif self.worker.native_prepare_handshake == 1:
+            raise ValueError("Native handshake was not acknowledged")
+        record.fields["wait_required"] = wait_required
+        record.fields["state"] = "acknowledged"
+
+    def _validate_vbf_issuer2026(self, request) -> None:
+        """Reject foreign callers before lexical engine resume ownership is granted."""
+        validate_vbf_process_before2026(
+            request, self, states=("issued", "acknowledged", "parked")
+        )
+        if _vbf_record(request).issuer != threading.get_ident():
+            raise ValueError("Captured VBF request issuer required")
+
+    def _wait_vbf_process_before2026(self, request) -> None:
+        validate_vbf_process_before2026(request, self, states=("acknowledged",))
+        record = _vbf_record(request)
+        if threading.get_ident() != record.issuer:
+            raise ValueError("VBF parked-child wait belongs to its issuing thread")
+        if record.fields["wait_required"]:
+            timeout = min(
+                self.controller.runtime.check(),
+                self.controller.runtime.cleanup_timeout,
+            )
+            deadline = time.monotonic() + timeout
+            while not self._child_parked.wait(
+                min(0.5, max(0, deadline - time.monotonic()))
+            ):
+                self.controller.runtime.check()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("VBF parked-child wait exceeded host deadline")
+        elif not self._child_parked.is_set():
+            raise ValueError(
+                "Non-handshake VBF request requires an already parked child"
+            )
+        with self._lock:
+            _validate_vbf_lineage(self, request, record)
+            if not self._child_parked.is_set():
+                raise ValueError("Actual native child parked event required")
+            _validate_vbf_source(self, record, freeze=True)
+            record.fields["state"] = "parked"
+
+    def _record_vbf_prepared2026(self, request, *, started_ms: int):
+        if type(started_ms) is not int or not 0 <= started_ms < 86_400_000:
+            raise ValueError("Native local milliseconds within day required")
+        validate_vbf_process_before2026(request, self, states=("parked",))
+        record = _vbf_record(request)
+        if threading.get_ident() != record.issuer:
+            raise ValueError("VBF FULL36800 preparation belongs to its issuer")
+        if self.engine._prepare_prefix_owner != (
+            record.issuer,
+            self.worker,
+            self,
+        ):
+            raise ValueError("Exact lexical FULL36800 preparation owner required")
+        if self.worker.native_prepare_handshake != 1:
+            raise ValueError("Actual FULL36800 VBF reset state required")
+        _validate_vbf_source(self, record, freeze=True)
+        record.fields["started_ms"] = started_ms
+        record.fields["state"] = "prepared"
+        return request
+
+    def _queue_vbf_prepare2026(self, request, session) -> int:
+        from scripts.programming_replay import ProgrammingReplay
+
+        validate_vbf_process_before2026(request, self, states=("prepared",))
+        record = _vbf_record(request)
+        if threading.get_ident() != record.issuer:
+            raise ValueError("VBF prepared root queue belongs to its issuer")
+        if (
+            type(session) is not ProgrammingReplay
+            or session.operation != "prepare"
+            or session.used
+            or session.container is not record.fields["container"]
+            or session.container.digest != record.fields["source_sha256"]
+            or session.node != record.fields["node"]
+            or session.trace is not record.fields["trace"]
+            or session._runtime2026 is not record.fields["runtime"]
+            or session._controller2026 is not record.fields["controller"]
+            or session._engine2026 is not record.fields["engine"]
+            or session._control_target2026 is not None
+            or session._control_export2026 is not None
+            or session._retained_export2026 is not None
+        ):
+            raise ValueError("Fresh authenticated raw VBF prepare root required")
+        with self._lock:
+            validate_vbf_process_before2026(request, self, states=("prepared",))
+            if (
+                self._sequence != request.previous_sequence
+                or self._completion_records.get(request.previous_sequence)
+                is not record.previous_record
+            ):
+                raise ValueError("VBF source request no longer owns the next sequence")
+            next_sequence = self._sequence + 1
+            record.root = session
+            record.fields["state"] = "queued"
+            self._resume.set()
+        return next_sequence
+
+    def _bind_vbf_phase_lease2026(self, request, lease) -> None:
+        validate_vbf_process_before2026(request, self, states=("queued",))
+        record = _vbf_record(request)
+        assert record.previous_record is not None
+        if (
+            threading.current_thread() is not self._outer
+            or lease.state != "reserved"
+            or lease.phase != 1
+            or lease.engine is not self.engine
+            or lease.controller is not self.controller
+            or self._lease is not None
+            or self._session is not None
+            or self._sequence != request.previous_sequence
+            or self._completion_records.get(request.previous_sequence)
+            is not record.previous_record
+            or not record.previous_record.completed.is_set()
+            or request.previous_lease.state != "released"
+        ):
+            raise ValueError("Actual outer VBF phase-one reservation required")
+        record.lease = lease
+        record.fields["state"] = "reserved"
+
+    def _consume_vbf_phase2026(self, request, lease):
+        validate_vbf_process_before2026(
+            request, self, states=("reserved",), lease=lease
+        )
+        record = _vbf_record(request)
+        if (
+            threading.current_thread() is not self._child
+            or lease.state != "adopted"
+            or lease._thread != threading.get_ident()
+            or self.worker.native_prepare_handshake != 1
+        ):
+            raise ValueError("Actual adopting VBF native child required")
+        _validate_vbf_source(self, record)
+        record.fields["state"] = "adopted"
+        return request
+
+    def _release_vbf_phase2026(self, request, lease) -> None:
+        if type(request) is not VbfProcessBeforeRequest2026:
+            raise TypeError("Concrete VBF ProcessBefore request required")
+        record = _vbf_record(request)
+        if (
+            record.lease is not lease
+            or lease.vbf_request is not request
+            or lease.state != "released"
+            or (lease._thread is not None and lease._thread != threading.get_ident())
+            or (
+                lease._thread is None
+                and threading.current_thread() not in (self._outer, self._child)
+            )
+        ):
+            raise ValueError("Actual released VBF phase lease required")
+        with _VBF_LOCK:
+            current = _VBF_REQUESTS.get(id(request))
+            if current is None or current[0] is not request or current[1] is not record:
+                raise ValueError("VBF request registry identity changed")
+            del _VBF_REQUESTS[id(request)]
+
+    def _abandon_vbf_process_before2026(self, request) -> None:
+        if type(request) is not VbfProcessBeforeRequest2026:
+            raise TypeError("Concrete VBF ProcessBefore request required")
+        with _VBF_LOCK:
+            entry = _VBF_REQUESTS.get(id(request))
+            if entry is None or entry[0] is not request:
+                return
+            record = entry[1]
+        if record.fields["job"] is not self:
+            raise ValueError("VBF request belongs to another native job")
+        if record.fields["state"] in ("queued", "reserved", "adopted"):
+            return
+        if threading.get_ident() != record.issuer:
+            raise ValueError("Only the VBF issuing thread may abandon its request")
+        record.fields["state"] = "abandoned"
+        with _VBF_LOCK:
+            current = _VBF_REQUESTS.get(id(request))
+            if current is not None and current[0] is request:
+                del _VBF_REQUESTS[id(request)]
+
     @property
     def state(self) -> ThreadState2026:
         with self._lock:
@@ -249,6 +935,24 @@ class EngineThreadJob2026:
             self.validate_owner(self.engine)
             if self._stop or (self._outer is not None and not self._outer.is_alive()):
                 raise ValueError("Native thread job is stopped")
+            with _VBF_LOCK:
+                if any(
+                    item.fields["job"] is self
+                    and item.fields["state"]
+                    in (
+                        "issued",
+                        "acknowledged",
+                        "parked",
+                        "prepared",
+                        "queued",
+                        "reserved",
+                        "adopted",
+                    )
+                    for _, item in _VBF_REQUESTS.values()
+                ):
+                    raise ValueError(
+                        "Native start cannot bypass an outstanding VBF request"
+                    )
             if (
                 expected == 1
                 and self.worker.native_prepare_handshake == 1
@@ -527,7 +1231,14 @@ class EngineThreadJob2026:
                     if lease is None:
                         if self._stop:
                             break
-                        raise ValueError("Native resume event has no actual child work")
+                        queued_request = _queued_vbf_request(self)
+                        if queued_request is None:
+                            raise ValueError(
+                                "Native resume event has no actual child work"
+                            )
+                        _promote_queued_vbf(self, queued_request)
+                        lease = self._lease
+                        record = self._active_record
                     assert record is not None
                     self._waiting = False
                     child = self._child
@@ -596,13 +1307,21 @@ class EngineThreadJob2026:
                     record.continuation = self.worker.take_continuation()
                     self._continuation = record.continuation
                     self._lease = self._session = None
-                    self._waiting = True
-                    if self.engine._retry_controller is not None:
-                        self.engine._retry_controller.worker_stopped()
                     self._completed.set()
                     record.completed.set()
+                    queued_request = _queued_vbf_request(self)
+                    self._waiting = queued_request is None
+                    if (
+                        queued_request is None
+                        and self.engine._retry_controller is not None
+                    ):
+                        self.engine._retry_controller.worker_stopped()
                     if self._stop:
+                        if queued_request is not None:
+                            _discard_unbound_queued_vbf(self, queued_request)
                         break
+                    if queued_request is not None:
+                        _promote_queued_vbf(self, queued_request)
             self._outer_exit = 0
         except BaseException as error:  # noqa: BLE001 - preserve thread failure for its joining owner
             with self._lock:
@@ -621,6 +1340,9 @@ class EngineThreadJob2026:
         finally:
             with self._lock:
                 self._stop = True
+                queued_request = _queued_vbf_request(self)
+                if queued_request is not None:
+                    _discard_unbound_queued_vbf(self, queued_request)
                 self._child_resume.set()
                 child = self._child
             if child is not None:

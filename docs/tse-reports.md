@@ -142,6 +142,25 @@ so the view does not claim which producer supplied it. The same native response
 also binds `maximum_recording_count` (logical 103) and
 `specification_number_raw` (logical 118) to the separate saved DWORDs.
 
+Each present DDR normal or ADS pair also adds one `ddr_headers` KeyCycle row,
+independent of its signal sample count. It preserves the unsigned value,
+precision byte and separate invalidity byte with exact source paths. A nonzero
+invalidity byte or negative signed value displays `-`; otherwise precisions 0–8
+use the recovered sign-space decimal format and zero padding. Valid values with
+precision 9–255 retain their raw fields and use `key_cycle_display=None` with
+`key_cycle_display_status="source-semantics-open"`; the native high-precision
+formatter behavior is not established. Missing pairs do not create rows.
+
+Normal DDR slot 24 samples also expose `sequence_format_admitted` and the
+evaluated `sequence_format_checks`. The view checks mask 21 first; for sample
+index zero that result is final, and later samples check masks 0 then 1 only
+while each preceding byte is present and zero. A missing byte fails with a null
+raw value and source path. These fields describe reaching the native numeric
+formatting branch, not a successful conversion or a plotted coordinate. The
+association is by normal slot position and exact pair path, never by stored
+signal identifier; sibling signals and ADS rows remain unannotated. Stored
+sample text, raw values and flags are unchanged.
+
 Operation-history headers expose the six stored current-time fields (year,
 month, day, hour, minute, second) and preserve the following metadata byte.
 CommandAPI `23434–234c3` logs the same `GetAnalyzeWorkFactorApiRcv` fields;

@@ -1246,7 +1246,11 @@ class CUWPersistence:
     def update_cpu(self, cpu_index: int):
         """3f620: updateEC94;21660 only whenECDc logged is already true."""
         self._check()
-        self.state.write_cpu_index = _uint(cpu_index)
+        old_cpu = self.state.write_cpu_index
+        new_cpu = _uint(cpu_index)
+        self.state.write_cpu_index = new_cpu
+        if old_cpu != new_cpu and self._engine is not None:
+            self._engine._persistence_cpu_changed2026(self, old_cpu, new_cpu)
         if self.state.logged:
             self.persist()
 

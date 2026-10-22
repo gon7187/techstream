@@ -165,8 +165,16 @@ group12 contains stop and disposal. Device8 recording uses this DMCI route.
 Static CreateDrs writer vtables resolve87's virtual18/1C to
 `CFileWriter::WriteStart/WriteEnd` in both original builds. Their patched
 nested lengths match the finalized group serializer. The selected enable mask
-is validated and serial mode is forced to1; caller protocol/session selection
-and the complete87 queue/error chronology remain separate unfinished work.
+is validated and serial mode is forced to1. `selected_variable_monitor_recording`
+joins those native groups with actual selected CheckMode and VIN producers while
+support communications remain live, then releases owned channels. The original
+one-target `selected_variable_recording` helper remains available for callers
+that already own a selected runtime target. The joined writer validates typed DRS
+metadata before support I/O, applies ISO construction on either connected device,
+and retains Run87 native status precedence across End11, the constructed-state
+stop serialization, and End12. Disposal remains source-modeled without executing
+the serialized DMCI. Host exceptions remain the primary exception while cleanup
+faults are attached as notes.
 
 Full provider coverage remains **OPEN**. Cooperative11/12/96 and the normal25
 factory join have authored positive and failure evidence; the complete exported

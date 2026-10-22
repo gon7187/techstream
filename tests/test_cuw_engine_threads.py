@@ -5,6 +5,7 @@ import hashlib
 import json
 import struct
 import threading
+import time
 import unittest
 from itertools import cycle
 from pathlib import Path
@@ -18,13 +19,18 @@ from scripts.cuw_engine_threads import (
     validate_thread_phase_lease,
 )
 from scripts.cuw_file_services import admit_file_sources_2026
-from scripts.j2534_2026 import J2534Device2026, J2534InterfacePair2026, PrimitiveResult
+from scripts.j2534_2026 import (
+    J2534Device2026,
+    J2534InterfacePair2026,
+    NativeMessage,
+    PrimitiveResult,
+)
 from scripts.programming_2026_common import (
     NativeException2026,
     NativeGeneralParameters2026,
     NativeRuntime2026,
 )
-from scripts.programming_replay import load_programming_replay
+from scripts.programming_replay import ProgrammingReplay, load_programming_replay
 from tests import test_cuw_gateway_startup as gateway_fixtures
 from tests.private_evidence import read_private_bytes, require_private
 from tests.test_calibration_2026 import cuw
@@ -255,8 +261,6 @@ class ThreadOwnershipTests(unittest.TestCase):
             runner_calls.append(True)
             return lambda: {"native_success": False, "identifiers": (b"CID",)}
 
-        from scripts.programming_replay import ProgrammingReplay
-
         with (
             patch.object(ProgrammingReplay, "_runner", ordinary_false_getter),
             patch.object(pair, "import_into", wraps=pair.import_into) as imports,
@@ -442,7 +446,6 @@ class ThreadOwnershipTests(unittest.TestCase):
         pair = engine.interface_pair
         assert pair is not None
         runner_calls = []
-        from scripts.programming_replay import ProgrammingReplay
 
         original_runner = ProgrammingReplay._runner
 
@@ -506,7 +509,6 @@ class ThreadOwnershipTests(unittest.TestCase):
         self.addCleanup(job.stop)
         pair = engine.interface_pair
         assert pair is not None
-        from scripts.programming_replay import ProgrammingReplay
 
         with (
             patch.object(
@@ -542,8 +544,6 @@ class ThreadOwnershipTests(unittest.TestCase):
 
         def throwing_getter(*_args):
             raise fault
-
-        from scripts.programming_replay import ProgrammingReplay
 
         with (
             patch.object(ProgrammingReplay, "_runner", throwing_getter),
@@ -1961,6 +1961,440 @@ class ThreadSequenceCompletionTests(unittest.TestCase):
                 job.result()
         finally:
             fixture.doCleanups()
+
+
+class VbfProcessBeforeRequestTests(unittest.TestCase):
+    def test_request_is_opaque_and_unassociated_lease_reports_none(self):
+        from scripts.cuw_engine_threads import (
+            VbfProcessBeforeRequest2026,
+            _issue_thread_phase_lease,
+            validate_vbf_process_before2026,
+        )
+
+        with self.assertRaises(TypeError):
+            VbfProcessBeforeRequest2026()
+        with self.assertRaises(TypeError):
+            validate_vbf_process_before2026(object(), object(), states=("issued",))
+
+        fixture = ThreadOwnershipTests()
+        fixture.setUp()
+        try:
+            lease = _issue_thread_phase_lease(fixture.engine, fixture.controller, 0)
+            self.assertIsNone(lease.vbf_request)
+            lease._release()
+        finally:
+            fixture.doCleanups()
+
+
+class VbfProcessBeforeResumeTests(unittest.TestCase):
+    def test_power_p4_status49_then_persistent_vbf_host_fault(self):
+        import tempfile
+
+        from scripts.cuw_engine_worker import EngineWorker2026
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+        from scripts.j2534_2026 import NativeReadBatch2026
+        from scripts.programming_replay import ProgrammingTrace, _native_request
+        from tests.test_cuw_engine_worker import encoded_table
+        from tests.test_programming_2026_common import make_raw_control_fixture2026
+        from tests.test_programming_2026_p5_prepare import (
+            POWER,
+            run_native_context,
+        )
+        from tests.test_programming_2026_p5_prepare import (
+            fixture as power_fixture,
+        )
+
+        _native, container, binding = power_fixture(  # type: ignore[misc]
+            POWER, return_inputs=True, ig_off_retriable=False
+        )
+        rows = []
+        echo = []
+        reads_after_probe = 0
+
+        def typed_value(value):
+            if value is None:
+                return {"type": "none", "value": None}
+            if type(value) is bool:
+                return {"type": "bool", "value": value}
+            if type(value) is int:
+                return {"type": "int", "value": value}
+            if isinstance(value, bytes):
+                return {"type": "bytes", "value": value.hex()}
+            if isinstance(value, NativeMessage):
+                return {
+                    "type": "mapping",
+                    "value": {
+                        "_native_type": {
+                            "type": "text",
+                            "value": "PASSTHRU_MSG_2026",
+                        },
+                        **{key: typed_value(item) for key, item in vars(value).items()},
+                    },
+                }
+            if isinstance(value, NativeReadBatch2026):
+                return {
+                    "type": "mapping",
+                    "value": {
+                        "_native_type": {"type": "text", "value": "READ_BATCH_2026"},
+                        "messages": typed_value(value.messages),
+                        "count": typed_value(value.count),
+                    },
+                }
+            if isinstance(value, tuple):
+                return {"type": "tuple", "value": [typed_value(item) for item in value]}
+            if isinstance(value, list):
+                return {
+                    "type": "sequence",
+                    "value": [typed_value(item) for item in value],
+                }
+            if isinstance(value, dict):
+                return {
+                    "type": "mapping",
+                    "value": {key: typed_value(item) for key, item in value.items()},
+                }
+            raise TypeError(f"Unsupported typed driver value: {type(value)!r}")
+
+        def capture_provider(event, _remaining):
+            nonlocal reads_after_probe
+            operation = event["operation"]
+            if operation in (
+                "passthru_open",
+                "passthru_connect",
+                "passthru_start_filter",
+            ):
+                result = PrimitiveResult(
+                    value=101 if operation == "passthru_start_filter" else 17
+                )
+            elif operation == "passthru_write":
+                message = event["messages"][0]
+                echo.append(NativeMessage(6, message.data[:4], rx_status=9))
+                result = PrimitiveResult(value=event["count"])
+            elif operation == "passthru_read":
+                if echo:
+                    result = PrimitiveResult(value=(echo.pop(0),))
+                else:
+                    reads_after_probe += 1
+                    result = PrimitiveResult(status=49)
+            else:
+                result = PrimitiveResult()
+            rows.append(
+                {
+                    "kind": "action",
+                    "request": _native_request(event),
+                    "result": typed_value(
+                        {"status": result.status, "value": result.value}
+                    ),
+                    "elapsed_ms": 1,
+                }
+            )
+            return result
+
+        direct_device = J2534Device2026(
+            capture_provider, clock=lambda: 0, background_workers=False
+        )
+        direct_device.open()
+        direct_device.connect(6)
+        direct = run_native_context(
+            _native,
+            NativeRuntime2026(
+                direct_device.primitive,
+                clock=lambda: 0,
+                cleanup_action=direct_device.cleanup_primitive,
+            ),
+        )
+        self.assertFalse(direct["native_return"])
+        self.assertEqual(
+            (direct["native_error_code"], direct["driver_error_code"]), (1, 49)
+        )
+        self.assertFalse(direct["programming_completed"])
+        self.assertEqual(reads_after_probe, 1)
+        direct_device.disconnect()
+        direct_device.close()
+
+        operations = [row["request"].get("operation") for row in rows]
+        probe_write = next(
+            index
+            for index, row in enumerate(rows)
+            if row["request"].get("operation") == "passthru_write"
+            and row["request"]["messages"][0]["data"]["value"].endswith("1002")
+        )
+        probe_reads = [
+            index
+            for index in range(probe_write + 1, len(rows))
+            if operations[index] == "passthru_read"
+        ]
+        self.assertEqual(len(probe_reads), 2)
+        stop_filter = next(
+            index
+            for index in range(probe_reads[-1] + 1, len(rows))
+            if operations[index] == "passthru_stop_filter"
+        )
+        start_filter = operations.index("passthru_start_filter")
+        second_generation_driver_rows = [
+            *rows[start_filter : probe_reads[-1]],
+            rows[stop_filter],
+        ]
+        clock_rows = [
+            {
+                "kind": "action",
+                "request": {"operation": "get_local_milliseconds_of_day"},
+                "result": {"type": "int", "value": timestamp},
+                "elapsed_ms": 1,
+            }
+            for timestamp in (1000, 1100, 1200, 1300)
+        ]
+        trace_events = [
+            *rows[:start_filter],
+            clock_rows[0],
+            *rows[start_filter : stop_filter + 1],
+            clock_rows[1],
+            clock_rows[2],
+            *second_generation_driver_rows,
+        ]
+
+        values = {
+            key: "\n".join(value)
+            for key, value in binding.values.items()
+            if key != "ParamFileKeySystemProtocolMicon"
+        }
+        values["EnableDLLVersionInformation"] = "0\n0\n0\n0"
+        profile_fields = ("ParamFileKeySystemProtocolMicon", *values)
+        profile = encoded_table(profile_fields, (("8P4A", *values.values()),))
+        catalog = {
+            "8P4A.ini": profile,
+            "8P4B.ini": encoded_table(profile_fields, (("8P4B", *values.values()),)),
+            "Parameter.ini": encoded_table(
+                (
+                    "ParamFileKeySystemProtocolMicon",
+                    "M16CTypeFlag",
+                    "FORESTTypeFlag",
+                    "PasswordAddress",
+                    "ByteOrder",
+                    "FlagToChangeWFSE",
+                    "FlagToUseCIDGetterAndFlashWriterDLL",
+                    "FlagToChangeToReprogGWModeForCentralGW",
+                ),
+                (
+                    ("8P4A", "0", "0", "00", "1", "0", "0", "0"),
+                    ("8P4B", "0", "0", "00", "1", "0", "0", "0"),
+                ),
+            ),
+        }
+        source = cuw(
+            container.attached.data.decode("ascii"),
+            tuple(record.data for record in container.records),
+        )
+        images = Path("runtime/no-car-21/recovered")
+        first_probe = threading.Event()
+        allow_first_probe = threading.Event()
+        cleanup_entered = threading.Event()
+        allow_cleanup = threading.Event()
+        sentinel = OSError("vbf-second-probe-host-sentinel")
+        saw_probe_reads = 0
+        last_request = None
+        new_roots = []
+        original_provider = ProgrammingTrace.driver_primitive
+
+        def gated_provider(trace, event, remaining):
+            nonlocal saw_probe_reads, last_request
+            operation = event["operation"]
+            if operation == "passthru_write":
+                last_request = event["messages"][0].data[4:]
+            if operation == "passthru_read" and last_request == b"\x10\x02":
+                saw_probe_reads += 1
+                if saw_probe_reads == 2:
+                    if not first_probe.is_set():
+                        first_probe.set()
+                        if not allow_first_probe.wait(3):
+                            raise TimeoutError("first probe barrier expired")
+                elif saw_probe_reads == 4:
+                    new_roots.append(job._session)
+                    raise sentinel
+            return original_provider(trace, event, remaining)
+
+        provider_patch = patch.object(
+            ProgrammingTrace, "driver_primitive", new=gated_provider
+        )
+        provider_patch.start()
+        self.addCleanup(provider_patch.stop)
+        engine, controller, session = make_raw_control_fixture2026(
+            self,
+            source=source,
+            catalog=catalog,
+            module_files={
+                POWER: read_private_bytes(images / POWER),
+                "TCUWControlCommPhase.dll": read_private_bytes(
+                    images / "TCUWControlCommPhase.dll"
+                ),
+            },
+            operation="prepare",
+            events=trace_events,
+            paired=True,
+        )
+        self.addCleanup(engine.close)
+        output = tempfile.TemporaryDirectory(dir="runtime/no-car-33")
+        self.addCleanup(output.cleanup)
+        assert engine._source is not None
+        engine.bind_persistence(
+            CUWPersistence(
+                Path(output.name),
+                ReproInfoState(
+                    (RecoveryCalibration("authored.vbf", engine._source),),
+                ),
+            )
+        )
+        job = engine.bind_thread_job(controller)
+        self.addCleanup(job.stop)
+        trace = session.trace
+        pair = trace.interface_pair
+        assert pair is not None
+        cleanup_owner = engine.bind_cleanup_controller()
+        original_cleanup = cleanup_owner.release_retired_selected
+
+        def held_cleanup(worker):
+            original_cleanup(worker)
+            cleanup_entered.set()
+            if not allow_cleanup.wait(3):
+                raise TimeoutError("retired cleanup barrier expired")
+
+        call_result = []
+        call_error = []
+        phase_imports = []
+        issued_requests = []
+        original_phase_started = EngineWorker2026._phase_started
+
+        def observe_phase_started(worker, phase, *, _vbf_request=None):
+            result = original_phase_started(worker, phase, _vbf_request=_vbf_request)
+            if _vbf_request is not None:
+                phase_imports.append(
+                    (
+                        _vbf_request.started_ms,
+                        worker._phase_started_ms,
+                        threading.current_thread() is job._child,
+                        worker._control_file_capture,
+                    )
+                )
+            return result
+
+        def process_before():
+            try:
+                call_result.append(
+                    engine.process_before_reprogramming(
+                        engine._general_parameters, engine.engine_runtime_device()
+                    )
+                )
+            except BaseException as error:  # noqa: BLE001 - preserve exact provider failure identity
+                call_error.append(error)
+
+        with (
+            patch.object(
+                cleanup_owner, "release_retired_selected", side_effect=held_cleanup
+            ),
+            patch.object(EngineWorker2026, "_phase_started", new=observe_phase_started),
+        ):
+            session.bind_engine2026(engine)
+            session.bind_controller2026(controller)
+            pair.engine.open()
+            pair.engine.connect(6)
+            job.start(session)
+            self.assertTrue(
+                first_probe.wait(3),
+                f"child error={job._error!r}, trace={trace.position}/{len(trace.rows)}, "
+                f"ops={[row['request'].get('operation') for row in rows]!r}, "
+                f"next={trace.rows[trace.position : trace.position + 1]!r}, "
+                f"tb={__import__('traceback').format_exception(job._error) if job._error else None}",
+            )
+            external = threading.Thread(target=process_before)
+            outer_identity = job._outer
+            child_identity = job._child
+            old_capture = job.worker._control_file_capture
+            external.start()
+            deadline = time.monotonic() + 3
+            while (
+                job.worker.native_prepare_handshake != 2 and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
+            self.assertEqual(
+                (job.worker.native_prepare_handshake, call_error, call_result),
+                (2, [], []),
+            )
+            from scripts.cuw_engine_threads import _VBF_REQUESTS
+
+            issued_requests.extend(
+                request
+                for request, record in _VBF_REQUESTS.values()
+                if record.fields["job"] is job
+            )
+            self.assertEqual(len(issued_requests), 1)
+            foreign_errors = []
+
+            def foreign_issuer():
+                try:
+                    job._validate_vbf_issuer2026(issued_requests[0])
+                except BaseException as error:  # noqa: BLE001 - retain exact guard outcome
+                    foreign_errors.append(error)
+
+            foreign = threading.Thread(target=foreign_issuer)
+            foreign.start()
+            foreign.join(3)
+            self.assertFalse(foreign.is_alive())
+            self.assertEqual(len(foreign_errors), 1)
+            self.assertIsInstance(foreign_errors[0], ValueError)
+            allow_first_probe.set()
+            self.assertTrue(cleanup_entered.wait(3))
+            external.join(3)
+            self.assertFalse(external.is_alive())
+            self.assertEqual(call_error, [])
+            self.assertEqual(call_result, [0])
+            self.assertEqual(job.worker.native_prepare_handshake, 1)
+            self.assertEqual(len(phase_imports), 0)
+            self.assertTrue(job._child_parked.is_set())
+            self.assertEqual(job.state.sequence, 1)
+            with self.assertRaises(ValueError):
+                engine.reserve_phase(controller, 1)
+            allow_cleanup.set()
+            deadline = time.monotonic() + 3
+            while job.state.sequence < 2 and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertEqual(job.state.sequence, 2)
+            old_result = job.result(5, sequence=1)
+            with self.assertRaises(OSError) as caught:
+                job.result(5, sequence=2)
+            self.assertIs(caught.exception, sentinel)
+            from scripts.cuw_engine_threads import validate_vbf_process_before2026
+
+            with self.assertRaises(ValueError):
+                validate_vbf_process_before2026(
+                    issued_requests[0], job, states=("adopted",)
+                )
+            self.assertEqual(len(phase_imports), 1)
+            self.assertEqual(phase_imports[0][:3], (1200, 1200, True))
+            new_capture = phase_imports[0][3]
+            self.assertIsNot(new_capture, old_capture)
+            self.assertIs(new_capture, job.worker._control_file_capture)
+            self.assertIs(job._outer, outer_identity)
+            self.assertIs(job._child, child_identity)
+            self.assertEqual(len(new_roots), 1)
+            self.assertIsNot(new_roots[0], session)
+            self.assertIs(new_roots[0].trace, trace)
+            self.assertIs(job.result(5, sequence=1), old_result)
+            old_record = job._completion_records[1]
+            self.assertTrue(old_record.completed.is_set())
+            assert old_record.result is not None
+            self.assertIs(old_record.result["native_return"], False)
+        self.assertEqual(session.trace.position, len(session.trace.rows))
+        self.assertEqual(
+            [
+                event["result"]["value"]
+                for event in trace_events
+                if event["request"].get("operation") == "get_local_milliseconds_of_day"
+            ],
+            [1000, 1100, 1200],
+        )
 
 
 if __name__ == "__main__":

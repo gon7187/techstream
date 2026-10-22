@@ -6,6 +6,7 @@ import threading
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts.cuw_2026 import CUWEngine2026, identity_2026
 from scripts.cuw_engine_worker import NativeWorkerIntegerError2026
@@ -448,6 +449,31 @@ class EngineWorker2026Tests(unittest.TestCase):
             self.assertEqual(engine.native_metadata.cpu_index, 1)
             self.assertEqual(worker.native_writer_target_index, 0)
 
+    def test_36800_vbf_applies_d30c_without_a_cached_cid_selection(self):
+        source = calibration(cpus=2, first_image="first.vbf")
+        state = ReproInfoState(
+            (RecoveryCalibration("source.cuw", source),),
+            loaded=True,
+            offset_of_write_cpu_multi_cal_index=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(Path(directory), state)
+            engine = self.engine(source, persistence=persistence)
+            self.addCleanup(engine.close)
+            controller = make_controller(NativeRuntime2026(lambda *_: None))
+            self.receive(engine, controller, (b"OLD1", b"OLD2"))
+            worker = engine.bind_worker(controller)
+            self.assertEqual(worker.source_state.current_global_cpu_index, 0)
+            self.assertEqual(worker.source_state.cpu_offset, 1)
+            self.assertEqual(engine.native_metadata.cpu_index, 0)
+
+            with engine.controller_execution(controller, 1):
+                pass
+
+            self.assertEqual(engine.native_metadata.cpu_index, 1)
+            self.assertEqual(worker.source_state.current_global_cpu_index, 1)
+            self.assertEqual(worker.source_state.cpu_offset, 1)
+
     def test_36800_retains_effective_cpu_zero_without_changing_selected_cpu(self):
         source = calibration(cpus=2, second_cpu_type="312")
         engine = self.engine(source, cpu_index=1)
@@ -513,7 +539,6 @@ class EngineWorker2026Tests(unittest.TestCase):
         with engine.controller_execution(controller, 1):
             pass
         self.assertEqual(worker.native_prepare_handshake, 1)
-
         with (
             self.assertRaisesRegex(ValueError, "prepare reentry"),
             engine.controller_execution(controller, 1),
@@ -523,6 +548,43 @@ class EngineWorker2026Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "owned36800 prepare prefix"):
             worker.prepare_reentry_handshake()
         self.assertEqual(worker.native_prepare_handshake, 1)
+
+    def test_vbf_resume_phase_start_rejects_unadopted_request_without_36800(self):
+        reads = []
+        runtime = NativeRuntime2026(
+            lambda *_: None,
+            local_milliseconds_of_day=lambda: reads.append(1) or 9876,
+        )
+        engine = self.engine(calibration(first_image="authored.vbf"))
+        controller = make_controller(runtime)
+        self.addCleanup(engine.close)
+        worker = engine.bind_worker(controller)
+        request = SimpleNamespace(started_ms=1234)
+        with self.assertRaisesRegex(ValueError, "actual child phase1"):
+            worker._phase_started(1, _vbf_request=request)
+
+        self.assertIsNone(worker._phase_started_ms)
+        self.assertEqual(worker.native_prepare_handshake, 0)
+        self.assertEqual(reads, [])
+
+    def test_vbf_prepare_rejects_unissued_receipt_before_prefix(self):
+        reads = []
+        runtime = NativeRuntime2026(
+            lambda *_: None,
+            local_milliseconds_of_day=lambda: reads.append(1) or 9876,
+        )
+        engine = self.engine(calibration(first_image="authored.vbf"))
+        controller = make_controller(runtime)
+        self.addCleanup(engine.close)
+        worker = engine.bind_worker(controller)
+        job = engine.bind_thread_job(controller)
+
+        with self.assertRaisesRegex(TypeError, "Concrete VBF ProcessBefore"):
+            worker._prepare_vbf_resume2026(job, object())
+
+        self.assertIsNone(worker._phase_started_ms)
+        self.assertEqual(worker.native_prepare_handshake, 0)
+        self.assertEqual(reads, [])
 
     def test_next_cpu_publishes_source_ig_cycle_to_engine_status(self):
         parameters = NativeGeneralParameters2026.from_sources(
@@ -659,6 +721,59 @@ class EngineWorker2026Tests(unittest.TestCase):
         self.assertEqual(worker.loaded_metadata, (engine.native_metadata,))
         self.assertEqual(worker.online_context().all_loaded_metadata, issued.files)
         self.assertTrue(worker.persist_current_cpu)
+
+    def test_actual141_reset_retains_persisted_d30c_offset(self):
+        from scripts.calibration_2026 import native2026_metadata_for_cpu
+
+        part = calibration(cpus=2, first_target="PART")
+        whole = calibration(cpus=2, first_target="WHOLE")
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr(
+                "Setting.ini",
+                "[DeltaReproCalFile]\nFileNum=1\nFileName1=part.cuw\n"
+                "[WholeReproCalFile]\nFileName=whole.cuw\n",
+            )
+            archive.writestr("part.cuw", part)
+            archive.writestr("whole.cuw", whole)
+        source = (
+            b"[Vehicle]\nContactType=P5-Unified\n[DataCompression]\n"
+            + payload.getvalue()
+        )
+        state = ReproInfoState(
+            (RecoveryCalibration("source.cuw", calibration(cpus=2)),),
+            loaded=True,
+            offset_of_write_cpu_multi_cal_index=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(Path(directory), state)
+            engine = self.engine(calibration(cpus=2), persistence=persistence)
+            issued = admit_file_sources_2026(engine, "direct.scuw", source, region=0)
+            engine.bind_file_sources(issued)
+            self.addCleanup(engine.close)
+            controller = make_controller(NativeRuntime2026(lambda *_: None))
+            worker = engine.bind_worker(controller)
+            self.assertEqual(worker.source_state.cpu_offset, 1)
+
+            with engine.controller_execution(controller, 2):
+                selected_cpu = native2026_metadata_for_cpu(engine.native_metadata, 1)
+                engine._select_worker_metadata(
+                    selected_cpu, controller=controller, worker=worker
+                )
+                self.assertEqual(engine.native_metadata.cpu_index, 1)
+                self.assertEqual(worker.source_state.cpu_offset, 1)
+                worker._persist_position()
+                self.assertEqual(persistence.state.write_cpu_index, 1)
+                self.assertEqual(
+                    persistence.state.offset_of_write_cpu_multi_cal_index, 1
+                )
+                replacement = issued.after_group_reset(0, worker=worker)
+                engine._accept_worker_file_reset(issued, replacement, worker=worker)
+
+            self.assertIs(engine.native_metadata, replacement.selected_metadata)
+            self.assertEqual(engine.native_metadata.cpu_index, 0)
+            self.assertEqual(worker.source_state.current_global_cpu_index, 0)
+            self.assertEqual(worker.source_state.cpu_offset, 1)
 
     def test_json_delta_group_reset_atomically_replaces_worker_file_views(self):
         first = calibration(first_target="FIRST")
