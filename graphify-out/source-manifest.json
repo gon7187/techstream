@@ -1,5 +1,6 @@
 {
   "scope": "git authored public exact freeze; no symlinks",
+  "source_commit": "f25441193cbc841bf06b8fd33f6f5773533b3263",
   "excluded": [
     "graphify-out",
     "analysis",
@@ -58,7 +59,7 @@
     },
     {
       "path": "docs/cuw-2026.md",
-      "sha256": "d770d30b2ac885e557dd9b853c5a5ed3e77868cbb09b4d3b11caece9d9c55da2"
+      "sha256": "b7cf33063fc16a7364a8589c98affa3bfb9375f328247575a4b7e377a7b3bfa5"
     },
     {
       "path": "docs/cuw-engine-cleanup.md",
@@ -66,11 +67,11 @@
     },
     {
       "path": "docs/cuw-engine-threads.md",
-      "sha256": "954375baced5bb263bd946477c9a22aef3a8c40020641c4e063d201ca557d24b"
+      "sha256": "7115707de86442028f8dc02ac51e05146b29da58493bb8c51bbff161a94f8c58"
     },
     {
       "path": "docs/cuw-engine-worker.md",
-      "sha256": "b3bc2e37a49899af28654d0ec0b8b58bfd5155076f6ba887e98503eeb1809587"
+      "sha256": "1767fed8991ae8ad20c9efbadc765da5572ee07f6a4e2fe863f7edba389b11b7"
     },
     {
       "path": "docs/cuw-file-services.md",
@@ -142,7 +143,7 @@
     },
     {
       "path": "docs/data-monitor.md",
-      "sha256": "3c50f62c2deb0954e26c92135384bbc5426f20b0176580d93dffb94b1b121cd0"
+      "sha256": "c9bb0642982fb7226876c31c9921203e09457052a4ac8e2845ada99316cee7ca"
     },
     {
       "path": "docs/database-resources.md",
@@ -154,7 +155,7 @@
     },
     {
       "path": "docs/development-handoff.md",
-      "sha256": "53c148959cfddf1eb3f1c2c733884d900d45b6601d8829ad27e2737449db1190"
+      "sha256": "426fa5f1fe58fd20ab51592107b5e1e96b088fe47c66598c21bdad5d06478ffe"
     },
     {
       "path": "docs/drive-recorder.md",
@@ -258,7 +259,7 @@
     },
     {
       "path": "docs/monitor-variable.md",
-      "sha256": "76980d3be896b7ad9c235a2d87cd5420b8b97f4d8b71ef9185844e8ae213577b"
+      "sha256": "4e0ea8ba98cc6d1f1543cdc1f79911d86cd62000cb3c2d756305b631882dffc6"
     },
     {
       "path": "docs/native-communication.md",
@@ -330,7 +331,7 @@
     },
     {
       "path": "docs/programming-2026-p5-prepare.md",
-      "sha256": "714dfd16986d21d3e3c4467499b849f0a036e3f6c548b260d7644182bfb1f788"
+      "sha256": "aa297255aa05b26cae9bf3a4bb582690c852552dfe3fecb1b60ba458ebf05509"
     },
     {
       "path": "docs/programming-2026-p6.md",
@@ -370,7 +371,7 @@
     },
     {
       "path": "docs/programming-replay.md",
-      "sha256": "13c9d459de99500949f4b25597d4fd57a11a07ce2d6430379e7a320dad543e7b"
+      "sha256": "b6aaf775ce21618b84adfe5d8034ae415f700859945a03bc37661300a030ffa4"
     },
     {
       "path": "docs/programming-vendor.md",
@@ -442,7 +443,7 @@
     },
     {
       "path": "docs/toyota-saved-ffd.md",
-      "sha256": "0fdedc041bf8481e69d268907e0367e85ffe086c4b41207e6b7e90be36615b47"
+      "sha256": "8d5fe301411ce1a8cbefd0f73669052dea4ea27a16926f76d7447b770642ca07"
     },
     {
       "path": "docs/toyota-session.md",
@@ -458,7 +459,7 @@
     },
     {
       "path": "docs/tse-reports.md",
-      "sha256": "d60dd62aa4ddd7a3492eb4aaf01e02f859f3f64474bf4d89eb1a515aa3b2269c"
+      "sha256": "6a52b307dcda3b4e5353e6b098efbcb465cedbd06803060e8fb9466291892356"
     },
     {
       "path": "docs/utility-bindings.md",
@@ -514,7 +515,7 @@
     },
     {
       "path": "docs/utility-ex-ty-chassis.md",
-      "sha256": "b8f9b05ff562486c17f90752722c21bc54d75d991e9919110284bd419d48546d"
+      "sha256": "0d405aaa6564efff843e0ef8cbe25a14cf972a1c0e32357fa8997bd42a7529c4"
     },
     {
       "path": "docs/utility-ex-ty-powertrain.md",
@@ -574,7 +575,7 @@
     },
     {
       "path": "docs/utility-ex.md",
-      "sha256": "8709a7646e7e34e581b7b5ba354ac942dbb428db051e8392dcf96d3deb6a5a0e"
+      "sha256": "f5e436b5e00e49f8d37692cca01c5f6e0f2e9b21b7aa3cb90c6a6aae3e15a59b"
     },
     {
       "path": "docs/utility-runtime.md",
@@ -586,7 +587,7 @@
     },
     {
       "path": "docs/verification.md",
-      "sha256": "4aae53b87428eb7e1ea8968249018009fe04c171850e0b75eb294094c25aa8ba"
+      "sha256": "8a25efb0369fd96e2383cc9161322849b21c05bf06cab2973cca0f4f182d0977"
     },
     {
       "path": "scripts/active_replay.py",
@@ -622,7 +623,7 @@
     },
     {
       "path": "scripts/cuw_2026.py",
-      "sha256": "d31f6bf33cab9f3291988bac0c93fbbd145d8ea672dc93433e382ba8d7cabbdd"
+      "sha256": "b9ac79d466f9587ec3708df7a19ced7e6d0b14f0c06389081b97212f75b6fe80"
     },
     {
       "path": "scripts/cuw_engine_cleanup.py",
@@ -630,11 +631,11 @@
     },
     {
       "path": "scripts/cuw_engine_threads.py",
-      "sha256": "f74150cb7ccc91f41b94f1488276cb63b0c697d717db7641c07b383f8067d9e9"
+      "sha256": "703e067ee2aaaf9f8f802436d9ec10e8b6d292c9798805bfc3ff07775c16aec2"
     },
     {
       "path": "scripts/cuw_engine_worker.py",
-      "sha256": "a9f9273c3d79458afe6f15d6ec53648217996db51877a5e5f84932e333946dd2"
+      "sha256": "ef1e63dd81286afbb17a049df146dc5fbb0cf58d46d147a8bdc3f43a004a25fd"
     },
     {
       "path": "scripts/cuw_file_services.py",
@@ -694,7 +695,7 @@
     },
     {
       "path": "scripts/cuw_persistence.py",
-      "sha256": "179a414ebb720450e3ff64028fac39e929f9f485a4cecba85deb53980d274b36"
+      "sha256": "1dd6b41eaa6851bc31e0a480bc5430a3484957157b143bac489544ddd1fa04f6"
     },
     {
       "path": "scripts/cuw_retry.py",
@@ -706,7 +707,7 @@
     },
     {
       "path": "scripts/data_monitor.py",
-      "sha256": "39921739ca3d2446b1b17c8c8e0c0d06b9f133e1b916504b4604b06a97e79e41"
+      "sha256": "c26c54640c1eb5c816df6f80b2644d711458311844458cd81cbe3f794e33b9fa"
     },
     {
       "path": "scripts/database_resources.py",
@@ -826,7 +827,7 @@
     },
     {
       "path": "scripts/monitor_variable.py",
-      "sha256": "c7a06ef5408d129a461709e5adaff809d283f49abbc2f62caea7480df1e58194"
+      "sha256": "46294e8202e0551c6ee871e9b0922b51e3b6cfffc2c60ec5a48dba401843111b"
     },
     {
       "path": "scripts/native_communication.py",
@@ -910,7 +911,7 @@
     },
     {
       "path": "scripts/programming_2026_p5_prepare.py",
-      "sha256": "a06e834fa480ad1a56b7b8fed969d626fc7165411f8fdd5d83aadfccd4b9fde8"
+      "sha256": "9b54036282b4d9d2138cee416fef7f1830ae6db9f17f59f0d6ec6ef369250dd7"
     },
     {
       "path": "scripts/programming_2026_p6.py",
@@ -950,7 +951,7 @@
     },
     {
       "path": "scripts/programming_replay.py",
-      "sha256": "ce7338d4bea1814b97ee5961cdcc44e0537e2f402d9ebff315d9596e2f63729a"
+      "sha256": "2704068b693481e72f51e9301db91995afa7c9ef86ccb9f9fa702a5e94c01c96"
     },
     {
       "path": "scripts/programming_vendor.py",
@@ -1042,7 +1043,7 @@
     },
     {
       "path": "scripts/tse_reports.py",
-      "sha256": "6f981d3468d6101311608c393a10a5692f5a67d75b6eb767b3526acf5c5a05e7"
+      "sha256": "b1144b3a21b8348deac20ede12d64f6c62de65b10aaca4c2bd0bf4ef6255c5dd"
     },
     {
       "path": "scripts/utility.py",
@@ -1058,7 +1059,7 @@
     },
     {
       "path": "scripts/utility_ex.py",
-      "sha256": "befc35c761f2b1ca3a39ff5c12c4526d8c36a39439b509664a8edb6ac0f3f87e"
+      "sha256": "4463e9a050219751a09a672b2b5f8c082ed1d02230beb0d572ec28827b28230e"
     },
     {
       "path": "scripts/utility_ex_chassis.py",
@@ -1114,7 +1115,7 @@
     },
     {
       "path": "scripts/utility_ex_ty_chassis.py",
-      "sha256": "89cba91182ebeeddf4382761f8a836571694ff19b96826484460f4f14267172b"
+      "sha256": "a36044fd903640fab52d3e50ccf805cb499a7f758313593fdaadd4b1f306e3e0"
     },
     {
       "path": "scripts/utility_ex_ty_powertrain.py",
@@ -1214,7 +1215,7 @@
     },
     {
       "path": "tests/test_cuw_2026.py",
-      "sha256": "710573e154f9532f1a43e384c8e1662d92ed872150c542b96f5ebf0a2a3d16e8"
+      "sha256": "c4d5239ad9bac4cb7c8147914975980f0763460945b5cbd04a13a718fdabb8b4"
     },
     {
       "path": "tests/test_cuw_engine_cleanup.py",
@@ -1222,11 +1223,11 @@
     },
     {
       "path": "tests/test_cuw_engine_threads.py",
-      "sha256": "a26e8cc08f05187d56b78ea22134fda6e98418d5fa525049df90db4361c667bc"
+      "sha256": "a44d38104293bc0bd597fba49ebe1c0de5fdef269a4abebe44d378944b5ab444"
     },
     {
       "path": "tests/test_cuw_engine_worker.py",
-      "sha256": "c8a90b3363718e82af9c0b06d2a2cce1bb354c01e3b6c86ce0ae2f478158adeb"
+      "sha256": "1b1930a87d4b20c04d43132a74d6006b87ebdc8b07b55879c461004e3ed5c65d"
     },
     {
       "path": "tests/test_cuw_file_services.py",
@@ -1298,11 +1299,11 @@
     },
     {
       "path": "tests/test_data_monitor.py",
-      "sha256": "f6c504722ea5970147f1ae8affe33622bddd1e57f439047a3fd9c3a9cacdbbfa"
+      "sha256": "4ea93988004a203791945a66e6994289025dcf21a91ffa46d3fb8a43ce716c84"
     },
     {
       "path": "tests/test_database_resources.py",
-      "sha256": "a5b5339c8a1c70c4677dda38344794036dd6736a524f588f1df09dc5acd613da"
+      "sha256": "ce2998f318e136f8b0e98ddc59ffffd676e657ad9a91b038988fd7c506690977"
     },
     {
       "path": "tests/test_demo.py",
@@ -1422,7 +1423,7 @@
     },
     {
       "path": "tests/test_monitor_variable.py",
-      "sha256": "50e1b9ff5a1a34a7491f58cfd85d1fa27d081418f675150921bb309cb782239b"
+      "sha256": "9c7cca624f61cd92221d09c5e97ef54618131968f2d57662a4c1c8b7d71036a0"
     },
     {
       "path": "tests/test_native_communication.py",
@@ -1510,7 +1511,7 @@
     },
     {
       "path": "tests/test_programming_2026_p5_prepare.py",
-      "sha256": "b64d7a09567732c2bd0ab83aa883a597e84fd5a38cb3c49e0d6fe40e2d7ad5b5"
+      "sha256": "858b958d99be5a23168fb9637e5353c6517f9a9a5906c7e2d2db2e30c253cb50"
     },
     {
       "path": "tests/test_programming_2026_p6.py",
@@ -1550,7 +1551,7 @@
     },
     {
       "path": "tests/test_programming_replay.py",
-      "sha256": "a44bccba992454a0666d49c4318d89c7922a16c6a9d428d4cdd1564f336bc18a"
+      "sha256": "7ef1deff588637625351773dccdfb9284e78dec33ef86c1989d9a764c9f74805"
     },
     {
       "path": "tests/test_programming_vendor.py",
@@ -1626,7 +1627,7 @@
     },
     {
       "path": "tests/test_toyota_saved_ffd.py",
-      "sha256": "b691dbb32efd0d79a03539e0f2ed7fde6acf5fe612e35f77ad3b5b6bae861381"
+      "sha256": "a551ccb4e8f9706c63af69ceda077f08ef7b6cbf0e0a605fa1c26375dbfc066f"
     },
     {
       "path": "tests/test_toyota_session.py",
@@ -1642,7 +1643,7 @@
     },
     {
       "path": "tests/test_tse_reports.py",
-      "sha256": "57f2a36301ad11d8c7bbe148a4fa06e2a1618e15abacd1a101a13f80399c6b4d"
+      "sha256": "3b680af0646c4f192860150ed54b53ad61825ea7c0b3429ab680df1b27c88f28"
     },
     {
       "path": "tests/test_utility.py",
@@ -1658,7 +1659,7 @@
     },
     {
       "path": "tests/test_utility_ex.py",
-      "sha256": "6585b9a45baaeefbe6f6bec2ba6721526a6bd9d056131d36b61e61f6115c6337"
+      "sha256": "2d4fdcae4ce81d968ea405ca38297ddf842591cda032d6ab8ae269b653ef91e4"
     },
     {
       "path": "tests/test_utility_ex_chassis.py",
@@ -1714,7 +1715,7 @@
     },
     {
       "path": "tests/test_utility_ex_ty_chassis.py",
-      "sha256": "4e0a3f36761d6cd23afd105e80f99434a54d183f4a14708986332d275b750c10"
+      "sha256": "74f4488ef1c014ab2a763bcd173e16145433fb78a6e80462358b3c3f9736ec73"
     },
     {
       "path": "tests/test_utility_ex_ty_powertrain.py",
