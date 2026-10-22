@@ -61,6 +61,7 @@ if TYPE_CHECKING:
         SelectedVariableMonitor,
         VariableActiveOperation,
         VariableMonitorRuntime,
+        VariableRuntimeTarget,
         VariableSystemOperation,
     )
     from scripts.native_communication import NativeCommunication
@@ -3584,6 +3585,162 @@ def complete_selected_legacy_recording(
                 primary.add_note(f"Recording cleanup also failed: {error}")
 
 
+def _selected_variable_multi_lower(
+    targets: tuple[VariableRuntimeTarget, ...],
+    communications: tuple[NativeCommunication, ...],
+    source_operations: NativeFrameOperations,
+    *,
+    controller_communication: NativeCommunication,
+    controller_category_flags: int,
+    cancelled: Callable[[], bool],
+) -> NativeMultiMonOperations:
+    """Build fresh MultiMon registrations from the final selected variable slots."""
+    from scripts.frame_transport import NativeFrameOperations, NativeMultiMonOperations
+    from scripts.monitor_dual import DualTarget
+    from scripts.monitor_legacy import dk_monitor_timing
+    from scripts.monitor_variable import (
+        SelectedVariableMonitor,
+        VariableMonitorSource,
+        VariableRuntimeTarget,
+    )
+    from scripts.native_communication import NativeCommunication, NativeFrameController
+
+    if (
+        not isinstance(source_operations, NativeFrameOperations)
+        or source_operations.device_kind != 8
+        or source_operations.channel is not None
+        or source_operations.owns_channel
+        or not isinstance(controller_communication, NativeCommunication)
+        or not isinstance(controller_communication.operations, NativeFrameController)
+        or type(controller_category_flags) is not int
+        or not isinstance(targets, tuple)
+        or not 1 <= len(targets) <= 2
+    ):
+        raise MonitorError("Variable MultiMon requires fresh device8 source context")
+
+    source_controller = controller_communication.operations.operations
+    if (
+        source_controller.backend is not source_operations.backend
+        or source_controller.driver != source_operations.driver
+        or source_controller.native_build != source_operations.native_build
+        or source_controller.device_kind != source_operations.device_kind
+        or source_controller.diagnostic_mode != source_operations.diagnostic_mode
+        or controller_communication.profile.category_record[72]
+        != controller_category_flags
+    ):
+        raise MonitorError("Variable MultiMon selected native contexts differ")
+
+    profiles: dict[str, ProtocolProfile] = {}
+    lower_targets = []
+    for target in targets:
+        if not isinstance(target, VariableRuntimeTarget):
+            raise MonitorError("Variable MultiMon requires final selected targets")
+        target.check()
+        cache, connection, plan = target.cache, target.connection, target.plan
+        communication = next(
+            (item for item in communications if item.cache is cache), None
+        )
+        if (
+            communication is None
+            or not communication.closed
+            or communication.profile is not cache.profile
+            or communication.ecu != cache.ecu
+            or communication.bus_id != cache.bus_id
+            or communication.source_build != cache.source_build
+            or not isinstance(communication.operations, NativeFrameController)
+            or communication.operations.operations.backend
+            is not source_operations.backend
+            or communication.operations.operations.driver != source_operations.driver
+            or communication.operations.operations.native_build
+            != source_operations.native_build
+            or communication.operations.operations.device_kind != 8
+            or communication.operations.operations.diagnostic_mode
+            != source_operations.diagnostic_mode
+            or cache.source_build != source_operations.native_build
+            or cache.profile.catalog.management.sha256
+            != controller_communication.profile.catalog.management.sha256
+            or cache.profile.catalog.management.version
+            != controller_communication.profile.catalog.management.version
+            or cache.profile.vehicle_name_key
+            != controller_communication.profile.vehicle_name_key
+            or cache.profile.exception_ids
+            != controller_communication.profile.exception_ids
+            or not isinstance(cache.profile, VehicleProfile)
+            or connection is None
+        ):
+            raise MonitorError("Variable MultiMon target source/context changed")
+        if not isinstance(plan, SelectedVariableMonitor):
+            raise MonitorError("Variable MultiMon entry requires pair setup")
+        expected_connection = selected_p4_connection(
+            cache.profile,
+            bus_id=communication.bus_id,
+            diagnostic_mode=source_operations.diagnostic_mode,
+            controller_category_flags=controller_category_flags,
+        )
+        if connection != expected_connection:
+            raise MonitorError("Variable MultiMon target connection was changed")
+        expected_entry = int.from_bytes(
+            source_operations.diagnostic_mode[8:12], "little"
+        ) or word(expected_connection.protocol_record, 8)
+        if target.entry_parameter != expected_entry:
+            raise MonitorError("Variable MultiMon target entry was changed")
+        setup = next(
+            (item for item in plan.commands.setup if item.command_id == 0x10A), None
+        )
+        if (
+            setup is None
+            or len(setup.values) != 8
+            or setup.values[:2]
+            != (cache.profile.category, expected_connection.address.request_id)
+            or type(setup.values[6]) is not int
+        ):
+            raise MonitorError("Variable MultiMon selected pair command is absent")
+        retry_limit = setup.values[6]
+        ecu = cache.ecu
+        if ecu in profiles or any(
+            item.command_id == cache.profile.category for item in lower_targets
+        ):
+            raise MonitorError("Variable MultiMon ECU identity is ambiguous")
+        profiles[ecu] = cache.profile
+        lower_targets.append(
+            DualTarget(
+                ecu,
+                expected_connection.address.request_id,
+                expected_connection.address.response_id,
+                expected_connection.bus_id,
+                cache.profile.category_record[72],
+                cache.profile.category,
+                retry_limit,
+                *dk_monitor_timing(cache.profile),
+                (
+                    expected_connection.can_parameter,
+                    expected_connection.can_byte_0,
+                    expected_connection.can_byte_1,
+                ),
+                expected_entry,
+            )
+        )
+
+    lower = NativeMultiMonOperations(
+        tuple(lower_targets),
+        profiles,
+        source_operations.backend,
+        driver=source_operations.driver,
+        native_build=source_operations.native_build,
+        source_identity=VariableMonitorSource.for_build(
+            source_operations.native_build
+        ).sha256,
+        device_kind=8,
+        diagnostic_mode=source_operations.diagnostic_mode,
+        clock=source_operations.clock,
+        cancelled=cancelled,
+        wait=source_operations.wait,
+    )
+    if lower.operations.channel is not None or lower.operations.owns_channel:
+        raise MonitorError("Fresh variable MultiMon unexpectedly owns a channel")
+    return lower
+
+
 def selected_variable_monitor_runtime(
     targets: tuple[LegacyCheckTarget, ...],
     operations: NativeFrameOperations | NativeMultiMonOperations | NativeVimClient,
@@ -3616,6 +3773,7 @@ def selected_variable_monitor_runtime(
     the runtime; it never opens a second channel for packet discovery.
     """
     from scripts.drive_recorder import NativeVimClient
+    from scripts.frame_transport import NativeFrameOperations
     from scripts.monitor_legacy import (
         LegacyCheckTarget,
     )
@@ -3872,6 +4030,23 @@ def selected_variable_monitor_runtime(
                 raise primary
             for error in failures:
                 primary.add_note(f"Variable support cleanup also failed: {error}")
+    if (
+        connected_device == 8
+        and isinstance(operations, NativeFrameOperations)
+        and len(registered_indices) >= 2
+        and null_controller is None
+        and 1 <= sum(target.cache.profile.category != 0x68 for target in selected) <= 2
+    ):
+        operations = _selected_variable_multi_lower(
+            tuple(
+                target for target in selected if target.cache.profile.category != 0x68
+            ),
+            tuple(communications),
+            operations,
+            controller_communication=controller_communication,
+            controller_category_flags=flags,
+            cancelled=cancelled,
+        )
     # Registration order was fixed before child creation; Check allocations
     # remain attached to the final selected target in each overwritten slot.
     runtime = VariableMonitorRuntime(

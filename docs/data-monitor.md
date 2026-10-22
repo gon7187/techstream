@@ -273,10 +273,22 @@ explicit caller inputs. The factory closes its support channels before returning
 the runtime and preserves primary exceptions if cleanup also fails. Full joined
 integration is tracked separately from the accepted normal/Dual checks above.
 
-The joined variable factory has an independent authored native-backend positive
-check under leaf100. `runtime/no-car-25/verify_variable_join.py` also verifies the
-complete full-support Check/plan/acquisition/native-DM/display path and native
-read-fault/host-cancellation cleanup. Partial ANY-support geometry remains
+For device8 without a selected NULL controller, two or more registered native
+slots select a fresh MultiMon lower after those support channels close. Its
+entries come from the final allocated variable targets and revalidated selected
+connections; voltage slots count for route selection but do not become
+communication entries. Selected NULL outcomes retain their source-defined
+errors. The lower constructor performs no adapter I/O and starts without a
+channel. Device4/VIM, explicit MultiMon, and the one-slot BASE routes retain
+their existing selection.
+
+The authored joined-factory regression covers builds12/18 through selected
+Check/plan/acquisition, fresh MultiMon connect, target configuration refresh,
+mode2 sends, native DM capture serialization and sample display conversion.
+Foreign source/backend contexts fail before new lower I/O; native NULL and mixed
+voltage retain their source outcomes. Native cancellation and host exceptions
+exercise channel cleanup and exception identity. These injected-backend checks
+do not establish physical adapter/vehicle support. Partial ANY-support geometry remains
 source-sensitive: a one-byte retained packet can still have a two-byte signal
 layout, which the display adapter rejects rather than reading outside its data.
 That narrower case is tracked for source review, not silently expanded.
