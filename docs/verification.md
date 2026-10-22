@@ -9,14 +9,14 @@
 | Проверка | Результат | Граница |
 | --- | --- | --- |
 | Полный private suite | **6 452 теста, 0 failures, 0 errors, 0 skips**, 207,258 с | Локальный частный корпус; `full-private-checks.log`, root reports G3 PASS |
-| Чистый source-only snapshot | **6 443 теста, 0 failures, 0 errors, 744 пропуска**, 68,764 с | Не GitHub clone. Все 74 уникальные skip-причины проверены; это отсутствующие optional private/source/OEM packets (`public-skip-reasons.json`) |
+| Свежий GitHub clone `0f99a6c` | **6 443 теста, 0 failures, 0 errors, 744 пропуска**, 69,417 с; offline workflows PASS | Все 74 уникальные skip-причины проверены: отсутствующие optional private/source/OEM packets. Более ранний чистый source snapshot: те же counts, 68,764 с |
 | Automatic CONTROL | **19 checks PASS** для leaf G1/G4/G6/G8 | Отдельно root подтверждает G2 offline workflows PASS; не означает закрытие G1–G6 |
 | GTK normal + compact | PASS после GUI-исправлений на frozen snapshot A16 | Проверены cancel/run и pending-close UI состояния; не физическое поведение |
 | SourceSpec | **SCOPED_PASS final candidate** на A16 по независимому static review | Остальные source obligations открыты |
 | Delivery-standards backend | PASS на `be752462` | Узкий backend verdict, не закрытие всех source/cleanup contracts |
 | Source manifest | **299 записей, zero drift — PASS** | `final-private-acceptance.json` |
 
-Два GUI-дефекта были найдены независимым static source/code review после более раннего успешного GTK smoke: idle-owner cancel/run должен восстанавливать каталог, а retry незавершённого cleanup — сохранять тот же owner. Исправления прошли новый normal/compact GTK. Свежий GitHub-clone прогон, публичный CI и доставка пока pending; не подставлять вместо них локальные результаты. Полное принятие 171 software obligations и full port не заявляются.
+Два GUI-дефекта были найдены независимым static source/code review после более раннего успешного GTK smoke: idle-owner cancel/run должен восстанавливать каталог, а retry незавершённого cleanup — сохранять тот же owner. Исправления прошли новый normal/compact GTK. Свежий GitHub clone проверен на `0f99a6c`; все пять jobs публичного [CI 39803649029](https://github.com/gon7187/techstream/actions/runs/39803649029) прошли на том же SHA. Последующую интеграцию и проверки графа фиксирует [PR #6](https://github.com/gon7187/techstream/pull/6). Полное принятие 171 software obligations и full port не заявляются.
 
 Точечные результаты этой работы имеют ограниченную область. Источник данных для каждого типа указан отдельно:
 
@@ -74,7 +74,7 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 - **Skipped/unrun** означает неизвестный результат, а не pass. Это включает проверки, код которых написан, но не запускался до паузы.
 - **Red/error** остаётся активной проблемой, пока исправление не проверено по исходному контракту. Сохранять красный вывод как свидетельство.
 - **Source omission** или неучтённый export/module означает открытый контракт; это не безопасное исключение и не утверждение о физическом оборудовании.
-- **Открытый gate** означает, что работа ещё нужна, даже если многие leaf-тесты зелёные. Полная closure G1–G6 остаётся открытой; отдельные subgate уже PASS, включая G2 offline workflow check. Исторические CI и публичные прогоны ниже относятся к указанным снимкам; актуальный SHA и CI вписать после финальной проверки рабочей ветки.
+- **Открытый gate** означает, что работа ещё нужна, даже если многие leaf-тесты зелёные. Полная closure G1–G6 остаётся открытой; отдельные subgate уже PASS, включая G2 offline workflow check. Исторические CI и публичные прогоны ниже относятся к указанным снимкам; текущий проверенный код — `0f99a6c`, его CI и статус интеграции доступны по ссылкам выше.
 
 Актуальные красные и ожидающие проверки перечислены в [handoff разработки](development-handoff.md#известные-красные-и-открытые-места). Локальные `analysis/evidence/no-car-*/` содержат команды, снимки и ограничения; это частные необязательные свидетельства, не требование публичной сборки.
 
