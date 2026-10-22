@@ -26,8 +26,10 @@ by these cores; the shared typed provider does not reinterpret that behavior.
 
 The four P5 cores install all filters, probe `10 02` at each address and retain
 only responders. Timeout status9/16 maps55; an exact three-byte negative maps56
-(BodyMicon's native catch checks SID27, the others SID10). No responder is error41
-unless controller retry964 is already set. Each retained address executes
+(POWER and BodyMicon compare SID27; the other variants compare SID10). An
+unrecognized negative response aborts with error41 even when controller retry964
+is set; a recognized responder-negative may leave an empty set for retry964. Each
+retained address executes
 `27 01`/`27 02`, then one diagnostic mask is sent and `31 01 10 03` runs at each
 retained address with10ms between addresses. BodyMicon uses the shared six-byte
 seed conversion. It unconditionally sets ECU block size1 before installing

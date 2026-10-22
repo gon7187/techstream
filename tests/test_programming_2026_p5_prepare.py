@@ -66,7 +66,14 @@ def secret_client():
     return client
 
 
-def fixture(module=POWER, *, addresses=None, retry=False, return_inputs=False):
+def fixture(
+    module=POWER,
+    *,
+    addresses=None,
+    retry=False,
+    return_inputs=False,
+    ig_off_retriable=True,
+):
     if addresses is None:
         addresses = "0100/0108\n0200/0208" if module == DUAL else "0100/0108"
     text = (
@@ -86,7 +93,7 @@ def fixture(module=POWER, *, addresses=None, retry=False, return_inputs=False):
         "WaitTimeAfterSeedData": "2",
         "WaitTimeAfterSeedKey": "3",
         "WaitTimeAfterDiagnosticMask": "4",
-        "IGOffRetriableFlag": "1",
+        "IGOffRetriableFlag": "1" if ig_off_retriable else "0",
     }
     binding = bind_native_parameter2026(
         container, {"8P4A.ini": parameters("8P4A", values)}, "prepare", encoded=False
@@ -280,6 +287,199 @@ class P5PrepareTests(unittest.TestCase):
                 self.assertFalse(rt._resources)
                 device.disconnect()
                 device.close()
+
+    def test_power_probe_literal_sid_with_real_j2534(self):
+        cases = (
+            ("single", 0x27, True, (b"\x7f\x27\x22",), True, None),
+            ("single", 0x10, True, (b"\x7f\x10\x22",), False, 41),
+            (
+                "multi",
+                0x27,
+                False,
+                (
+                    b"\x7f\x27\x22",
+                    PROBE,
+                    b"\x67\x01\x00\x01\x02\x03",
+                    b"\x67\x02",
+                    ROUTINE,
+                ),
+                True,
+                None,
+            ),
+            (
+                "multi",
+                0x27,
+                True,
+                (
+                    b"\x7f\x27\x22",
+                    PROBE,
+                    b"\x67\x01\x00\x01\x02\x03",
+                    b"\x67\x02",
+                    ROUTINE,
+                ),
+                True,
+                None,
+            ),
+            (
+                "multi",
+                0x10,
+                False,
+                (
+                    b"\x7f\x10\x22",
+                    PROBE,
+                    b"\x67\x01\x00\x01\x02\x03",
+                    b"\x67\x02",
+                    ROUTINE,
+                ),
+                False,
+                41,
+            ),
+            (
+                "multi",
+                0x10,
+                True,
+                (
+                    b"\x7f\x10\x22",
+                    PROBE,
+                    b"\x67\x01\x00\x01\x02\x03",
+                    b"\x67\x02",
+                    ROUTINE,
+                ),
+                False,
+                41,
+            ),
+        )
+        for scope, sid, retry, replies, prepared, error_code in cases:
+            with self.subTest(scope=scope, sid=hex(sid), retry=retry):
+                addresses = "0100/0108" if scope == "single" else "0100/0108\n0200/0208"
+                context = fixture(
+                    POWER,
+                    addresses=addresses,
+                    retry=retry,
+                    ig_off_retriable=False,
+                )
+                assert isinstance(context, P5PrepareContext2026)
+                self.assertEqual(context.identity.sha256, HASHES[POWER])
+                self.assertFalse(
+                    context.binding.parameter.boolean("IGOffRetriableFlag")
+                )
+                reply_stream = iter(replies)
+                calls, echo, released = [], [], []
+                next_filter = iter((101, 202))
+
+                def provider(
+                    event,
+                    remaining,
+                    calls=calls,
+                    echo=echo,
+                    next_filter=next_filter,
+                    released=released,
+                    reply_stream=reply_stream,
+                ):
+                    calls.append(event)
+                    operation = event["operation"]
+                    if operation in ("passthru_open", "passthru_connect"):
+                        return PrimitiveResult(value=17)
+                    if operation == "passthru_start_filter":
+                        return PrimitiveResult(value=next(next_filter))
+                    if operation == "passthru_stop_filter":
+                        released.append(event["identifier"])
+                        return PrimitiveResult()
+                    if operation == "passthru_write":
+                        message = event["messages"][0]
+                        echo.append(NativeMessage(6, message.data[:4], rx_status=9))
+                        return PrimitiveResult(value=event["count"])
+                    if operation == "passthru_read":
+                        if echo:
+                            return PrimitiveResult(value=(echo.pop(0),))
+                        sent = next(
+                            item
+                            for item in reversed(calls)
+                            if item["operation"] == "passthru_write"
+                        )["messages"][0].data
+                        response_address = (
+                            int.from_bytes(sent[:4], "big") + 8
+                        ).to_bytes(4, "big")
+                        return PrimitiveResult(
+                            value=(
+                                NativeMessage(6, response_address + next(reply_stream)),
+                            )
+                        )
+                    return PrimitiveResult()
+
+                device = J2534Device2026(
+                    provider, clock=lambda: 0, background_workers=False
+                )
+                device.open()
+                device.connect(6)
+                rt = NativeRuntime2026(
+                    device.primitive,
+                    clock=lambda: 0,
+                    cleanup_action=device.cleanup_primitive,
+                )
+                notification = NotificationBool()
+                try:
+                    result = run_native_context(
+                        context, rt, retry_notification=notification
+                    )
+                    self.assertFalse(bool(notification))
+                    self.assertEqual(result["prepared"], prepared, result)
+                    self.assertEqual(result["native_return"], prepared)
+                    self.assertEqual(result["native_error_code"], error_code)
+                    writes = [
+                        event["messages"][0].data
+                        for event in calls
+                        if event["operation"] == "passthru_write"
+                    ]
+                    expected_probe_ids = ["00000100"]
+                    if scope == "multi" and sid == 0x27:
+                        expected_probe_ids.append("00000200")
+                    self.assertEqual(
+                        [
+                            write[:4].hex()
+                            for write in writes
+                            if write[4:] == b"\x10\x02"
+                        ],
+                        expected_probe_ids,
+                    )
+                    if prepared and scope == "multi":
+                        key = seed_key_four_round(
+                            bytes.fromhex("00010203"), context.materials
+                        )
+                        key_and_routine = [
+                            write
+                            for write in writes
+                            if write[4:].startswith(
+                                (b"\x27\x01", b"\x27\x02", b"\x31\x01")
+                            )
+                        ]
+                        self.assertEqual(
+                            key_and_routine,
+                            [
+                                bytes.fromhex("000002002701"),
+                                b"\x00\x00\x02\x00\x27\x02" + key,
+                                bytes.fromhex("0000020031011003"),
+                            ],
+                        )
+                        self.assertEqual(writes[-1], bytes.fromhex("0000020031011003"))
+                    elif scope == "multi":
+                        self.assertFalse(
+                            any(write[4:] != b"\x10\x02" for write in writes)
+                        )
+                    stop_calls = [
+                        event["identifier"]
+                        for event in calls
+                        if event["operation"] == "passthru_stop_filter"
+                    ]
+                    expected_filters = 1 if scope == "single" else 2
+                    self.assertEqual(len(stop_calls), expected_filters)
+                    self.assertEqual(sorted(released), sorted(stop_calls))
+                    self.assertEqual(len(set(stop_calls)), expected_filters)
+                    self.assertFalse(device.filters)
+                    self.assertFalse(rt._resources)
+                finally:
+                    device.disconnect()
+                    device.close()
 
     def test_private_actual_secret_authorization_when_available(self):
         root = Path(__file__).resolve().parents[1] / "runtime/no-car-21/recovered"

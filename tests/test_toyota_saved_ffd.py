@@ -659,6 +659,557 @@ class SavedFfdTests(unittest.TestCase):
                 if mode == "bodyfault":
                     self.assertNotIn(b"7FAB23", logger.path.read_bytes())
 
+    def test_rc_complete_outer_actual_public_eb_clear_and_privacy(self):
+        from test_frame_transport import DRIVER
+        from test_native_communication import J2534Fixture
+
+        from scripts.command_api import (
+            SOURCE_SHA256,
+            CommandAPI,
+            CommandSource,
+            ImageFacadeResult,
+            SavedOperationFacadeFreeze,
+            SavedOperationFacadeValue,
+        )
+        from scripts.database_resources import DdrP5SupportValue, DdrPacketLog
+        from scripts.diagnostic_db import parse_database
+        from scripts.frame_transport import J2534Result, NativeMessage
+        from scripts.native_communication import (
+            NativeCommunication,
+            NativeFrameController,
+        )
+
+        cancel_error = Cancelled("fixture cancellation identity")
+        for mode in ("success", "counter", "bodyfault", "metadatafault", "cancel"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                selected, _fixture = internal_image_profile(root, "normal")
+                sections = {
+                    key: (item.count, item.payload)
+                    for key, item in selected.catalog.management.sections.items()
+                }
+                count, rows = sections[18]
+                rows += struct.pack("<8H", 42, 0x66, 1, 0, 0, 0, 0, 0)
+                sections[18] = (
+                    count + 1,
+                    b"".join(
+                        sorted(
+                            (
+                                rows[offset : offset + 16]
+                                for offset in range(0, len(rows), 16)
+                            ),
+                            key=lambda row: struct.unpack_from("<HH", row),
+                        )
+                    ),
+                )
+                module = bytearray(88)
+                module_name = "GetRCImageFFDP5_DT.dll\0".encode("utf-16le")
+                module[: len(module_name)] = module_name
+                struct.pack_into("<H", module, 80, 42)
+                module[86] = 0xEB
+                sections[19] = (1, bytes(module))
+                encoded = bytearray(database(1, sections))
+                struct.pack_into("<I", encoded, 28, selected.catalog.management.version)
+                selected.catalog.management = parse_database(bytes(encoded))
+
+                mapping = {
+                    "2100": "6100",
+                    "221103": "6211030200",
+                    "221126": "621126010201",
+                    "2703": "6703000000000000",
+                    "222031": "62203100",
+                    "221129": "62112933003500",
+                    "22112c": "62112c0100",
+                    "22112f": "62112f010101",
+                    "221132": "621132010201030405060708",
+                    "221130": "62",
+                    "221133": "62",
+                    "ab31": "eb313300",
+                }
+                if mode == "metadatafault":
+                    mapping["221103"] = "6211030100"
+                for indices in (
+                    (0x201, 0x401, 0x601, 0x801, 0xA01, 0xC01, 0xE01),
+                    (
+                        0x02010000,
+                        0x04010000,
+                        0x06010000,
+                        0x08010000,
+                        0x0A010000,
+                        0x0C010000,
+                        0x0E010000,
+                    ),
+                    (
+                        0x02010001,
+                        0x04010001,
+                        0x06010001,
+                        0x08010001,
+                        0x0A010001,
+                        0x0C010001,
+                        0x0E010001,
+                    ),
+                ):
+                    for block, index in enumerate(indices, 1):
+                        key = "ab333300" + index.to_bytes(4, "big").hex()
+                        if mode == "bodyfault" and index == 0x801:
+                            mapping[key] = "7fab23"
+                        else:
+                            scalar = (
+                                0x1235
+                                if mode == "counter" and index == 0x02010000
+                                else 0x1234
+                            )
+                            mapping[key] = (
+                                "eb333300"
+                                + index.to_bytes(4, "big").hex()
+                                + (
+                                    "01050102" + scalar.to_bytes(2, "big").hex()
+                                    if block == 1
+                                    else ""
+                                )
+                            )
+                replies = {
+                    bytes.fromhex(key): bytes.fromhex(value)
+                    for key, value in mapping.items()
+                }
+
+                class Fixture(J2534Fixture):
+                    request = b""
+
+                    def invoke(
+                        self,
+                        operation,
+                        fields,
+                        *,
+                        replies=replies,
+                        mode=mode,
+                        cancel_error=cancel_error,
+                        **kwargs,
+                    ):
+                        if operation == "write_messages":
+                            self.request = fields["messages"][0].data[4:]
+                        if operation == "read_messages":
+                            self.calls.append((operation, dict(fields)))
+                            if mode == "cancel" and self.request == bytes.fromhex(
+                                "22112c"
+                            ):
+                                raise cancel_error
+                            return J2534Result(
+                                count=1,
+                                messages=(
+                                    NativeMessage(
+                                        6,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        bytes.fromhex("000007e8")
+                                        + replies[self.request],
+                                    ),
+                                ),
+                            )
+                        return super().invoke(operation, fields, **kwargs)
+
+                backend = Fixture([])
+                channel = NativeCommunication.from_backend(
+                    selected,
+                    backend,
+                    "rc-public-wire",
+                    first_request=b"\x21\x00",
+                    driver=DRIVER,
+                    device_kind=8,
+                    bus_id=0x12,
+                    source_build=18,
+                    clock=lambda: 0.0,
+                )
+                assert isinstance(channel.operations, NativeFrameController)
+                logger = DdrPacketLog(root / "logs", channel.operations)
+                api = CommandAPI(CommandSource(18, SOURCE_SHA256[18]))
+                prior = ImageFacadeResult(
+                    0,
+                    (SavedOperationFacadeFreeze((SavedOperationFacadeValue(99),)),),
+                    (789, 8, 9),
+                )
+                support = DdrP5SupportValue(
+                    170, mode == "counter", 0x1234 if mode == "counter" else 0
+                )
+                request = RcImageRequest18((1, 1), ddr_support=support)
+                if mode == "cancel":
+                    with self.assertRaises(Cancelled) as caught:
+                        api.get_rc_image_ffd(
+                            channel, logger, bytes(6), request, previous=prior
+                        )
+                    self.assertIs(caught.exception, cancel_error)
+                    self.assertTrue(channel.closed)
+                    self.assertIsNone(logger._file)
+                    self.assertTrue(logger.path.exists())
+                    continue
+
+                output = api.get_rc_image_ffd(
+                    channel, logger, bytes(6), request, previous=prior
+                )
+                self.assertTrue(channel.closed)
+                self.assertIsNone(logger._file)
+                self.assertTrue(logger.path.exists())
+                if mode == "metadatafault":
+                    self.assertEqual(output.return_code, 0x90040501)
+                    self.assertEqual(output.freezes, ())
+                    self.assertEqual(output.native_fields18, (0, 0, 0))
+                else:
+                    self.assertEqual(output.return_code, 0)
+                    self.assertTrue(output.freezes)
+                    values = tuple(row.values[0].scalar for row in output.freezes)
+                    self.assertTrue(
+                        all(
+                            value == (0x1235 if mode == "counter" else 0x1234)
+                            for value in values
+                        )
+                    )
+                    self.assertEqual(output.native_fields18, (0, 0, 0))
+                if mode == "bodyfault":
+                    packet_file = logger.path.read_bytes()
+                    self.assertNotIn(b"7FAB23", packet_file)
+                    self.assertNotIn(b"AB33330000000801", packet_file)
+                    self.assertNotIn(b"AB33330000000201", packet_file)
+                    self.assertNotIn(b"EB33330000000201", packet_file)
+                if mode == "success":
+                    saved = json.dumps(api.rc_image_ffd_report(output))
+                    for private_field in (
+                        "raw_reply",
+                        "log_path",
+                        "security",
+                        "ddr_report",
+                    ):
+                        self.assertNotIn(private_field, saved)
+
+        for encoding, module_name, build in (
+            ("utf-16le", "GetImageFFDP5_DT.dll", 18),
+            ("ascii", "GetRCImageFFDP5_DT.dll", 18),
+            ("utf-16le", "GetRCImageFFDP5_DT.dll", 12),
+        ):
+            with (
+                self.subTest(encoding=encoding, module_name=module_name, build=build),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                selected, _fixture = internal_image_profile(root, "normal", build=build)
+                sections = {
+                    key: (item.count, item.payload)
+                    for key, item in selected.catalog.management.sections.items()
+                }
+                module = bytearray(88)
+                name = (module_name + "\0").encode(encoding)
+                module[: len(name)] = name
+                struct.pack_into("<H", module, 80, 42)
+                module[86] = 0xEB
+                sections[19] = (1, bytes(module))
+                encoded = bytearray(database(1, sections))
+                struct.pack_into("<I", encoded, 28, selected.catalog.management.version)
+                selected.catalog.management = parse_database(bytes(encoded))
+                backend = J2534Fixture([])
+                channel = NativeCommunication.from_backend(
+                    selected,
+                    backend,
+                    "rc-public-preflight",
+                    first_request=b"\x21\x00",
+                    driver=DRIVER,
+                    device_kind=8,
+                    bus_id=0x12,
+                    source_build=build,
+                    clock=lambda: 0.0,
+                )
+                assert isinstance(channel.operations, NativeFrameController)
+                logger = DdrPacketLog(root / "rejected", channel.operations)
+                api = CommandAPI(CommandSource(build, SOURCE_SHA256[build]))
+                with self.assertRaises(NotImplementedError):
+                    api.get_rc_image_ffd(
+                        channel,
+                        logger,
+                        bytes(6),
+                        RcImageRequest18((1,)),
+                    )
+                self.assertEqual(backend.calls, [])
+                self.assertFalse(logger.directory.exists())
+
+    def test_rc_public_internal_support_from_real_ddr(self):
+        from test_frame_transport import DRIVER
+        from test_native_communication import J2534Fixture
+
+        from scripts.command_api import (
+            SOURCE_SHA256,
+            CommandAPI,
+            CommandSource,
+            ImageFacadeResult,
+            SavedOperationFacadeFreeze,
+            SavedOperationFacadeValue,
+        )
+        from scripts.database_resources import DdrPacketLog
+        from scripts.frame_transport import J2534Result, NativeMessage
+        from scripts.native_communication import (
+            NativeCommunication,
+            NativeFrameController,
+        )
+
+        def selected_profile(root, *, present):
+            profile, fixture = internal_image_profile(
+                root, "normal", support_values=present, build=18
+            )
+            management = profile.catalog.management
+            sections = {
+                key: (item.count, item.payload)
+                for key, item in management.sections.items()
+            }
+            if present:
+                rows = []
+                for offset in range(0, len(sections[54][1]), 44):
+                    row = bytearray(sections[54][1][offset : offset + 44])
+                    logical = struct.unpack_from("<H", row, 16)[0]
+                    if logical in (170, 171):
+                        struct.pack_into("<H", row, 18, 0xBC)
+                        struct.pack_into(
+                            "<HH", row, 20, *((16, 31) if logical == 170 else (0, 31))
+                        )
+                        struct.pack_into("<H", row, 24, 0)
+                        struct.pack_into("<H", row, 34, 0x14B2)
+                        row[38], row[39] = 0x12, 0xB2
+                    rows.append(bytes(row))
+                rows.sort(key=lambda row: struct.unpack_from("<H", row, 16)[0])
+                sections[54] = (len(rows), b"".join(rows))
+            module = bytearray(88)
+            name = "GetRCImageFFDP5_DT.dll\0".encode("utf-16le")
+            module[: len(name)] = name
+            struct.pack_into("<H", module, 80, 42)
+            module[86] = 0xEB
+            sections[19] = (1, bytes(module))
+            raw = bytearray(database(1, sections))
+            struct.pack_into("<I", raw, 28, management.version)
+            (root / "Toyota.ddb").write_bytes(raw)
+            return VehicleCatalog(root).build_profile(42), fixture
+
+        def responses(fixture, mode):
+            mapping = {
+                bytes.fromhex(key): bytes.fromhex(value)
+                for key, value in fixture["responses_hex"].items()
+            }
+            mapping.update(
+                {
+                    bytes.fromhex("27030000"): bytes.fromhex("67010000"),
+                    bytes.fromhex("27010000"): bytes.fromhex("67010000"),
+                    bytes.fromhex("2214f0"): bytes.fromhex(
+                        "6214f00006"
+                        if mode in ("present", "innerfault")
+                        else "6214f00002"
+                    ),
+                    bytes.fromhex("2100"): bytes.fromhex("6100"),
+                    bytes.fromhex("221103"): bytes.fromhex("6211030200"),
+                    bytes.fromhex("221126"): bytes.fromhex("621126010201"),
+                    bytes.fromhex("2703"): bytes.fromhex("6703000000000000"),
+                    bytes.fromhex("222031"): bytes.fromhex("62203100"),
+                    bytes.fromhex("221129"): bytes.fromhex("62112933003500"),
+                    bytes.fromhex("22112c"): bytes.fromhex("62112c0100"),
+                    bytes.fromhex("22112f"): bytes.fromhex("62112f000200"),
+                    bytes.fromhex("221132"): bytes.fromhex("62"),
+                    bytes.fromhex("221130"): bytes.fromhex("62"),
+                    bytes.fromhex("221133"): bytes.fromhex("62"),
+                    bytes.fromhex("ab31"): bytes.fromhex("eb313300"),
+                }
+            )
+            if mode in ("present", "innerfault"):
+                mapping[bytes.fromhex("2214b2")] = bytes.fromhex(
+                    "7f2213" if mode == "innerfault" else "6214b2f1231234"
+                )
+            for occurrence, scalar in ((1, 0x1234), (2, 0x1235)):
+                for block in range(1, 8):
+                    index = block * 0x200 + occurrence
+                    request = b"\xab\x33\x33\x00" + index.to_bytes(4, "big")
+                    payload = (
+                        b"\xeb\x33\x33\x00"
+                        + index.to_bytes(4, "big")
+                        + (
+                            b"\x01\x05\x01\x02" + scalar.to_bytes(2, "big")
+                            if block == 1
+                            else b""
+                        )
+                    )
+                    mapping[request] = payload
+            return mapping
+
+        class Fixture(J2534Fixture):
+            request = b""
+
+            def __init__(self, replies):
+                super().__init__([])
+                self.replies = replies
+                self.writes = []
+
+            def invoke(self, operation, fields, **kwargs):
+                if operation == "write_messages":
+                    self.request = fields["messages"][0].data[4:]
+                    self.writes.append(self.request.hex())
+                if operation == "read_messages":
+                    self.calls.append((operation, dict(fields)))
+                    return J2534Result(
+                        count=1,
+                        messages=(
+                            NativeMessage(
+                                6,
+                                0,
+                                0,
+                                0,
+                                0,
+                                bytes.fromhex("000007e8") + self.replies[self.request],
+                            ),
+                        ),
+                    )
+                return super().invoke(operation, fields, **kwargs)
+
+        for mode in ("absent", "present", "innerfault"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                selected, fixture = selected_profile(root, present=mode != "absent")
+                wire = responses(fixture, mode)
+                backend = Fixture(wire)
+                channel = NativeCommunication.from_backend(
+                    selected,
+                    backend,
+                    "rc-internal-public",
+                    first_request=b"\x21\x00",
+                    driver=DRIVER,
+                    device_kind=8,
+                    bus_id=0x12,
+                    source_build=18,
+                    clock=lambda: 0.0,
+                )
+                assert isinstance(channel.operations, NativeFrameController)
+                packet_log = DdrPacketLog(root / "logs", channel.operations)
+                self.assertIs(packet_log.operations, channel.operations)
+                api = CommandAPI(CommandSource(18, SOURCE_SHA256[18]))
+                previous = ImageFacadeResult(
+                    0,
+                    (SavedOperationFacadeFreeze((SavedOperationFacadeValue(99),)),),
+                    (789, 8, 9),
+                )
+                output = api.get_rc_image_ffd(
+                    channel,
+                    packet_log,
+                    bytes(6),
+                    RcImageRequest18((1,), ecu_info=(), ddr_support=None),
+                    previous=previous,
+                )
+                self.assertEqual(output.return_code, 0)
+                self.assertTrue(channel.closed)
+                self.assertIsNone(packet_log._file)
+                self.assertTrue(packet_log.path.is_file())
+                self.assertEqual(channel.profile.category, 42)
+                self.assertIs(packet_log.operations, channel.operations)
+                values = tuple(row.values[0].scalar for row in output.freezes)
+                if mode == "present":
+                    self.assertEqual(values, (0x1235,))
+                    self.assertEqual(output.native_fields18, (1, 0, 0x1234))
+                else:
+                    self.assertEqual(values, (0x1234, 0x1235))
+                    self.assertEqual(output.native_fields18, (0, 0, 0))
+                self.assertNotIn(99, values)
+
+                writes = backend.writes
+                self.assertEqual(
+                    writes[:5], ["2100", "27030000", "27010000", "221421", "2214f0"]
+                )
+                record_writes = [
+                    int.from_bytes(bytes.fromhex(request[8:]), "big")
+                    for request in writes
+                    if request.startswith("ab333300")
+                ]
+                if mode == "present":
+                    expected_records = [0x201] + [
+                        block * 0x200 + 2 for block in range(1, 8)
+                    ]
+                    self.assertEqual(writes.count("2214b2"), 1)
+                    self.assertLess(
+                        writes.index("2214f0"),
+                        writes.index("2214b2"),
+                    )
+                    self.assertLess(
+                        writes.index("2214b2"),
+                        writes.index("221103"),
+                    )
+                elif mode == "innerfault":
+                    expected_records = [
+                        block * 0x200 + occurrence
+                        for occurrence in (1, 2)
+                        for block in range(1, 8)
+                    ]
+                    self.assertEqual(writes.count("2214b2"), 1)
+                else:
+                    expected_records = [
+                        block * 0x200 + occurrence
+                        for occurrence in (1, 2)
+                        for block in range(1, 8)
+                    ]
+                    self.assertNotIn("2214b2", writes)
+                self.assertEqual(record_writes, expected_records)
+                self.assertNotIn("2214b1", writes)
+                self.assertFalse(any(request.startswith("91") for request in writes))
+
+                packet_bytes = packet_log.path.read_bytes()
+                if mode == "present":
+                    self.assertIn(b"6214B2F1231234", packet_bytes)
+                    self.assertNotIn(b"AB33330000000201", packet_bytes)
+                    self.assertNotIn(b"EB33330000000201", packet_bytes)
+                    self.assertIn(b"AB33330000000202", packet_bytes)
+                elif mode == "innerfault":
+                    self.assertIn(b"7F2213", packet_bytes)
+                    self.assertEqual(output.native_fields18, (0, 0, 0))
+                else:
+                    self.assertNotIn(b"2214B2", packet_bytes)
+                    self.assertIn(b"AB33330000000201", packet_bytes)
+                    self.assertIn(b"AB33330000000202", packet_bytes)
+                public_json = json.dumps(api.rc_image_ffd_report(output))
+                for private_field in (
+                    "raw_reply",
+                    "log_path",
+                    "security",
+                    "ddr_report",
+                ):
+                    self.assertNotIn(private_field, public_json)
+
+                if mode == "present":
+                    direct_backend = Fixture(wire)
+                    direct_channel = NativeCommunication.from_backend(
+                        selected,
+                        direct_backend,
+                        "rc-internal-direct-replay",
+                        first_request=b"\x21\x00",
+                        driver=DRIVER,
+                        device_kind=8,
+                        bus_id=0x12,
+                        source_build=18,
+                        clock=lambda: 0.0,
+                    )
+                    assert isinstance(direct_channel.operations, NativeFrameController)
+                    direct_log = DdrPacketLog(
+                        root / "direct-logs", direct_channel.operations
+                    )
+                    direct = capture_rc_image_saved(
+                        direct_channel,
+                        direct_log,
+                        RcImageSource(18, RC_IMAGE_SOURCE_SHA256),
+                        bytes(6),
+                        RcImageRequest18((1,), ecu_info=(), ddr_support=None),
+                    )
+                    self.assertEqual(direct.native_status, 0)
+                    self.assertTrue(direct.first_support.present)
+                    self.assertEqual(direct.first_support.value, 0x1234)
+                    self.assertIsNotNone(direct.phase)
+                    assert direct.phase is not None
+                    self.assertEqual(
+                        tuple(row.blocks[0].values[0] for row in direct.phase.freezes),
+                        (0x1235,),
+                    )
+                    self.assertEqual(direct_backend.writes, writes)
+                    self.assertIsNone(direct_log._file)
+                    self.assertTrue(direct_channel.closed)
+
     def test_rc_actual_seven_block_regular_adjacent_duplicate_and_rollback(self):
         from test_frame_transport import DRIVER
         from test_native_communication import J2534Fixture, serialized_profile
