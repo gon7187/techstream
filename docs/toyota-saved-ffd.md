@@ -283,9 +283,19 @@ set; linked extended records keep their raw send/receive bytes, while zero,
 orphan and counter-excluded-parent records roll back to the preceding packet
 offset. Extended rows add no freeze scalar. Three focused actual43/77/49
 controls check these bytes and the existing suppressed-error rollback path.
-The complete ADS image producer and saved outer remain incomplete. Original12
-generic outer still requires its exact internal normal path. PVM, RC and TSS3
-indexed image producers and saved outers remain incomplete. `ImageP5Request18` preserves caller BYTE numbers, selector and the two
+The complete ADS image producer and saved outer remain incomplete. The actual
+RC18 `GetRCImageFFDP5_DT.dll` DB113 EB route now has a real saved-producer join
+control for caller-provided support: absent/present counter filtering, seven
+block partial rollback, metadata fault clearing of prior facade values,
+cancellation cleanup/identity, pre-I/O module/source guards, and typed JSON
+privacy. A second actual saved-producer route builds normal BC/B2 support from
+the serialized DDR management rows and raw `6214B2` response, then checks the
+public fields, equal-header filtering, following accepted header, inner-support
+failure behavior and retained/truncated packet records. The normal path is
+bounded to these captured support vectors; complete RC equivalence remains
+open. Original12 generic
+outer still requires its exact internal normal path. PVM and TSS3 indexed image
+producers and saved outers remain incomplete. `ImageP5Request18` preserves caller BYTE numbers, selector and the two
 native ECU-reference fields consumed by the DDR selector. Empty and duplicate
 number lists remain visible. Original12 uses separate inline helpers and reads
 all memorized images; original18 requires a caller snapshot-number list, filters

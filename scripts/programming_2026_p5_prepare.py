@@ -203,8 +203,8 @@ def run_native_context(context, runtime, *, retry_notification=None, secret_info
             _, raw = native_error_fields2026(error)
             if raw in (9, 16):
                 raise CommonResponseError(55, b"") from error
-            # BodyMicon source checks SID27 here; other variants check SID10.
-            sid = 0x27 if module == BODY else 0x10
+            # POWER and BodyMicon compare SID27; other variants compare SID10.
+            sid = 0x27 if module in (POWER, BODY) else 0x10
             if (
                 isinstance(error, CommonResponseError)
                 and len(error.response) == 3

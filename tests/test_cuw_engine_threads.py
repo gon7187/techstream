@@ -6,7 +6,9 @@ import json
 import struct
 import threading
 import unittest
+from itertools import cycle
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from scripts.cuw_2026 import CUWEngine2026
@@ -30,6 +32,8 @@ from tests.test_cuw_engine_worker import calibration, encoded_table, make_contro
 
 
 class ThreadOwnershipTests(unittest.TestCase):
+    _sequence_generations = 1
+
     def setUp(self):
         path = Path("runtime/no-car-21/recovered/CUW.dll")
         if not path.is_file():
@@ -293,9 +297,10 @@ class ThreadOwnershipTests(unittest.TestCase):
             typed_runtime,
         )
 
+        generations = getattr(self, "_sequence_generations", 1)
         native, container, binding = fixture(P5, "0100/0108\n0200/0208", allow="")
         provider_runtime, device, _provider_events = typed_runtime(
-            (p5(b"ONE"), b"SECOND")
+            cycle((p5(b"ONE"), b"SECOND"))
         )
         rows = []
         reads = 0
@@ -383,6 +388,10 @@ class ThreadOwnershipTests(unittest.TestCase):
         direct = run_native_context(native, provider_runtime)
         self.assertIs(direct["bool_out"], False)
         self.assertEqual(direct["cids"], (b"ONE",))
+        for _ in range(1, generations):
+            repeated = run_native_context(native, provider_runtime)
+            self.assertIs(repeated["bool_out"], False)
+            self.assertEqual(repeated["cids"], (b"ONE",))
         values = {
             key: "\n".join(value)
             for key, value in binding.values.items()
@@ -454,15 +463,30 @@ class ThreadOwnershipTests(unittest.TestCase):
                     f"runner calls={runner_calls}; captured={[row['request'].get('operation') for row in rows]}; "
                     f"next={session.trace.rows[session.trace.position : session.trace.position + 1]}"
                 ) from error
+            reports = [report]
+            for sequence in range(2, generations + 1):
+                session = session.next_session2026(
+                    "get_cid", node=session.node, cpu_index=0
+                )
+                self.assertEqual(job.start(session), sequence)
+                reports.append(job.result(5, sequence=sequence))
 
         self.assertIs(report["native_return"], False, report)
         self.assertEqual(report["identifiers"], (b"ONE",))
-        self.assertEqual(runner_calls, [True])
+        self.assertEqual(runner_calls, [True] * generations)
         self.assertEqual(
             [call.args[0] for call in imports.call_args_list],
-            [pair.control, pair.engine],
+            [pair.control, pair.engine] * generations,
         )
         self.assertEqual(engine.received_identifiers, (b"ONE",))
+        self.assertEqual(session.trace.position, len(session.trace.rows))
+        if generations > 1:
+            self.assertIs(job.result(5, sequence=1), report)
+            self.assertEqual(
+                [item["identifiers"] for item in reports],
+                [(b"ONE",)] * generations,
+            )
+            self.assertEqual(job.state.sequence, generations)
 
     def test_prepare_return_does_not_import_getter_snapshot(self):
         from tests.test_programming_2026_common import RawControlStageMachineTests
@@ -1589,7 +1613,7 @@ class EngineThreadRetryBridgeTests(unittest.TestCase):
             return self.continuation
 
     def _job(self, *, error=None):
-        job = object.__new__(EngineThreadJob2026)
+        job: Any = object.__new__(EngineThreadJob2026)
         job._lock = threading.RLock()
         job._resume = threading.Event()
         job._completed = threading.Event()
@@ -1611,6 +1635,10 @@ class EngineThreadRetryBridgeTests(unittest.TestCase):
         job._host_stop = False
         job._waiting = False
         job._sequence = 1
+        from scripts.cuw_engine_threads import _CompletionRecord2026
+
+        job._active_record = _CompletionRecord2026(1)
+        job._completion_records = {1: job._active_record}
         job._result = None
         job._error = None
         job._continuation = None
@@ -1676,6 +1704,263 @@ class EngineThreadRetryBridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             job.dispatch_retry_callback()
         self.assertFalse(job._callback_requested.is_set())
+
+
+class ThreadSequenceCompletionTests(unittest.TestCase):
+    def _job_fixture(self, **kwargs):
+        fixture = ThreadOwnershipTests()
+        fixture.setUp()
+        engine, controller, job, session = fixture.imported_prepare(**kwargs)
+        return fixture, engine, controller, job, session
+
+    def test_00_old_waiter_keeps_the_sequence_selected_at_call_entry(self):
+        from scripts.cuw_engine_threads import _CompletionRecord2026
+
+        class WaitGate(threading.Event):
+            def wait(self, timeout=None):
+                self.entered.set()
+                return self.release.wait(timeout)
+
+            def __init__(self):
+                super().__init__()
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+        old_result = {"generation": 1}
+        new_result = {"generation": 2}
+        gate = WaitGate()
+        old = _CompletionRecord2026(1, completed=gate, result=old_result)
+        job = object.__new__(EngineThreadJob2026)
+        job._lock = threading.RLock()
+        job._outer = job._child = None
+        job._sequence = 1
+        job._completion_records = {1: old}
+        job._completed = gate
+        job._result = old_result
+        job._error = None
+        returned = []
+        waiter = threading.Thread(target=lambda: returned.append(job.result(2)))
+        waiter.start()
+        self.assertTrue(gate.entered.wait(2))
+
+        new = _CompletionRecord2026(2)
+        new.completed.set()
+        new.result = new_result
+        with job._lock:
+            job._completion_records[2] = new
+            job._sequence = 2
+            job._completed = new.completed
+            job._result = new_result
+        gate.release.set()
+        waiter.join(2)
+
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(len(returned), 1)
+        self.assertIs(returned[0], old_result)
+
+    def test_three_actual_source_bound_generations_share_the_persistent_job(self):
+        fixture = ThreadOwnershipTests()
+        fixture.setUp()
+        fixture._sequence_generations = 3
+        try:
+            fixture.test_actual_p5_false_getter_imports_pair_through_thread_job()
+        finally:
+            fixture.doCleanups()
+
+    def test_old_result_and_error_objects_survive_later_publication(self):
+        from scripts.cuw_engine_threads import _CompletionRecord2026
+
+        def record(result=None, error=None, continuation=None):
+            item = _CompletionRecord2026(1)
+            item.completed.set()
+            item.result, item.error, item.continuation = result, error, continuation
+            return item
+
+        job = object.__new__(EngineThreadJob2026)
+        job._lock = threading.RLock()
+        job._outer = job._child = None
+        old_result = {"generation": 1}
+        later_error = OSError("generation 2")
+        latest_continuation = object()
+        job._sequence = 3
+        job._completion_records = {
+            1: record(result=old_result),
+            2: record(error=later_error),
+            3: record(result={"generation": 3}, continuation=latest_continuation),
+        }
+
+        self.assertIs(job.result(2, sequence=1), old_result)
+        with self.assertRaises(OSError) as caught:
+            job.result(2, sequence=2)
+        self.assertIs(caught.exception, later_error)
+        self.assertIs(job.continuation, latest_continuation)
+
+        earlier_error = RuntimeError("generation 1")
+        latest_result = {"generation": 3}
+        job._completion_records[1] = record(error=earlier_error)
+        job._completion_records[3] = record(
+            result=latest_result, continuation=latest_continuation
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            job.result(2, sequence=1)
+        self.assertIs(caught.exception, earlier_error)
+        self.assertIs(job.result(2), latest_result)
+
+    def test_result_rejects_unissued_invalid_sequences(self):
+        job = object.__new__(EngineThreadJob2026)
+        job._lock = threading.RLock()
+        job._outer = job._child = None
+        job._sequence = 1
+        from scripts.cuw_engine_threads import _CompletionRecord2026
+
+        record = _CompletionRecord2026(1)
+        record.completed.set()
+        record.result = {}
+        job._completion_records = {1: record}
+        for sequence in (True, 0, -1, 2):
+            with self.subTest(sequence=sequence), self.assertRaises(ValueError):
+                job.result(2, sequence=sequence)
+
+    def test_child_prelude_fault_is_published_to_its_sequence(self):
+        fixture, _engine, _controller, job, session = self._job_fixture(
+            operation="get_cid", include_control=False
+        )
+        fault = RuntimeError("controlled child prelude fault")
+        original_clear = job._child_parked.clear
+        clear_calls = 0
+
+        def fail_child_clear():
+            nonlocal clear_calls
+            clear_calls += 1
+            if clear_calls == 2:
+                raise fault
+            return original_clear()
+
+        try:
+            with patch.object(job._child_parked, "clear", side_effect=fail_child_clear):
+                job.start(session)
+                with self.assertRaises(RuntimeError) as caught:
+                    job.result(2, sequence=1)
+            self.assertIs(caught.exception, fault)
+        finally:
+            fixture.doCleanups()
+
+    def test_reserved_release_failure_keeps_the_legacy_winning_error(self):
+        fixture, engine, controller, job, session = self._job_fixture(
+            operation="get_cid", include_control=False
+        )
+        primary = ValueError("controlled runtime check failure")
+        cleanup = OSError("controlled reserved release failure")
+        original_release = engine.release_reserved_phase
+        release_calls = 0
+
+        def fail_first_release(lease):
+            nonlocal release_calls
+            release_calls += 1
+            if release_calls == 1:
+                raise cleanup
+            return original_release(lease)
+
+        try:
+            with (
+                patch.object(controller.runtime, "check", side_effect=primary),
+                patch.object(
+                    engine, "release_reserved_phase", side_effect=fail_first_release
+                ),
+            ):
+                job.start(session)
+                caught = []
+                try:
+                    job.result(2, sequence=1)
+                except (
+                    ValueError,
+                    OSError,
+                ) as error:  # preserve exact worker error identity
+                    caught.append(error)
+            self.assertEqual(release_calls, 1)
+            self.assertEqual(len(caught), 1)
+            self.assertIs(caught[0], cleanup)
+            self.assertIs(job._completion_records[1].error, cleanup)
+        finally:
+            fixture.doCleanups()
+
+    def test_late_outer_wait_fault_cannot_mutate_published_record(self):
+        fixture, _engine, _controller, job, session = self._job_fixture(
+            operation="get_cid", include_control=False
+        )
+        clock = lambda: 1000
+        session.trace.native_local_milliseconds_of_day = clock
+        _controller.runtime.local_milliseconds_of_day = clock
+        original_wait = job._resume.wait
+        waits = 0
+        fault = RuntimeError("controlled late outer wait fault")
+
+        def fail_second_wait(timeout=None):
+            nonlocal waits
+            waits += 1
+            if waits == 2:
+                raise fault
+            return original_wait(timeout)
+
+        try:
+            with patch.object(job._resume, "wait", side_effect=fail_second_wait):
+                sequence = job.start(session)
+                self.assertEqual(sequence, 1)
+                outer = job._outer
+                self.assertIsNotNone(outer)
+                assert outer is not None
+                outer.join(2)
+            record = job._completion_records[1]
+            self.assertTrue(record.completed.is_set())
+            self.assertIsNone(record.error)
+            self.assertIs(job.result(2, sequence=1), record.result)
+        finally:
+            fixture.doCleanups()
+
+    def test_outer_cleanup_preserves_child_winner_and_appends_note(self):
+        case = EngineThreadRetryBridgeTests()
+        job = case._job()
+        record = job._active_record
+        primary = OSError("controlled child winner")
+        existing_note = "pre-existing cleanup note"
+        outer_cleanup = ValueError("controlled outer cleanup fault")
+        job._error = record.error = primary
+        primary.add_note(existing_note)
+        job._child_done.set()
+        child = threading.Thread(target=lambda: None)
+        child.start()
+        child.join()
+        job._child = child
+        job.engine.cleanup.release_retired_selected = lambda worker: (
+            _ for _ in ()
+        ).throw(outer_cleanup)
+        job._resume.set()
+
+        job._run_outer()
+
+        self.assertEqual(
+            primary.__notes__,
+            [
+                existing_note,
+                "Native outer cleanup failure: ValueError",
+            ],
+        )
+        self.assertIs(job._error, primary)
+        self.assertIs(record.error, primary)
+        self.assertTrue(record.completed.is_set())
+        with self.assertRaises(OSError) as caught:
+            job.result(1, sequence=1)
+        self.assertIs(caught.exception, primary)
+
+    def test_unstarted_no_argument_result_keeps_legacy_message(self):
+        fixture, _engine, _controller, job, _session = self._job_fixture()
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "^Native thread job has not been started$"
+            ):
+                job.result()
+        finally:
+            fixture.doCleanups()
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -118,6 +118,15 @@ class ThreadState2026:
     outer_exit_code: int | None
 
 
+@dataclass
+class _CompletionRecord2026:
+    sequence: int
+    completed: threading.Event = field(default_factory=threading.Event)
+    result: dict | None = None
+    error: BaseException | None = None
+    continuation: WorkerContinuation2026 | None = None
+
+
 def _timeout_deadline(timeout: float) -> float:
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
         raise TypeError("Finite positive host timeout required")
@@ -157,6 +166,8 @@ class EngineThreadJob2026:
         self._host_stop = False
         self._waiting = False
         self._sequence = 0
+        self._completion_records: dict[int, _CompletionRecord2026] = {}
+        self._active_record: _CompletionRecord2026 | None = None
         self._result: dict | None = None
         self._error: BaseException | None = None
         self._continuation: WorkerContinuation2026 | None = None
@@ -202,9 +213,10 @@ class EngineThreadJob2026:
     @property
     def continuation(self) -> WorkerContinuation2026 | None:
         with self._lock:
-            if not self._completed.is_set():
+            record = self._completion_records.get(self._sequence)
+            if record is None or not record.completed.is_set():
                 raise ValueError("Native child has not unwound")
-            return self._continuation
+            return record.continuation
 
     def start(
         self, session: ProgrammingReplay, *, phase: int | None = None
@@ -257,7 +269,8 @@ class EngineThreadJob2026:
             self._prepare_pending.clear()
             self._result = self._error = self._continuation = None
             self._child_exit = None
-            self._sequence += 1
+            sequence = self._sequence + 1
+            record = _CompletionRecord2026(sequence)
             if self._outer is None:
                 self._outer = threading.Thread(
                     target=self._run_outer, name="CUW2026-3cb90", daemon=True
@@ -268,8 +281,10 @@ class EngineThreadJob2026:
                     self.engine.release_reserved_phase(self._lease)
                     self._lease = self._session = None
                     self._outer = None
-                    self._sequence -= 1
                     raise
+            self._sequence = sequence
+            self._completion_records[sequence] = record
+            self._active_record = record
             self._resume.set()
             return self._sequence
 
@@ -337,16 +352,19 @@ class EngineThreadJob2026:
             raise ValueError("Consolidated native controller ownership is not bound")
 
     def _run_child(self) -> None:
+        record = None
         try:
             while True:
                 self._child_resume.wait()
                 self._child_resume.clear()
                 with self._lock:
                     lease, session = self._lease, self._session
+                    record = self._active_record
                     if self._stop and (lease is None or lease.state != "reserved"):
                         break
                     if lease is None:
                         raise ValueError("Native child resume has no reserved work")
+                    assert record is not None
                     assert session is not None
                     self._child_parked.clear()
                 try:
@@ -421,9 +439,11 @@ class EngineThreadJob2026:
                             self.dispatch_worker_tail()
                         with self._lock:
                             self._result = result
+                            record.result = result
                 except BaseException as error:  # noqa: BLE001 - preserve child faults for the joining host
                     with self._lock:
                         self._error = error
+                        record.error = error
                 finally:
                     if lease.state == "reserved":
                         self.engine.release_reserved_phase(lease)
@@ -435,6 +455,8 @@ class EngineThreadJob2026:
         except BaseException as error:  # noqa: BLE001 - preserve thread failure for the joining owner
             with self._lock:
                 self._error, self._child_exit = error, 1
+                if record is not None and not record.completed.is_set():
+                    record.error = error
             self._child_done.set()
             self._activity.set()
 
@@ -493,16 +515,20 @@ class EngineThreadJob2026:
                 )
 
     def _run_outer(self) -> None:
+        record = None
         try:
             while True:
+                record = None
                 self._resume.wait()
                 self._resume.clear()
                 with self._lock:
                     lease = self._lease
+                    record = self._active_record
                     if lease is None:
                         if self._stop:
                             break
                         raise ValueError("Native resume event has no actual child work")
+                    assert record is not None
                     self._waiting = False
                     child = self._child
                     needs_start = child is None
@@ -567,12 +593,14 @@ class EngineThreadJob2026:
                     self.worker
                 )
                 with self._lock:
-                    self._continuation = self.worker.take_continuation()
+                    record.continuation = self.worker.take_continuation()
+                    self._continuation = record.continuation
                     self._lease = self._session = None
                     self._waiting = True
                     if self.engine._retry_controller is not None:
                         self.engine._retry_controller.worker_stopped()
                     self._completed.set()
+                    record.completed.set()
                     if self._stop:
                         break
             self._outer_exit = 0
@@ -584,8 +612,12 @@ class EngineThreadJob2026:
                     self._error.add_note(
                         "Native outer cleanup failure: " + type(error).__name__
                     )
+                if record is not None and not record.completed.is_set():
+                    record.error = self._error
                 self._outer_exit = 1
                 self._completed.set()
+                if record is not None:
+                    record.completed.set()
         finally:
             with self._lock:
                 self._stop = True
@@ -595,18 +627,24 @@ class EngineThreadJob2026:
                 child.join()
             self._waiting = False
 
-    def result(self, timeout: float = 5.0) -> dict:
+    def result(self, timeout: float = 5.0, *, sequence: int | None = None) -> dict:
         deadline = _timeout_deadline(timeout)
         self._reject_self_join()
-        if not self._sequence:
-            raise ValueError("Native thread job has not been started")
-        if not self._completed.wait(max(0, deadline - time.monotonic())):
-            raise TimeoutError("Native child wait exceeded host deadline")
         with self._lock:
-            if self._error is not None:
-                raise self._error
-            assert self._result is not None
-            return self._result
+            if sequence is None and not self._sequence:
+                raise ValueError("Native thread job has not been started")
+            selected = self._sequence if sequence is None else sequence
+            if sequence is not None and (type(sequence) is not int or sequence <= 0):
+                raise ValueError("Already-issued positive native sequence required")
+            record = self._completion_records.get(selected)
+            if record is None:
+                raise ValueError("Native thread sequence has not been issued")
+        if not record.completed.wait(max(0, deadline - time.monotonic())):
+            raise TimeoutError("Native child wait exceeded host deadline")
+        if record.error is not None:
+            raise record.error
+        assert record.result is not None
+        return record.result
 
     @property
     def is_child_thread(self) -> bool:
