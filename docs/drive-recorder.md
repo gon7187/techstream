@@ -273,14 +273,28 @@ manual entry before communication. Retained state is bound to the catalog,
 management hash, selected DB113 row and exception IDs, and is invalidated by
 session disposal.
 
-The ordinary producer preserves the embedded1D list. Manual selection and
-answers reject a nonempty1D list while its separate source route is unimplemented.
-Option42 continuation is retained on the same session and emits fresh option
-menus on later answers. Provider setup and formatter output use the existing
-`NativeCommunication` adapter and typed DRS selection fields. The new authored
-tests are serialized-DDB software replay; they do not attest a loaded OEM DLL
-hash, prove every regional GUI lifecycle, or confirm physical communication.
-Existing automatic12/18 tests remain independent and unchanged.
+`select_multigroup_categories(selected_ids, bus_judge=...)` admits the selected
+NA18 category-command row `SelectCarCtgrMltOpt.dll` and builds the embedded1D
+option-group list from the surviving DB129 and DB12A records. The list retains
+source order and duplicate labels; `multi_option_groups` exposes immutable
+snapshots of its ABI fields. The actual 5190/58D0 selector path uses those
+retained entries, including hidden duplicate IDs, sibling next-group updates,
+and terminal formatting through the shared communication/provider state.
+Ordinary category production leaves an existing1D list untouched, and a later
+7d answer follows that list when present. The adapter requires source build18,
+native controller build18, the first selected DB113 7d row naming
+`SelectCarTypVn10_DT.dll`, and the first selected DB113 48 row naming
+`SelectCarCtgrMltOpt.dll`; this is source admission, not runtime OEM DLL hash
+attestation. Host-side safety ceilings cap retained 1D data at100000 entries
+and the serialized response at32 MiB; more than65535 unique synthetic select
+IDs is rejected before append instead of emulating the native WORD wraparound.
+
+The authored Multi controls use serialized synthetic DDB data and the real
+`NativeCommunication` adapter. They cover duplicate-text IDs, sibling mutation,
+terminal answers, stale1D crossover, cache-negative behavior, fallback ordering,
+and mode2 clearing. They do not prove every regional GUI lifecycle, the full
+family of provider consumers, or physical communication. Existing automatic
+12/18 tests remain independent and unchanged.
 
 The selected vehicle context models the recorder-facing GUI export: ordered
 names/options and terminal words survive, while display-only CarInfo IDs

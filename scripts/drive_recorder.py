@@ -1257,6 +1257,52 @@ class NativeCategoryMenu:
 
 
 @dataclass(frozen=True)
+class NativeMultiOptionGroup:
+    category: int
+    bus: int
+    option_key: int
+    raw_group: int
+    raw_choice: int
+    label_reference: int
+    terminal_model: int
+    next_group: int
+    assigned_index: int
+    assigned_select: int
+    text: str
+
+
+@dataclass
+class _NativeMultiOptionGroup:
+    category: int
+    bus: int
+    option_key: int
+    raw_group: int
+    raw_choice: int
+    label_reference: int
+    terminal_model: int
+    next_group: int
+    assigned_index: int = 0
+    assigned_select: int = 0
+    text: str = ""
+    text_bytes: bytes = b""
+
+    def snapshot(self) -> NativeMultiOptionGroup:
+        return NativeMultiOptionGroup(
+            self.category,
+            self.bus,
+            self.option_key,
+            self.raw_group,
+            self.raw_choice,
+            self.label_reference,
+            self.terminal_model,
+            self.next_group,
+            self.assigned_index,
+            self.assigned_select,
+            self.text,
+        )
+
+
+@dataclass(frozen=True)
 class NativeDisplayItem:
     core_words: tuple[int, int]
     value: int
@@ -5237,10 +5283,12 @@ class NativeVehicleSession:
         self.shared_option = 0xFFFF
         self.category_mode = 0
         self.category_ids: list[tuple[int, int]] = []
-        self.option_groups: list[object] = []
+        self.option_groups: list[_NativeMultiOptionGroup] = []
+        self.option_group_bytes = 0
         self.current_model: int | None = None
         self.model_list: list[int] = []
         self.manual_identity: tuple[object, ...] | None = None
+        self.multi_identity: tuple[object, ...] | None = None
         self.manual_parent_record: bytes | None = None
         self._closed = False
 
@@ -5254,12 +5302,18 @@ class NativeVehicleSession:
         self._check()
         return tuple(self._vin_entries)
 
+    @property
+    def multi_option_groups(self) -> tuple[NativeMultiOptionGroup, ...]:
+        self._check()
+        return tuple(entry.snapshot() for entry in self.option_groups)
+
     def dispose(self) -> None:
         """Release this CDataCtrl's embedded lists, independently of the adapter."""
         self._vin_entries.clear()
         self._contexts.clear()
         self.category_ids.clear()
         self.option_groups.clear()
+        self.option_group_bytes = 0
         self.model_list.clear()
         self.shared_bus = 0xFF
         self.shared_category = 0xFFFFFFFF
@@ -5268,6 +5322,7 @@ class NativeVehicleSession:
         self.category_mode = 0
         self.current_model = None
         self.manual_identity = None
+        self.multi_identity = None
         self.manual_parent_record = None
         self._closed = True
 
@@ -5390,6 +5445,49 @@ class NativeVehicleSelector:
                 )
         elif bind and self.session is not None:
             self.session.manual_identity = identity
+        return rows
+
+    def _multi_admit(self, *, bind: bool = False) -> tuple[bytes, ...]:
+        from scripts.native_communication import NativeFrameController
+
+        self._manual_admit(bind=bind)
+        if not isinstance(self.owner.operations, NativeFrameController):
+            raise UnsupportedRecorderOperation(
+                "Multi categories require the native18 frame controller"
+            )
+        rows = self.owner.profile.dll_records(0x48)
+        if not rows or len(rows[0]) < 80:
+            raise UnsupportedRecorderOperation(
+                "Multi categories require the selected native18 multi-command row"
+            )
+        module = rows[0][:80].decode("utf-16le").split("\0", 1)[0]
+        if module != "SelectCarCtgrMltOpt.dll":
+            raise UnsupportedRecorderOperation(
+                "Multi categories require SelectCarCtgrMltOpt.dll"
+            )
+        identity = (
+            self.catalog,
+            self.catalog.management.sha256,
+            rows[0],
+            self.owner.profile.exception_ids,
+            self.owner.source_build,
+            self.owner.operations.native_build,
+        )
+        if self.session is not None and self.session.multi_identity is not None:
+            if self.session.multi_identity != identity:
+                raise UnsupportedRecorderOperation(
+                    "Multi-option owner no longer matches its source catalog"
+                )
+        elif bind and self.session is not None:
+            self.session.multi_identity = identity
+        if (
+            self.session is not None
+            and self.session.option_groups
+            and self.session.multi_identity != identity
+        ):
+            raise UnsupportedRecorderOperation(
+                "Retained multi-option state has no matching source owner"
+            )
         return rows
 
     def _manual_owner(self) -> NativeVehicleSession:
@@ -5661,6 +5759,316 @@ class NativeVehicleSelector:
             selected = category, bus
         return selected
 
+    def _multi_initial_pair(self) -> tuple[int, int]:
+        candidates = self.catalog.protocol_candidates(self.owner.profile.exception_ids)
+        contexts = _NativeVehicleContexts(
+            self,
+            tuple((candidate.category, candidate.variant) for candidate in candidates),
+        )
+        selected = self.owner.check_protocol(candidates, contexts=contexts)
+        self._check()
+        if selected is None:
+            return 0, 0
+        return selected.category, selected.variant
+
+    @staticmethod
+    def _multi_bus_probe_case(rows: tuple[dict, ...]) -> bool:
+        return bool(rows) and all(
+            word(bytes.fromhex(row["raw_hex"]), 0) == 1
+            and bytes.fromhex(row["raw_hex"])[2] in (0x17, 0x21)
+            for row in rows
+        )
+
+    def _multi_fallback_pair(self, rows: tuple[dict, ...]) -> tuple[int, int]:
+        ordered = self._manual_variant_sort(rows, check=self._check)
+        if not ordered:
+            return 0, 0
+        raw = bytes.fromhex(ordered[-1]["raw_hex"])
+        return word(raw, 0), raw[2]
+
+    def _multi_append_option_group(
+        self,
+        *,
+        category: int,
+        bus: int,
+        option_key: int,
+        raw_group: int,
+        raw_choice: int,
+        label_reference: int,
+        terminal_model: int,
+        next_group: int,
+        text: str,
+    ) -> None:
+        assert self.session is not None
+        self._check()
+        label_bytes = self._text(text).data
+        size = 44 + len(label_bytes)
+        if (
+            len(self.session.option_groups) >= 100_000
+            or self.session.option_group_bytes + size > MAX_RECORDER_BYTES
+        ):
+            raise RecorderError("Native multi-option state exceeds host budget")
+        self.session.option_groups.append(
+            _NativeMultiOptionGroup(
+                category,
+                bus,
+                option_key,
+                raw_group,
+                raw_choice,
+                label_reference,
+                terminal_model,
+                next_group,
+                text=text,
+                text_bytes=label_bytes,
+            )
+        )
+        self.session.option_group_bytes += size
+
+    def _multi_create_option_groups(self, rows: tuple[dict, ...]) -> None:
+        assert self.session is not None
+        for vehicle in rows:
+            self._check()
+            raw = bytes.fromhex(vehicle["raw_hex"])
+            option_key = word(raw, 48)
+            records = self.catalog.option_records(option_key)
+            valid, invalid = self._valid_options(option_key, 1)
+            if not valid:
+                raise NativeDrsError(0xC0040101)
+            records = tuple(
+                record
+                for record in records
+                if (word(record, 6), word(record, 8)) not in invalid
+            )
+            if not records:
+                raise NativeDrsError(0xC0040101)
+            for record in records:
+                self._check()
+                label_reference = struct.unpack_from("<I", record)[0]
+                text = self.catalog.language.resolve(label_reference)
+                self._multi_append_option_group(
+                    category=word(raw, 0),
+                    bus=raw[2],
+                    option_key=option_key,
+                    raw_group=word(record, 6),
+                    raw_choice=word(record, 8),
+                    label_reference=label_reference,
+                    terminal_model=word(record, 10),
+                    next_group=word(record, 12),
+                    text=text,
+                )
+
+    def _multi_search_index(
+        self, raw_group: int
+    ) -> tuple[_NativeMultiOptionGroup, ...]:
+        assert self.session is not None
+        if type(raw_group) is not int or not 0 <= raw_group <= 0xFFFF:
+            raise RecorderError("Native multi-option group must be a ushort")
+        output: list[_NativeMultiOptionGroup] = []
+        seen: set[str] = set()
+        for entry in self.session.option_groups:
+            self._check()
+            entry.assigned_index = 0
+            entry.assigned_select = 0
+        for entry in self.session.option_groups:
+            self._check()
+            if entry.raw_group != raw_group:
+                continue
+            entry.assigned_index = raw_group
+            entry.assigned_select = 0
+            if entry.text in seen:
+                continue
+            if len(output) >= 0xFFFF:
+                raise RecorderError("Native multi-option select IDs exceed WORD range")
+            if len(output) >= 100_000:
+                raise RecorderError("Native multi-option output exceeds entry budget")
+            seen.add(entry.text)
+            entry.assigned_select = len(output) + 1
+            output.append(replace(entry))
+        return tuple(output)
+
+    def _multi_option_group(
+        self,
+        output: list[_NativeMultiOptionGroup],
+        option_key: int,
+        raw_group: int,
+        assigned_index: int,
+    ) -> None:
+        assert self.session is not None
+        seen = {entry.text for entry in output}
+        for entry in self.session.option_groups:
+            self._check()
+            if entry.option_key != option_key or entry.raw_group != raw_group:
+                continue
+            entry.assigned_index = assigned_index
+            entry.assigned_select = 0
+            if entry.text in seen:
+                continue
+            if len(output) >= 0xFFFF:
+                raise RecorderError("Native multi-option select IDs exceed WORD range")
+            if len(output) >= 100_000:
+                raise RecorderError("Native multi-option output exceeds entry budget")
+            seen.add(entry.text)
+            entry.assigned_select = len(output) + 1
+            output.append(replace(entry))
+
+    def _multi_search_select(
+        self, index: int, select_id: int
+    ) -> tuple[_NativeMultiOptionGroup, ...]:
+        assert self.session is not None
+        matches = [
+            (position, entry)
+            for position, entry in enumerate(self.session.option_groups)
+            if entry.assigned_index == index and entry.assigned_select == select_id
+        ]
+        if len(matches) != 1:
+            raise NativeDrsError(0xC0040602)
+        position, selected = matches[0]
+        if selected.terminal_model:
+            return (replace(selected),)
+        output: list[_NativeMultiOptionGroup] = []
+        self._multi_option_group(
+            output, selected.option_key, selected.next_group, selected.next_group
+        )
+        sibling_position = position + 1
+        while sibling_position < len(self.session.option_groups):
+            self._check()
+            sibling = self.session.option_groups[sibling_position]
+            if sibling.assigned_index == index and sibling.text == selected.text:
+                self._multi_option_group(
+                    output,
+                    sibling.option_key,
+                    sibling.next_group,
+                    selected.next_group,
+                )
+            sibling_position += 1
+        return tuple(output)
+
+    def _multi_check_protocol_cache(self) -> tuple[int, int, int, int, int]:
+        assert self.session is not None
+        _ = self.owner.connection_entries
+        section = self.catalog.management.sections.get(2)
+        if section is None:
+            raise NativeDrsError(0xA0030107)
+        if section.count > 0x7FFF:
+            raise NativeDrsError(0xA0030110)
+        if len(section.payload) != section.count * 4:
+            raise RecorderError("Malformed native DB102 candidate table")
+        if section.count == 0:
+            raise NativeDrsError(0xC0040101)
+        displayed = self._multi_search_index(1)
+        if not displayed:
+            raise NativeDrsError(0xC0040602)
+        for index in range(section.count):
+            self._check()
+            category, bus = struct.unpack_from("<HB", section.payload, index * 4)
+            if not any(
+                entry.category == category and entry.bus == bus for entry in displayed
+            ):
+                continue
+            category_rows = self.owner.profile.category_records(category)
+            if len(category_rows) != 1:
+                raise NativeDrsError(0xC0040102)
+            protocol = category_rows[0][72]
+            communication = self._manual_protocol_context(category, bus)
+            supported, found = communication.check_connection_buffer()
+            self._check()
+            if found:
+                if supported == 1:
+                    return category, bus, protocol, index, 1
+                continue
+            status = self._manual_null_send(communication)
+            if status == 0:
+                return category, bus, protocol, index, 1
+            self.owner.connect_set(category, 0, bus, protocol)
+            self._check()
+        return 0, 0, 0, 0, 0
+
+    def _multi_selection_output(
+        self,
+        index: int,
+        entries: tuple[_NativeMultiOptionGroup, ...],
+        *,
+        base: NativeVehicleSelection | None = None,
+    ) -> NativeVehicleSelection:
+        self._check()
+        if not entries:
+            raise NativeDrsError(0xC0040602)
+        if len(entries) > 100_000:
+            raise RecorderError("Native multi-option output exceeds entry budget")
+        options = []
+        for entry in entries:
+            self._check()
+            self._append(
+                options,
+                NativeVehicleEntry(
+                    (1, 0), (entry.assigned_select,), self._text(entry.text)
+                ),
+            )
+        result = NativeVehicleSelection(
+            (1, 0),
+            base.vin if base is not None else self._text(""),
+            ((1, 0), (1, 0), (1, 0)),
+            base.select_names if base is not None else (),
+            base.car_info if base is not None else (),
+            tuple(options),
+            (index, 0),
+        )
+        if len(result.encode()) > MAX_RECORDER_BYTES:
+            raise RecorderError("Native multi-option output exceeds byte budget")
+        self._check()
+        self._current = result
+        return result
+
+    def _multi_initial(
+        self,
+        param_index: int,
+        *,
+        base: NativeVehicleSelection | None = None,
+        caller_values: tuple[int, int, int, int] | None = None,
+    ) -> NativeVehicleSelection:
+        assert self.session is not None
+        raw_group = param_index or 1
+        output = self._multi_search_index(raw_group)
+        if not output:
+            raise NativeDrsError(0xC0040602)
+        if param_index == 0:
+            if caller_values is None:
+                self._manual_commit_globals()
+            else:
+                bus, category, protocol, option = caller_values
+                self._manual_commit_globals(
+                    option_value=option,
+                    category_value=category,
+                    bus_value=bus,
+                    protocol_value=protocol,
+                )
+        return self._multi_selection_output(raw_group, output, base=base)
+
+    def _multi_answer(self, index: int, select_id: int) -> NativeVehicleSelection:
+        assert self.session is not None
+        output = self._multi_search_select(index, select_id)
+        if not output:
+            raise NativeDrsError(0xC0040602)
+        if len(output) != 1 or output[0].terminal_model == 0:
+            return self._multi_selection_output(output[0].assigned_index, output)
+        selected = output[0]
+        model, category, bus = (
+            selected.terminal_model,
+            selected.category,
+            selected.bus & 0xFF,
+        )
+        self._consumer_cache_init()
+        self.option_key = 0
+        provider_protocol = self._manual_setup_protocol(category=category)
+        result = self._manual_finish(
+            model,
+            option_value=0,
+            provider_protocol=provider_protocol,
+            category_value=category,
+            bus_value=bus,
+        )
+        return result
+
     def select_categories(
         self,
         selected_ids: tuple[tuple[int, int], ...],
@@ -5672,13 +6080,27 @@ class NativeVehicleSelector:
         except ToyotaCodecError as error:
             raise NativeDrsError(error.code) from error
 
-    def _select_categories(
+    def select_multigroup_categories(
         self,
         selected_ids: tuple[tuple[int, int], ...],
         *,
         bus_judge: int,
     ) -> NativeCategoryMenu:
-        """Execute ordinary18 SelectCarCategory; state is retained on the session."""
+        try:
+            return self._select_categories(
+                selected_ids, bus_judge=bus_judge, multigroup=True
+            )
+        except ToyotaCodecError as error:
+            raise NativeDrsError(error.code) from error
+
+    def _select_categories(
+        self,
+        selected_ids: tuple[tuple[int, int], ...],
+        *,
+        bus_judge: int,
+        multigroup: bool = False,
+    ) -> NativeCategoryMenu:
+        """Execute an admitted18 category producer on the shared owner."""
         if (
             not isinstance(selected_ids, tuple)
             or len(selected_ids) > 100_000
@@ -5698,7 +6120,7 @@ class NativeVehicleSelector:
         if any(level not in (1, 2, 3, 4) for level, _ in selected_ids):
             raise NativeDrsError(0xC0040001)
         session = self._manual_owner()
-        self._manual_admit(bind=True)
+        self._multi_admit(bind=True) if multigroup else self._manual_admit(bind=True)
         self._check()
         selected: list[int] = [0, 0, 0, 0]
         for level, value in selected_ids:
@@ -5711,7 +6133,10 @@ class NativeVehicleSelector:
             current_bus, current_category = session.shared_bus, session.shared_category
             if current_bus == 0xFF and current_category == 0xFFFFFFFF:
                 current_valid = 0
-                category, bus, _protocol, _index = self._except_hv()
+                if multigroup:
+                    category, bus = self._multi_initial_pair()
+                else:
+                    category, bus, _protocol, _index = self._except_hv()
                 session.shared_category = category
                 session.shared_bus = bus
                 current_category, current_bus = category, bus
@@ -5818,6 +6243,12 @@ class NativeVehicleSelector:
                     word(raw, 46),
                 )
             )
+        if multigroup:
+            # Multi1900 owns 1D and clears it after every menu has been built,
+            # including mode0/2 and any later error in output selection.
+            self._check()
+            session.option_groups.clear()
+            session.option_group_bytes = 0
         if current_valid == 0 and (
             (len(surviving) == 1 and bytes.fromhex(surviving[0]["raw_hex"])[2] != 0)
             or (len(surviving) > 1 and max_choices == 1)
@@ -5835,9 +6266,22 @@ class NativeVehicleSelector:
                 or bytes.fromhex(row["raw_hex"])[2] != first_row[2]
                 for row in surviving[1:]
             ):
-                session.shared_category, session.shared_bus = self._manual_probe_pair(
-                    surviving
-                )
+                if multigroup and self._multi_bus_probe_case(surviving):
+                    session.shared_category, session.shared_bus = (
+                        self._manual_probe_pair(surviving)
+                    )
+                elif multigroup:
+                    self._multi_create_option_groups(surviving)
+                    category, bus, _protocol, _index, supported = (
+                        self._multi_check_protocol_cache()
+                    )
+                    if supported != 1:
+                        category, bus = self._multi_fallback_pair(surviving)
+                    session.shared_category, session.shared_bus = category, bus
+                else:
+                    session.shared_category, session.shared_bus = (
+                        self._manual_probe_pair(surviving)
+                    )
                 mode = 1
 
         if mode:
@@ -5864,19 +6308,32 @@ class NativeVehicleSelector:
             0 if self.session.shared_option == 0xFFFF else self.session.shared_option,
         )
 
-    def _manual_commit_globals(self, *, option_value: int | None = None) -> None:
+    def _manual_commit_globals(
+        self,
+        *,
+        option_value: int | None = None,
+        category_value: int | None = None,
+        bus_value: int | None = None,
+        protocol_value: int | None = None,
+    ) -> None:
         assert self.session is not None
         bus, category, protocol, option = self._manual_local_values()
         if option_value is not None:
             option = option_value
+        if category_value is not None:
+            category = category_value
+        if bus_value is not None:
+            bus = bus_value
+        if protocol_value is not None:
+            protocol = protocol_value
         self.session.shared_category = category
         self.session.shared_protocol = protocol
         self.session.shared_option = option
         self.session.shared_bus = bus
 
-    def _manual_setup_protocol(self) -> int:
+    def _manual_setup_protocol(self, *, category: int | None = None) -> int:
         assert self.session is not None
-        category = self.session.shared_category
+        category = self.session.shared_category if category is None else category
         if category in (0, 0xFFFFFFFF):
             return 0
         records = self.owner.profile.category_records(category)
@@ -5921,7 +6378,12 @@ class NativeVehicleSelector:
         return result
 
     def _manual_car_info(
-        self, model: int, provider_protocol: int
+        self,
+        model: int,
+        provider_protocol: int,
+        *,
+        category_value: int | None = None,
+        bus_value: int | None = None,
     ) -> tuple[tuple[NativeVehicleEntry, ...], tuple[NativeVehicleEntry, ...]]:
         assert self.session is not None
         select_names: list[NativeVehicleEntry] = []
@@ -5930,8 +6392,10 @@ class NativeVehicleSelector:
         provider_created = False
         masters: tuple[bytes, ...] | None = None
         info_level = info_value = 0
-        category = self.session.shared_category
-        bus = self.session.shared_bus
+        category = (
+            self.session.shared_category if category_value is None else category_value
+        )
+        bus = self.session.shared_bus if bus_value is None else bus_value
         protocol = provider_protocol & 31
         communication: NativeCommunication | None = None
         phase_supported = protocol in (3, 4, 20, 21)
@@ -6021,12 +6485,23 @@ class NativeVehicleSelector:
         option_value: int = 0,
         provider_protocol: int = 0,
         postlude: bool = True,
+        category_value: int | None = None,
+        bus_value: int | None = None,
     ) -> NativeVehicleSelection:
         assert self.session is not None
         self._reset_budget(b"")
-        select_names, names = self._manual_car_info(model, provider_protocol)
+        select_names, names = self._manual_car_info(
+            model,
+            provider_protocol,
+            category_value=category_value,
+            bus_value=bus_value,
+        )
         # 5BF0 commits only after the provider has formatted all requested IDs.
-        self._manual_commit_globals(option_value=option_value)
+        self._manual_commit_globals(
+            option_value=option_value,
+            category_value=category_value,
+            bus_value=bus_value,
+        )
         self.session.current_model = model
         if self.session.model_list:
             self.session.model_list[0] = model
@@ -6156,6 +6631,9 @@ class NativeVehicleSelector:
                 provider_protocol=provider_protocol,
                 postlude=False,
             )
+            if session.option_groups:
+                self._multi_admit()
+                return self._multi_initial(0, base=base)
             self.option_key = option_key
             result = self._manual_option_output(option_key, 1, base=base)
             if result.trailing_words[1] != 0:
@@ -6164,9 +6642,12 @@ class NativeVehicleSelector:
             return result
         if not model:
             raise NativeDrsError(0xC0040102)
-        return self._manual_finish(
-            model, option_value=0, provider_protocol=provider_protocol
+        result = self._manual_finish(
+            model,
+            option_value=0,
+            provider_protocol=provider_protocol,
         )
+        return result
 
     def _manual_answer(self, group: int, choice: int) -> NativeVehicleSelection:
         assert self.session is not None
@@ -6351,10 +6832,16 @@ class NativeVehicleSelector:
         if car is None:
             car = (
                 ()
-                if self.session is not None and self.session.category_ids and model == 0
+                if self.session is not None
+                and (self.session.category_ids or self.session.option_groups)
+                and model == 0
                 else self._car(model)
             )
-        if self.session is not None and self.session.category_ids and model != 0:
+        if (
+            self.session is not None
+            and (self.session.category_ids or self.session.option_groups)
+            and model != 0
+        ):
             if self.communication is None or not 0 <= self.protocol <= 0xFF:
                 raise RecorderError("Manual resume lost its selected native context")
             selected_bus = self.communication.bus_id
@@ -6370,6 +6857,28 @@ class NativeVehicleSelector:
                 self.session.model_list[0] = model
             else:
                 self.session.model_list.append(model)
+        if self.session is not None and self.session.option_groups and self.option_key:
+            base = NativeVehicleSelection(
+                (1, 0),
+                NativeCoreString((1, 0), vin.split(b"\0", 1)[0] + b"\0"),
+                ((1, 0), (1, 0), (1, 0)),
+                names,
+                tuple(row for row in car if row.values[0] not in (16, 17, 18)),
+                (),
+                (0, model),
+            )
+            self._multi_admit()
+            assert self.communication is not None
+            return self._multi_initial(
+                0,
+                base=base,
+                caller_values=(
+                    self.communication.bus_id,
+                    self.communication.profile.category,
+                    self.protocol,
+                    self.option_key,
+                ),
+            )
         options = ()
         if self.option_key:
             group = group or 1
@@ -6412,16 +6921,20 @@ class NativeVehicleSelector:
             raise RecorderError("Native vehicle context exceeds byte budget")
         self._check()
         self._current = result
+        if (
+            self.session is not None
+            and self.session.option_groups
+            and not self.session.category_ids
+            and model != 0
+        ):
+            self._manual_parent_postlude()
+            self._check()
         return result
 
     def select(self) -> NativeVehicleSelection:
         """Execute an automatic request (Index0), with actual native probes."""
         self._check()
         try:
-            if self.session is not None and self.session.option_groups:
-                raise UnsupportedRecorderOperation(
-                    "Native multi-option session consumption is not admitted"
-                )
             if self.session is not None and self.session.category_ids:
                 self._manual_admit()
                 self._consumer_cache_init()
@@ -6606,9 +7119,21 @@ class NativeVehicleSelector:
         ):
             raise RecorderError("Native option answer must contain ushort integers")
         if self.session is not None and self.session.option_groups:
-            raise UnsupportedRecorderOperation(
-                "Native multi-option session consumption is not admitted"
-            )
+            self._check()
+            self._multi_admit()
+            self._consumer_cache_init()
+            if (
+                group == 0
+                or self.session.shared_bus == 0xFF
+                or self.session.shared_category == 0xFFFFFFFF
+                or self.session.shared_protocol == 0xFF
+                or self.session.shared_option == 0xFFFF
+            ):
+                raise NativeDrsError(0xC0040001)
+            try:
+                return self._multi_answer(group, choice)
+            except ToyotaCodecError as error:
+                raise NativeDrsError(error.code) from error
         if self.session is not None and self.session.category_ids:
             self._check()
             self._manual_admit()
