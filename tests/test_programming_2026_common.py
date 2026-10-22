@@ -2498,6 +2498,83 @@ class ControllerCIDFallbackTests(unittest.TestCase):
         self.assertFalse(controller.alternate_cid_used)
 
 
+class RetryStatePreservationTests(unittest.TestCase):
+    def test_successful_prepare_retry_preserves_failure_and_runs_finish_tail(self):
+        from types import SimpleNamespace
+        from typing import Any, cast
+        from unittest.mock import Mock, patch
+
+        from scripts.programming_2026_common import (
+            NativeParameterBinding2026,
+        )
+
+        engine, controller, session = cast(
+            tuple[Any, Any, Any], ControllerExecuteTests().shell("write")
+        )
+        controller.address_history = ()
+        worker = engine._worker
+        engine._received_identifiers = ()
+        worker.control_state = SimpleNamespace(
+            failed=True,
+            initial_command_retry=False,
+            source_mode=0,
+            native_context_970=True,
+        )
+        errors = Mock()
+        errors.comm_phase = 2
+        engine._dh_state = errors
+        engine.bind_retry_controller = Mock(return_value=Mock())
+        engine._metadata = SimpleNamespace(vehicle={"kindofecu": ""}, cpu_index=0)
+
+        parameter = Mock()
+        parameter.boolean.side_effect = lambda name: {
+            "IGOffRetriableFlag": True,
+            "PrepareRetryFlag": True,
+            "ConfirmAfterEndOfFlashingFlag": True,
+            "ReceiveTimeoutBeforePrepareRetry": 0,
+        }.get(name, False)
+        parameter.long.return_value = 0
+        parameter.parameters.return_value = (("",) * 4, 4)
+        binding = Mock(spec=NativeParameterBinding2026)
+        binding.operation = "write"
+        binding.parameter = parameter
+        binding.metadata = SimpleNamespace(source_container=object())
+        binding.rebind_writer_metadata = Mock()
+        binding.require_control_versions = Mock()
+        session.executed_binding2026 = Mock(return_value=binding)
+        session.next_retry2026 = Mock(return_value=session)
+        session.next_finish2026 = Mock(return_value=session)
+        resolver = Mock()
+        resolver.resolve.return_value = (True, ())
+
+        with (
+            patch.object(controller, "query_control_error"),
+            patch.object(
+                controller,
+                "run_bound_export",
+                side_effect=(
+                    {"native_return": True, "state": "prepare_retry_completed"},
+                    {"native_return": True, "state": "finish_completed"},
+                ),
+            ) as run_export,
+            patch(
+                "scripts.j2534_2026.communication_addresses_from_parameter",
+                return_value=resolver,
+            ),
+        ):
+            result = controller.retry_failed_write(engine, session)
+
+        self.assertEqual(
+            [item["state"] for item in result["exports"]],
+            ["prepare_retry_completed", "finish_completed"],
+        )
+        self.assertTrue(result["retry_decision"])
+        self.assertEqual(run_export.call_count, 2)
+        worker.clear_post_write_state.assert_not_called()
+        worker.finish_recovery_probe.assert_called_once_with(controller)
+        errors.record_native_error.assert_any_call(None, 0, 0)
+
+
 class ControllerExecuteTests(unittest.TestCase):
     def shell(self, operation, *, contact="CAN", worker_phase=None):
         from types import SimpleNamespace

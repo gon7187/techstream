@@ -3873,7 +3873,6 @@ class ControlCommPhase2026:
             reports.append(report)
             if returned:
                 errors.record_native_error(None, 0, 0)
-                worker.clear_post_write_state()
                 break
             if not (parameter.boolean("FlagToNonSetEerrorKindConnect") or False):
                 worker.set_control_error_kind(5 if checkpoint else 3)

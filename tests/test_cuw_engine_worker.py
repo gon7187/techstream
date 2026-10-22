@@ -3,6 +3,7 @@ import io
 import json
 import struct
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
@@ -1222,6 +1223,81 @@ class EngineWorker2026Tests(unittest.TestCase):
         self.assertEqual(worker.control_state.lifecycle, "ready")
         self.assertFalse(worker.source_state.complete)
         session.trace.assert_complete()
+
+
+class GatewayCacheCallbackTests(unittest.TestCase):
+    def test_callback24_publishes_engine_cache_for_callback25_after_worker_change(self):
+        from scripts.cuw_engine_worker import EngineWorker2026
+
+        engine = object.__new__(CUWEngine2026)
+        engine._active = True
+        engine._phase_thread = threading.get_ident()
+        engine._gateway_classifier_cache = 0
+        engine._persistence = None
+        engine._repro_gateway_node = 0
+
+        def worker():
+            result = object.__new__(EngineWorker2026)
+            result._engine = engine
+            result._lock = threading.RLock()
+            result._closed = False
+            result.validate_source = lambda engine=None: None
+            return result
+
+        first = worker()
+        engine._worker = first
+        for value in (1, 2, 255):
+            with self.subTest(value=value):
+                first.record_callback_24(value)
+                self.assertEqual(engine.native_gateway_cache, value)
+
+                replacement = worker()
+                engine._worker = replacement
+                replacement.publish_callback_25_gateway_node()
+                self.assertEqual(engine.repro_gateway_node, value)
+                self.assertEqual(engine.native_gateway_cache, value)
+                first = replacement
+
+    def test_callback24_rejects_invalid_value_before_cache_mutation(self):
+        from scripts.cuw_engine_worker import EngineWorker2026
+
+        engine = object.__new__(CUWEngine2026)
+        engine._active = True
+        engine._phase_thread = threading.get_ident()
+        engine._gateway_classifier_cache = 7
+        engine._persistence = None
+        worker = object.__new__(EngineWorker2026)
+        worker._engine = engine
+        worker._lock = threading.RLock()
+        worker._closed = False
+        worker.validate_source = lambda engine=None: None
+        engine._worker = worker
+
+        with self.assertRaises(ValueError):
+            worker.record_callback_24(True)
+        self.assertEqual(engine.native_gateway_cache, 7)
+
+    def test_callback24_rejects_noncurrent_worker_before_cache_mutation(self):
+        from scripts.cuw_engine_worker import EngineWorker2026
+
+        engine = object.__new__(CUWEngine2026)
+        engine._active = True
+        engine._phase_thread = threading.get_ident()
+        engine._gateway_classifier_cache = 7
+        engine._persistence = None
+
+        def worker():
+            result = object.__new__(EngineWorker2026)
+            result._engine = engine
+            result._lock = threading.RLock()
+            result._closed = False
+            result.validate_source = lambda engine=None: None
+            return result
+
+        engine._worker = worker()
+        with self.assertRaisesRegex(ValueError, "source-issued worker"):
+            worker().record_callback_24(2)
+        self.assertEqual(engine.native_gateway_cache, 7)
 
 
 if __name__ == "__main__":

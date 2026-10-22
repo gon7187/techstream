@@ -24,6 +24,7 @@ AUTHORED_CALLER_SHA256 = (
     "ecba533aeaa2ec2a014fa59a113d025a8efe90338767c2786b8a5a891ca0f599"
 )
 AUTHORED_MODULE_BYTES = b"authored native procedure integration fixture"
+_FIXTURE_OWNERSHIP = threading.Lock()
 DCM_UTILITY_GROUP = 0x1352
 BSM_UTILITY_GROUP = 0x134A
 DCM_TEXT_IDENTIFIERS = (
@@ -144,37 +145,54 @@ class AuthoredNativeUtility:
         libraries.caller_sha256 = AUTHORED_CALLER_SHA256
         libraries.engine = engine
 
+        if not _FIXTURE_OWNERSHIP.acquire(blocking=False):
+            raise RuntimeError("An authored native utility fixture is already active")
         self._sources = SOURCES
         self._digest = digest
+        self._had_source = digest in SOURCES
         self._previous_source = SOURCES.get(digest)
-        SOURCES[digest] = "TY18"
         self._body_module = utility_ex_ty_body
         self._previous_body_sha = utility_ex_ty_body.SHA_18_TY
-        if dcm_value is not None:
-            utility_ex_ty_body.SHA_18_TY = digest
-        self.runtime = NativeUtilityRuntime(libraries)
-        self.events = events
-        self.entered = entered
+        self._close_lock = threading.Lock()
         self.closed = False
+        try:
+            SOURCES[digest] = "TY18"
+            if dcm_value is not None:
+                utility_ex_ty_body.SHA_18_TY = digest
+            self.runtime = NativeUtilityRuntime(libraries)
+            self.events = events
+            self.entered = entered
+        except BaseException:
+            self._restore_globals()
+            _FIXTURE_OWNERSHIP.release()
+            raise
+
+    def _restore_globals(self) -> None:
+        if self._had_source:
+            self._sources[self._digest] = cast(str, self._previous_source)
+        else:
+            self._sources.pop(self._digest, None)
+        self._body_module.SHA_18_TY = self._previous_body_sha
 
     def close(self) -> None:
         """Release the temporary source registry and the authored worker."""
-        if self.closed:
-            return
-        self.closed = True
-        try:
+        with self._close_lock:
+            if self.closed:
+                return
             worker = self.runtime.libraries.engine.worker
-            if worker._thread is not None:
-                if self.runtime.done:
-                    worker.stop()
-                else:
-                    self.runtime.cancel()
-        finally:
-            if self._previous_source is None:
-                self._sources.pop(self._digest, None)
-            else:
-                self._sources[self._digest] = self._previous_source
-            self._body_module.SHA_18_TY = self._previous_body_sha
+            try:
+                if worker._thread is not None:
+                    if self.runtime.done:
+                        worker.stop()
+                    else:
+                        self.runtime.cancel()
+                if worker._thread is not None:
+                    raise RuntimeError("Authored native utility worker remains active")
+            finally:
+                if worker._thread is None:
+                    self._restore_globals()
+                    self.closed = True
+                    _FIXTURE_OWNERSHIP.release()
 
     def __enter__(self) -> Self:
         return self

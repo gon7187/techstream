@@ -125,6 +125,113 @@ class AuthoredNativeUtilityTests(unittest.TestCase):
             AuthoredNativeUtility(dcm_value=256)
 
 
+class AuthoredFixtureOwnershipTests(unittest.TestCase):
+    def test_overlapping_fixture_is_rejected_without_disturbing_first(self):
+        first = AuthoredNativeUtility(dcm_value=0)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "fixture is already active"):
+                AuthoredNativeUtility(dcm_value=7)
+            runtime = first.runtime
+            runtime.start(0x13723)
+            runtime.progress(1000)
+            self.assertEqual((runtime.result, runtime.status), (0, "completed"))
+        finally:
+            first.close()
+
+    def test_close_restores_preexisting_registry_and_body_values(self):
+        from scripts import utility_ex_ty_body
+        from scripts.utility_ex import SOURCES
+
+        digest = hashlib.sha256(AUTHORED_MODULE_BYTES).hexdigest()
+        prior_source = SOURCES.get(digest)
+        prior_body = utility_ex_ty_body.SHA_18_TY
+        SOURCES[digest] = "preexisting"
+        utility_ex_ty_body.SHA_18_TY = "preexisting-body"
+        try:
+            fixture = AuthoredNativeUtility(dcm_value=0)
+            fixture.close()
+            fixture.close()
+            self.assertEqual(SOURCES[digest], "preexisting")
+            self.assertEqual(utility_ex_ty_body.SHA_18_TY, "preexisting-body")
+        finally:
+            if prior_source is None:
+                SOURCES.pop(digest, None)
+            else:
+                SOURCES[digest] = prior_source
+            utility_ex_ty_body.SHA_18_TY = prior_body
+
+    def test_constructor_failure_releases_fixture_ownership(self):
+        from unittest.mock import patch
+
+        from scripts import utility_ex_ty_body
+        from scripts.utility_ex import SOURCES
+
+        digest = hashlib.sha256(AUTHORED_MODULE_BYTES).hexdigest()
+        prior_source = SOURCES.get(digest)
+        prior_body = utility_ex_ty_body.SHA_18_TY
+        with (
+            patch(
+                "scripts.utility.NativeUtilityRuntime",
+                side_effect=RuntimeError("runtime construction failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "construction failed"),
+        ):
+            AuthoredNativeUtility(dcm_value=0)
+        self.assertEqual(SOURCES.get(digest), prior_source)
+        self.assertEqual(utility_ex_ty_body.SHA_18_TY, prior_body)
+        fixture = AuthoredNativeUtility(dcm_value=0)
+        fixture.close()
+
+    def test_failed_worker_stop_retains_fixture_ownership_for_retry(self):
+        from unittest.mock import patch
+
+        from scripts.utility_ex import SOURCES
+
+        digest = hashlib.sha256(AUTHORED_MODULE_BYTES).hexdigest()
+        fixture = AuthoredNativeUtility(hold=True)
+        runtime = fixture.runtime
+        runtime.start(0x1381D)
+        self.assertTrue(fixture.entered.wait(1))
+        try:
+            with (
+                patch.object(
+                    runtime.libraries.engine.worker,
+                    "stop",
+                    side_effect=TimeoutError("injected stop timeout"),
+                ),
+                self.assertRaisesRegex(TimeoutError, "injected stop timeout"),
+            ):
+                fixture.close()
+            self.assertIsNotNone(runtime.libraries.engine.worker._thread)
+            self.assertEqual(SOURCES[digest], "TY18")
+            with self.assertRaisesRegex(RuntimeError, "fixture is already active"):
+                AuthoredNativeUtility()
+        finally:
+            fixture.close()
+        self.assertIsNone(runtime.libraries.engine.worker._thread)
+        self.assertNotIn(digest, SOURCES)
+
+    def test_worker_failure_releases_fixture_after_join_and_propagates(self):
+        from scripts.utility_ex import SOURCES
+
+        digest = hashlib.sha256(AUTHORED_MODULE_BYTES).hexdigest()
+        fixture = AuthoredNativeUtility(fault=True)
+        runtime = fixture.runtime
+        runtime.start(0x1381D)
+        worker = runtime.libraries.engine.worker
+        thread = worker._thread
+        assert thread is not None
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        with self.assertRaisesRegex(OSError, "authored exchange fault"):
+            fixture.close()
+        self.assertTrue(fixture.closed)
+        self.assertIsNone(worker._thread)
+        self.assertNotIn(digest, SOURCES)
+        replacement = AuthoredNativeUtility()
+        replacement.close()
+
+
 class AuthoredUtilityGroupTextTests(unittest.TestCase):
     def test_selected_and_common_identifiers_resolve_in_their_own_groups(self):
         files = create_utility_group_text_examples(

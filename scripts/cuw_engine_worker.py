@@ -409,7 +409,6 @@ class EngineWorker2026:
         )
         self._retained_cpu_type = ""
         self._prepare_handshake = 0
-        self._callback_24_state = 0
         self._callback_28_state = 0
         self._callback_47_state = 0
         self._battery_voltage: float | None = None
@@ -479,7 +478,6 @@ class EngineWorker2026:
             self._cpu_offset = previous._cpu_offset
             self._progress_base = previous._progress_base
             self._retained_cpu_type = previous._retained_cpu_type
-            self._callback_24_state = previous._callback_24_state
             self._callback_28_state = previous._callback_28_state
             self._callback_47_state = previous._callback_47_state
             self._battery_voltage = previous._battery_voltage
@@ -832,7 +830,7 @@ class EngineWorker2026:
                 self._complete,
                 tuple(self._phase_elapsed_ms),
                 self._pending_continuation is not None,
-                self._callback_24_state,
+                self._engine.native_gateway_cache,
                 self._callback_28_state,
                 self._callback_47_state,
                 tuple(self._cpu_percentages),
@@ -1392,7 +1390,6 @@ class EngineWorker2026:
         with self._lock:
             self._retained_cpu_type = ""
             self._prepare_handshake = 0
-            self._callback_24_state = 0
             self._callback_28_state = 0
             self._callback_47_state = 0
             self._battery_voltage = None
@@ -1518,10 +1515,11 @@ class EngineWorker2026:
         return value
 
     def record_callback_24(self, value: int) -> None:
-        """58ab0 stores callback24's raw gateway-classifier byte."""
+        """58ab0 stores callback24's raw byte in the engine-owned ED0C cache."""
         self._engine._require_owned_phase()
         with self._lock:
-            self._callback_24_state = self._callback_byte(value)
+            self.validate_source()
+            self._engine._publish_callback_24_gateway_cache(worker=self, value=value)
 
     def publish_callback_25_gateway_node(self) -> None:
         """58b40 callback25 copies cached DAT8ed0c into typData990/BF9."""

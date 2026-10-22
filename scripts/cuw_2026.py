@@ -2931,6 +2931,13 @@ class CUWEngine2026:
             raise ValueError("Actual source-issued worker required for gateway cache")
         self._assign_gateway_classifier_cache(self.repro_gateway_node)
 
+    def _publish_callback_24_gateway_cache(self, *, worker, value: int) -> None:
+        """58ab0 callback24 assigns its raw byte to persistent ED0C."""
+        self._require_owned_phase()
+        if worker is not self.worker:
+            raise ValueError("Actual source-issued worker required for gateway cache")
+        self._assign_gateway_classifier_cache(value)
+
     def _reset_gateway_classifier_cache_for_cleanup(self, cleanup) -> None:
         """23630 zeroes ED0C as part of the actual recovery aggregate reset."""
         self._validate_cleanup_controller(cleanup)

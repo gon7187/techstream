@@ -14,22 +14,41 @@ from pathlib import Path
 from typing import Any
 
 _PRIVATE_ROOTS = ("analysis", "artifacts", ".unlazy")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _canonical_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = _REPO_ROOT / candidate
+    return candidate.resolve()
 
 
 def _is_private(path: str | Path) -> bool:
-    parts = Path(path).parts
-    if any(root in parts for root in _PRIVATE_ROOTS):
+    candidate = _canonical_path(path)
+    repo_root = _REPO_ROOT.resolve()
+    try:
+        parts = candidate.relative_to(repo_root).parts
+    except ValueError:
+        return False
+    if parts and parts[0] in _PRIVATE_ROOTS:
         return True
-    return "runtime" in parts and any(part.startswith("no-car-") for part in parts)
+    return (
+        len(parts) >= 2
+        and parts[0] == "runtime"
+        and parts[1].startswith("no-car-")
+        and len(parts[1]) > len("no-car-")
+    )
 
 
 def require_private(*paths: str | Path) -> None:
     """Skip the current test when any required private path is absent."""
     missing = []
     for path in paths:
-        if not _is_private(path):
+        candidate = _canonical_path(path)
+        if not _is_private(candidate):
             raise AssertionError(f"Not a private evidence path: {path}")
-        if not Path(path).exists():
+        if not candidate.exists():
             missing.append(str(path))
     if missing:
         shown = ", ".join(missing[:3])
@@ -39,13 +58,15 @@ def require_private(*paths: str | Path) -> None:
 
 
 def read_private_bytes(path: str | Path) -> bytes:
-    require_private(path)
-    return Path(path).read_bytes()
+    candidate = _canonical_path(path)
+    require_private(candidate)
+    return candidate.read_bytes()
 
 
 def read_private_text(path: str | Path, *, encoding: str = "utf-8") -> str:
-    require_private(path)
-    return Path(path).read_text(encoding=encoding)
+    candidate = _canonical_path(path)
+    require_private(candidate)
+    return candidate.read_text(encoding=encoding)
 
 
 def read_private_json(path: str | Path) -> Any:
