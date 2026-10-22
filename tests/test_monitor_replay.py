@@ -3,15 +3,19 @@
 import copy
 import hashlib
 import json
+import shutil
 import struct
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from test_monitor_variable import authored_profile
 
+from scripts.data_monitor import MonitorError
 from scripts.demo import _ddb
+from scripts.drive_recorder import NativeTriggerInfo, NativeTriggerParameters
 from scripts.frame_transport import J2534Result, NativeMessage
 from scripts.monitor_replay import (
     SCHEMA,
@@ -1405,6 +1409,690 @@ def add_primary(source, context, category):
         "diagnostic_mode_hex": context["diagnostic_mode_hex"],
         "initial_request_hex": context["initial_request_hex"],
     }
+
+
+class NativeVehicleReplayTests(unittest.TestCase):
+    def native_vehicle_document(self, root: Path) -> tuple[Path, dict]:
+        from test_drive_recorder import NativeMultiCategory18Tests
+
+        from scripts.data_monitor import select_provider
+        from scripts.profiles import VehicleCatalog
+
+        helper = NativeMultiCategory18Tests()
+        communication, _backend = helper.multi_runtime()
+        self.addCleanup(helper.doCleanups)
+        multi_root = communication.profile.catalog.root
+        template_root, document = authored_document(root / "template")
+        catalog_root = root / "native-source"
+        catalog_root.mkdir(parents=True, exist_ok=True)
+        for name in ("Toyota.ddb", "M_English.ddb", "DemoEngine.ddb"):
+            shutil.copyfile(template_root / name, catalog_root / name)
+        base_catalog = VehicleCatalog(catalog_root)
+        multi_catalog = VehicleCatalog(multi_root)
+        sections = {
+            index: (section.count, section.payload)
+            for index, section in base_catalog.management.sections.items()
+        }
+        frame_count, frame_rows = sections[17]
+        sections[17] = (
+            frame_count + 1,
+            struct.pack("<4H", 0, 1, 0, 0) + frame_rows,
+        )
+        multi_sections = multi_catalog.management.sections
+        section = multi_sections[2]
+        sections[2] = (section.count, section.payload)
+        primary_category = sections[16][1][:76]
+        multi_category = multi_sections[16].payload[76:152]
+        sections[16] = (2, primary_category + multi_category)
+        for index in (41, 42):
+            section = multi_sections[index]
+            sections[index] = (section.count, section.payload)
+        dll_section = multi_sections[19]
+        sections[19] = (dll_section.count, dll_section.payload)
+        (catalog_root / "Toyota.ddb").write_bytes(_ddb(1, sections))
+        profile = VehicleCatalog(catalog_root).build_profile(1)
+        context = document["context"]
+        context.update(
+            category=profile.category,
+            vehicle_name_key=None,
+            controller_flags=profile.category_record[72],
+            native_variant="normal",
+        )
+        provider = select_provider(
+            profile.category_record[72],
+            context["selection"]["communication_protocol"],
+            context["selection"]["attribute_3_31"],
+        )
+        context["module_ids"] = dict(monitor_module_ids(18, provider))
+        context["source_files"] = {
+            name: hashlib.sha256((catalog_root / name).read_bytes()).hexdigest()
+            for name in ("Toyota.ddb", "M_English.ddb", profile.filename)
+        }
+        document["events"] = []
+        return catalog_root, document
+
+    @staticmethod
+    def selection_path(replay: MonitorReplay, *, choose_categories: bool = False):
+        menu = replay.native_categories((), bus_judge=0)
+        if choose_categories:
+            selected_ids = tuple(
+                (item.level, choice.value)
+                for item in menu.items
+                for choice in item.choices
+            )
+            menu = replay.native_categories(selected_ids, bus_judge=0)
+        offered = replay.native_select()
+        if offered.trailing_words[1] == 0:
+            return (
+                menu,
+                offered,
+                replay.native_answer(
+                    offered.trailing_words[0], offered.options[0].values[0]
+                ),
+            )
+        return menu, offered, offered
+
+    def authored_native_close_document(self, directory: Path) -> tuple[Path, dict]:
+        case = NativeVehicleReplayTests()
+        self.addCleanup(case.doCleanups)
+        source, document = case.native_vehicle_document(directory)
+        capture = AuthoredCapture(document)
+        replay = MonitorReplay(capture, source)
+        replay.begin_native_vehicle(info_ids=(), text_encoding="ascii")
+        self.selection_path(replay, choose_categories=True)
+        replay.close_native_vehicle()
+        document["events"] = capture.captured
+        return source, document
+
+    def replay_native_close_document(
+        self, source: Path, document: dict
+    ) -> MonitorReplay:
+        replay = MonitorReplay(
+            MonitorRecording.loads(json.dumps(document).encode()), source
+        )
+        replay.begin_native_vehicle(info_ids=(), text_encoding="ascii")
+        self.selection_path(replay, choose_categories=True)
+        return replay
+
+    @staticmethod
+    def append_disconnect_retry(document: dict) -> None:
+        disconnects = [
+            event for event in document["events"] if event["operation"] == "disconnect"
+        ]
+        if len(disconnects) != 1:
+            raise AssertionError(
+                f"Expected one authored close event, got {len(disconnects)}"
+            )
+        retry = copy.deepcopy(disconnects[0])
+        disconnects[0]["result"]["code"] = 9
+        document["events"].append(retry)
+
+    def test_actual_multi48_selection_and_ordered_option_ids_replay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_root, document = self.native_vehicle_document(Path(directory))
+            author = AuthoredCapture(document)
+            capture = MonitorReplay(author, source_root)
+            capture.begin_native_vehicle(info_ids=(), text_encoding="ascii")
+            menu, offered, terminal = self.selection_path(capture)
+            self.assertEqual(menu.mode, 1)
+            self.assertEqual(tuple(item.level for item in menu.items), (1, 2, 3, 4))
+            self.assertEqual(
+                tuple(item.choices[0].value for item in menu.items), (1, 1, 1, 1)
+            )
+            self.assertEqual(offered.trailing_words[1], 0)
+            self.assertEqual(
+                (offered.trailing_words[0], offered.options[0].values[0]), (1, 1)
+            )
+            self.assertEqual(terminal.trailing_words, (0, 10001))
+            capture.close_native_vehicle()
+            document["events"] = author.captured
+
+            replay = MonitorReplay(
+                MonitorRecording.loads(json.dumps(document).encode()), source_root
+            )
+            replay.begin_native_vehicle(info_ids=(), text_encoding="ascii")
+            replay_menu, replay_offered, replay_terminal = self.selection_path(replay)
+            self.assertEqual(replay_menu, menu)
+            self.assertEqual(replay_offered, offered)
+            self.assertEqual(replay_terminal, terminal)
+            replay.close_native_vehicle()
+            replay.recording.assert_complete()
+
+    def test_native_selection_rejects_wrong_source_before_consuming(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_root, document = authored_document(Path(directory), build=12)
+            replay = MonitorReplay(
+                MonitorRecording.loads(json.dumps(document).encode()), source_root
+            )
+            from scripts.drive_recorder import UnsupportedRecorderOperation
+
+            with self.assertRaisesRegex(
+                UnsupportedRecorderOperation, "source18 normal device8"
+            ):
+                replay.begin_native_vehicle(info_ids=(4,), text_encoding="ascii")
+            self.assertEqual(replay.recording.position, 0)
+            self.assertEqual(replay.outputs, {})
+
+    def test_native_run_requires_selection_binding_and_typed_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_root, document = self.native_vehicle_document(Path(directory))
+            author = AuthoredCapture(document)
+            replay = MonitorReplay(author, source_root)
+            replay.begin_native_vehicle(info_ids=(), text_encoding="ascii")
+            with self.assertRaisesRegex(ValueError, "terminal selection"):
+                replay.run()
+            self.assertEqual(replay.recording.position, 0)
+            self.assertFalse(replay.used)
+            replay.close_native_vehicle()
+
+    def test_native_actual_selection_retained_context_worker_and_drs_replay(self):
+        trigger = NativeTriggerInfo((1, 0), 1, 1, 0)
+        parameters = NativeTriggerParameters((1, 0), 1, 0, (1, 0), (), (1, 0), ())
+        with tempfile.TemporaryDirectory() as directory:
+            recording_path, source_root = write_native_vehicle_smoke_fixture(
+                Path(directory), trigger=trigger, parameters=parameters
+            )
+            document = json.loads(recording_path.read_text(encoding="utf-8"))
+            events = document["events"]
+            self.assertTrue(any(event["operation"] == "connect" for event in events))
+            self.assertTrue(
+                any(event["operation"] == "write_messages" for event in events)
+            )
+            self.assertTrue(
+                any(event["operation"] == "read_messages" for event in events)
+            )
+            self.assertTrue(
+                any(
+                    event["operation"] == "write_messages"
+                    and event["request"]["messages"][0]["data"]["bytes"].endswith("13")
+                    for event in events
+                )
+            )
+            self.assertTrue(
+                any(event["operation"] == "stop_message_filter" for event in events)
+            )
+            self.assertTrue(any(event["operation"] == "disconnect" for event in events))
+            self.assertEqual(
+                sum(event["operation"] == "connect" for event in events), 1
+            )
+            replay = MonitorReplay(
+                MonitorRecording.loads(recording_path.read_bytes()), source_root
+            )
+            replay.begin_native_vehicle(info_ids=(), text_encoding="ascii")
+            position, elapsed = replay.recording.position, replay.recording.clock()
+            time.sleep(0.01)
+            self.assertEqual(
+                (replay.recording.position, replay.recording.clock()),
+                (position, elapsed),
+            )
+            menu, offered, terminal = self.selection_path(
+                replay, choose_categories=True
+            )
+            selection_session = replay._native_vehicle
+            if selection_session is None:
+                self.fail("Native selection session was not retained")
+            selection_controller: Any = selection_session.communication.operations
+            selection_lower: Any = selection_controller.operations
+            self.assertIsNotNone(selection_lower.channel)
+            self.assertEqual(
+                sum(event["operation"] == "connect" for event in events), 1
+            )
+            self.assertFalse(
+                any(
+                    event["operation"] == "disconnect"
+                    for event in events[: replay.recording.position]
+                )
+            )
+            self.assertEqual(
+                tuple(item.choices[0].value for item in menu.items), (1, 1, 1, 1)
+            )
+            self.assertEqual(terminal.trailing_words, (0, 10001))
+            self.assertEqual(
+                (offered.trailing_words[0], offered.options[0].values[0]), (1, 1)
+            )
+            replay.bind_native_vehicle_system(1)
+            bound_communication = replay._native_bound_communication
+            if bound_communication is None:
+                self.fail("Bound native communication was not retained")
+            self.assertIs(bound_communication.operations, selection_controller)
+            self.assertIsNotNone(selection_lower.channel)
+            report = replay.run(trigger=trigger, parameters=parameters)
+            replay.recording.assert_complete()
+            self.assertEqual(report["status"], "completed")
+            self.assertIsNone(selection_lower.channel)
+            self.assertEqual(replay.close_native_vehicle(), 0)
+            self.assertEqual(set(replay.outputs), {"monitor", "recording"})
+            self.assertEqual(
+                replay.output_formats, {"monitor": "dm", "recording": "drs"}
+            )
+            self.assertEqual(
+                replay.outputs["monitor"],
+                Path(directory, "expected-monitor.dm").read_bytes(),
+            )
+            self.assertEqual(
+                replay.outputs["recording"],
+                Path(directory, "expected-recording.drs").read_bytes(),
+            )
+            dm_path = Path(directory, "monitor.dm")
+            drs_path = Path(directory, "recording.drs")
+            replay.save_dm(dm_path)
+            replay.save_output(drs_path, stream="recording")
+            self.assertEqual(dm_path.read_bytes(), replay.outputs["monitor"])
+            self.assertEqual(drs_path.read_bytes(), replay.outputs["recording"])
+
+    def test_native_phase4_formatter_acquisition_replays_with_artifacts(self):
+        import dataclasses
+
+        values = dict(
+            zip(
+                (*range(40, 53), 54, 55, 56, 53, 57),
+                (*b"ENG0001", *b"123456", 9, 1, 124, 8, 2),
+                strict=True,
+            )
+        )
+        replies = {
+            bytes((0x21, function)): bytes((0x61, value))
+            for function, value in values.items()
+        }
+        trigger = NativeTriggerInfo((1, 0), 1, 1, 0)
+        parameters = NativeTriggerParameters((1, 0), 1, 0, (1, 0), (), (1, 0), ())
+
+        with tempfile.TemporaryDirectory() as directory:
+            case = NativeVehicleReplayTests()
+            self.addCleanup(case.doCleanups)
+            source, document = case.native_vehicle_document(Path(directory))
+            from scripts.demo import _ddb
+            from scripts.profiles import VehicleCatalog
+
+            catalog = VehicleCatalog(source)
+            sections = {
+                key: (section.count, section.payload)
+                for key, section in catalog.management.sections.items()
+            }
+            count, payload = sections[0]
+            requests = []
+            for index in range(count):
+                offset, size = struct.unpack_from("<IH", payload, index * 6)
+                requests.append(payload[count * 6 + offset : count * 6 + offset + size])
+
+            def add_request(request: bytes) -> int:
+                requests.append(request)
+                return len(requests)
+
+            mask_ref = add_request(b"\x00\xff")
+            check_ref = add_request(b"\x61")
+            frame_count, frame_payload = sections[17]
+            function_count, function_payload = sections[18]
+            frames = bytearray(frame_payload)
+            functions = [
+                function_payload[index : index + 16]
+                for index in range(0, len(function_payload), 16)
+            ]
+            for function in values:
+                request_ref = add_request(bytes((0x21, function)))
+                frame_key = 0x500 + function
+                frames.extend(
+                    struct.pack("<4H", frame_key, request_ref, mask_ref, check_ref)
+                )
+                functions.append(
+                    struct.pack("<8H", 1, function, 1, frame_key, 0, 1, 0, 0)
+                )
+            functions.sort(key=lambda row: struct.unpack_from("<2H", row))
+            directory_bytes, request_bytes = bytearray(), bytearray()
+            for request in requests:
+                directory_bytes += struct.pack("<IH", len(request_bytes), len(request))
+                request_bytes += request
+            sections[0] = (
+                len(requests),
+                bytes(directory_bytes + request_bytes),
+            )
+            sections[17] = (frame_count + len(values), bytes(frames))
+            sections[18] = (function_count + len(values), b"".join(functions))
+            (source / "Toyota.ddb").write_bytes(_ddb(1, sections))
+            document["context"]["source_files"] = {
+                name: hashlib.sha256((source / name).read_bytes()).hexdigest()
+                for name in document["context"]["source_files"]
+            }
+
+            class Capture(AuthoredCapture):
+                def consume(self, kind, operation, request):
+                    result = cast(
+                        J2534Result, super().consume(kind, operation, request)
+                    )
+                    if (
+                        kind == "sdk"
+                        and operation == "read_messages"
+                        and self.request in replies
+                    ):
+                        message = dataclasses.replace(
+                            result.messages[0],
+                            data=b"\0\0\x07\xe8" + replies[self.request],
+                        )
+                        result = dataclasses.replace(result, messages=(message,))
+                        self.captured[-1]["result"] = sdk_value(result)
+                    return result
+
+            capture = Capture(document)
+            replay = MonitorReplay(capture, source)
+            replay.begin_native_vehicle(
+                info_ids=(1, 2, 3, 4, 16, 17), text_encoding="ascii"
+            )
+            _, offered, terminal = self.selection_path(replay, choose_categories=True)
+            self.assertEqual(offered.trailing_words, (1, 0))
+            self.assertEqual(terminal.trailing_words, (0, 10001))
+            self.assertEqual(
+                {entry.values[0]: entry.text.data for entry in terminal.car_info},
+                {
+                    1: b"ENG0001\0",
+                    2: b"123456\0",
+                    3: b"2024\0",
+                    4: b"Demo Model\0",
+                },
+            )
+            observed = [
+                bytes.fromhex(event["request"]["messages"][0]["data"]["bytes"])[4:]
+                for event in capture.captured
+                if event["operation"] == "write_messages"
+            ]
+            self.assertEqual(
+                [request for request in observed if request in replies], list(replies)
+            )
+            replay.bind_native_vehicle_system(1)
+            replay.run(trigger=trigger, parameters=parameters)
+            document["events"] = capture.captured
+
+            strict = MonitorReplay(
+                MonitorRecording.loads(json.dumps(document).encode()), source
+            )
+            strict.begin_native_vehicle(
+                info_ids=(1, 2, 3, 4, 16, 17), text_encoding="ascii"
+            )
+            _, _, strict_terminal = self.selection_path(strict, choose_categories=True)
+            self.assertEqual(strict_terminal, terminal)
+            strict.bind_native_vehicle_system(1)
+            strict.run(trigger=trigger, parameters=parameters)
+            strict.recording.assert_complete()
+            self.assertEqual(strict.outputs, replay.outputs)
+            self.assertIn("monitor", strict.outputs)
+            self.assertIn("recording", strict.outputs)
+
+    def test_native_cancel_and_close_fault_publish_no_artifacts(self):
+        trigger = NativeTriggerInfo((1, 0), 1, 1, 0)
+        parameters = NativeTriggerParameters((1, 0), 1, 0, (1, 0), (), (1, 0), ())
+        for fault in ("cancel", "close"):
+            with (
+                self.subTest(fault=fault),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path, source_root = write_native_vehicle_smoke_fixture(
+                    Path(directory), trigger=trigger, parameters=parameters
+                )
+                document = json.loads(path.read_text(encoding="utf-8"))
+                event = next(
+                    event
+                    for event in reversed(document["events"])
+                    if event["operation"]
+                    == ("read_messages" if fault == "cancel" else "disconnect")
+                )
+                if fault == "cancel":
+                    event["result"]["host_boundary"] = "cancelled_after"
+                else:
+                    event["result"]["code"] = 9
+                    retry = copy.deepcopy(event)
+                    retry["result"]["code"] = 0
+                    document["events"].append(retry)
+                recording = MonitorRecording(document)
+                replay = MonitorReplay(recording, source_root)
+                replay.begin_native_vehicle(info_ids=(), text_encoding="ascii")
+                self.selection_path(replay, choose_categories=True)
+                replay.bind_native_vehicle_system(1)
+                expected = InterruptedError if fault == "cancel" else MonitorError
+                with self.assertRaises(expected):
+                    replay.run(trigger=trigger, parameters=parameters)
+                self.assertEqual(recording.position, len(document["events"]))
+                self.assertEqual(replay.outputs, {})
+                self.assertIsNone(replay.dm_bytes)
+                self.assertFalse(replay.native_vehicle_cleanup_pending)
+                self.assertEqual(replay.close_native_vehicle(), 0)
+
+    def test_source_mutation_blocks_requests_but_still_closes_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_root, document = self.native_vehicle_document(Path(directory))
+            author = AuthoredCapture(document)
+            replay = MonitorReplay(author, source_root)
+            replay.begin_native_vehicle(info_ids=(), text_encoding="ascii")
+            language = source_root / "M_English.ddb"
+            language.write_bytes(language.read_bytes() + b"\0")
+            with self.assertRaisesRegex(
+                ValueError, "Monitor source changed after loading"
+            ):
+                replay.native_categories((), bus_judge=0)
+            with self.assertRaisesRegex(
+                ValueError, "Monitor source changed after loading"
+            ):
+                replay.close_native_vehicle()
+
+    def test_native_close_retries_and_retires_business_without_extra_io(self):
+        trigger = NativeTriggerInfo((1, 0), 1, 1, 0)
+        parameters = NativeTriggerParameters((1, 0), 1, 0, (1, 0), (), (1, 0), ())
+        with tempfile.TemporaryDirectory() as directory:
+            root, document = self.authored_native_close_document(Path(directory))
+            self.append_disconnect_retry(document)
+            replay = self.replay_native_close_document(root, document)
+            session = replay._native_vehicle
+            if session is None:
+                self.fail("Native close session was not retained")
+            communication = session.communication
+            self.assertTrue(replay.native_vehicle_systems())
+            before_close = replay.recording.position
+
+            self.assertEqual(replay.close_native_vehicle(), 0x91010009)
+            self.assertTrue(replay.native_vehicle_cleanup_pending)
+            self.assertIs(replay._native_vehicle, session)
+            self.assertIs(session.communication, communication)
+            after_failure = replay.recording.position
+            self.assertGreater(after_failure, before_close)
+            for operation in (
+                lambda: replay.native_categories((), bus_judge=0),
+                replay.native_select,
+                lambda: replay.native_answer(1, 1),
+                replay.native_vehicle_systems,
+                lambda: replay.bind_native_vehicle_system(1),
+                lambda: replay.run(trigger=trigger, parameters=parameters),
+            ):
+                with self.assertRaises(ValueError):
+                    operation()
+            self.assertEqual(replay.recording.position, after_failure)
+
+            self.assertEqual(replay.close_native_vehicle(), 0)
+            self.assertFalse(replay.native_vehicle_cleanup_pending)
+            after_release = replay.recording.position
+            language = root / "M_English.ddb"
+            language.write_bytes(language.read_bytes() + b"\0")
+            self.assertEqual(replay.close_native_vehicle(), 0)
+            self.assertEqual(replay.recording.position, after_release)
+
+            trigger = NativeTriggerInfo((1, 0), 1, 1, 0)
+            parameters = NativeTriggerParameters((1, 0), 1, 0, (1, 0), (), (1, 0), ())
+            recording_path, source_root = write_native_vehicle_smoke_fixture(
+                Path(directory) / "used-run",
+                trigger=trigger,
+                parameters=parameters,
+            )
+            run_document = json.loads(recording_path.read_text(encoding="utf-8"))
+            disconnect = next(
+                event
+                for event in reversed(run_document["events"])
+                if event["operation"] == "disconnect"
+            )
+            if run_document["events"][-1] is not disconnect:
+                self.fail("Authored final close event is not at the cursor tail")
+            disconnect["result"]["code"] = 9
+            second_failure = copy.deepcopy(disconnect)
+            successful_retry = copy.deepcopy(disconnect)
+            successful_retry["result"]["code"] = 0
+            run_document["events"].extend((second_failure, successful_retry))
+            recording = MonitorRecording(run_document)
+            failed_run = MonitorReplay(recording, source_root)
+            failed_run.begin_native_vehicle(info_ids=(), text_encoding="ascii")
+            self.selection_path(failed_run, choose_categories=True)
+            failed_run.bind_native_vehicle_system(1)
+            with self.assertRaises(MonitorError):
+                failed_run.run(trigger=trigger, parameters=parameters)
+            self.assertTrue(failed_run.used)
+            self.assertTrue(failed_run.native_vehicle_cleanup_pending)
+            self.assertEqual(recording.position, len(run_document["events"]) - 1)
+
+            before_rejected_run = recording.position
+            with self.assertRaisesRegex(ValueError, "single-use"):
+                failed_run.run(trigger=trigger, parameters=parameters)
+            self.assertEqual(recording.position, before_rejected_run)
+            self.assertTrue(failed_run.native_vehicle_cleanup_pending)
+            self.assertEqual(failed_run.close_native_vehicle(), 0)
+            self.assertFalse(failed_run.native_vehicle_cleanup_pending)
+            self.assertEqual(recording.position, len(run_document["events"]))
+            self.assertEqual(failed_run.outputs, {})
+
+    def test_native_close_source_failure_keeps_retry_pending_then_releases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, document = self.authored_native_close_document(Path(directory))
+            self.append_disconnect_retry(document)
+            replay = self.replay_native_close_document(root, document)
+            language = root / "M_English.ddb"
+            original = language.read_bytes()
+            language.write_bytes(original + b"\0")
+
+            with self.assertRaisesRegex(
+                ValueError, "source changed after loading"
+            ) as caught:
+                replay.close_native_vehicle()
+            self.assertTrue(replay.native_vehicle_cleanup_pending)
+            self.assertTrue(
+                any(
+                    "Post-close source check" in note
+                    for note in caught.exception.__notes__
+                )
+            )
+
+            language.write_bytes(original)
+            self.assertEqual(replay.close_native_vehicle(), 0)
+            self.assertFalse(replay.native_vehicle_cleanup_pending)
+            position = replay.recording.position
+            self.assertEqual(replay.close_native_vehicle(), 0)
+            self.assertEqual(replay.recording.position, position)
+
+            second_root, second_document = self.authored_native_close_document(
+                Path(directory) / "close0-source-error"
+            )
+            released = self.replay_native_close_document(second_root, second_document)
+            second_language = second_root / "M_English.ddb"
+            second_language.write_bytes(second_language.read_bytes() + b"\0")
+            with self.assertRaisesRegex(ValueError, "source changed after loading"):
+                released.close_native_vehicle()
+            self.assertFalse(released.native_vehicle_cleanup_pending)
+            released_position = released.recording.position
+            self.assertEqual(released.close_native_vehicle(), 0)
+            self.assertEqual(released.recording.position, released_position)
+
+    def test_native_close_host_exception_identity_and_retry(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, document = self.authored_native_close_document(Path(directory))
+            replay = self.replay_native_close_document(root, document)
+            session = replay._native_vehicle
+            if session is None:
+                self.fail("Native close session was not retained")
+            communication = session.communication
+            controller = communication.operations
+            sentinel = RuntimeError("authored close sentinel")
+            position = replay.recording.position
+            language = root / "M_English.ddb"
+            original = language.read_bytes()
+            language.write_bytes(original + b"\0")
+
+            with (
+                patch.object(controller, "disconnect", side_effect=sentinel),
+                self.assertRaises(RuntimeError) as caught,
+            ):
+                replay.close_native_vehicle()
+            self.assertIs(caught.exception, sentinel)
+            self.assertTrue(
+                any("Pre-close source check" in note for note in sentinel.__notes__)
+            )
+            self.assertTrue(
+                any("Source check also failed" in note for note in sentinel.__notes__)
+            )
+            self.assertTrue(replay.native_vehicle_cleanup_pending)
+            self.assertEqual(replay.recording.position, position)
+
+            language.write_bytes(original)
+            self.assertEqual(replay.close_native_vehicle(), 0)
+            self.assertFalse(replay.native_vehicle_cleanup_pending)
+            self.assertEqual(replay.recording.position, len(document["events"]))
+            self.assertGreater(replay.recording.position, position)
+
+
+def write_native_vehicle_smoke_fixture(
+    directory: Path,
+    *,
+    trigger: NativeTriggerInfo,
+    parameters: NativeTriggerParameters,
+) -> tuple[Path, Path]:
+    """Persist public authored DDBs and a literal full native-run recording."""
+    directory.mkdir(parents=True, exist_ok=True)
+    case = NativeVehicleReplayTests()
+    source_root, document = case.native_vehicle_document(directory / "build")
+    author = AuthoredCapture(document)
+    try:
+        capture = MonitorReplay(author, source_root)
+        capture.begin_native_vehicle(info_ids=(), text_encoding="ascii")
+        NativeVehicleReplayTests.selection_path(capture, choose_categories=True)
+        capture_session = capture._native_vehicle
+        if capture_session is None:
+            raise AssertionError("Native selection session was not retained")
+        selection_controller: Any = capture_session.communication.operations
+        selection_lower: Any = selection_controller.operations
+        if selection_lower.channel is None:
+            raise AssertionError("Selection did not leave its native controller open")
+        if sum(event["operation"] == "connect" for event in author.captured) != 1:
+            raise AssertionError("Selection did not use one controller connection")
+        if any(event["operation"] == "disconnect" for event in author.captured):
+            raise AssertionError(
+                "Selection closed its controller before monitor handoff"
+            )
+        capture.bind_native_vehicle_system(capture.context["category"])
+        bound_communication = capture._native_bound_communication
+        if (
+            bound_communication is None
+            or bound_communication.operations is not selection_controller
+        ):
+            raise AssertionError("Monitor handoff replaced the selection controller")
+        capture.run(trigger=trigger, parameters=parameters)
+        document["events"] = author.captured
+        recording_path = directory / "native_vehicle_recording.json"
+        recording_path.write_text(
+            json.dumps(document, indent=2) + "\n", encoding="utf-8"
+        )
+        Path(directory, "expected-monitor.dm").write_bytes(capture.outputs["monitor"])
+        Path(directory, "expected-recording.drs").write_bytes(
+            capture.outputs["recording"]
+        )
+
+        recording = MonitorRecording.loads(recording_path.read_bytes())
+        replay = MonitorReplay(recording, source_root)
+        replay.begin_native_vehicle(info_ids=(), text_encoding="ascii")
+        NativeVehicleReplayTests.selection_path(replay, choose_categories=True)
+        replay.bind_native_vehicle_system(replay.context["category"])
+        replay.run(trigger=trigger, parameters=parameters)
+        recording.assert_complete()
+        if replay.outputs != capture.outputs:
+            raise AssertionError(
+                "Strict native replay outputs differ from actual capture"
+            )
+        return recording_path, source_root
+    finally:
+        case.doCleanups()
 
 
 if __name__ == "__main__":

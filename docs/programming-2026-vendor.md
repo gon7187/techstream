@@ -40,6 +40,29 @@ is shared by bound utility instances and starts with the source image's 32 zero
 bytes. The AES/provider boundary receives the native secret type, actual seed, AES flag and encryption flag, and must return the exact
 key width. Gateway authorization must return 256 bytes for the observed
 16-byte seed. These providers cannot return diagnostic success.
+During an actual scoped CONTROL prepare or write export, the internally
+created SBR utility retains its parent vendor context. Its `read_ssm` stores the
+selected response byte and publishes that same byte to the worker's C25 field
+immediately, before seed challenge or authorization continues. Standalone
+utility instances remain local, and the gateway-only retry branch does not read
+or publish SSM.
+For scoped SBR writing, progress reads live CONTROL scratch and starts a fresh
+private cumulative count for each export. It uses the issued native entry CPU
+index and held CONTROL CPU metadata, preserving native order through the
+writer's internal CPU loop without reselecting the module or parameter row.
+It parses each CPU's file geometry only when the native loop reaches that CPU,
+so malformed future rows cannot preempt valid current-CPU transfers when the
+source loop flag stops before those rows.
+Each successful block publishes the old count vector, stores the new count and
+percentage with the source's double arithmetic, then publishes percentage;
+there is no final count flush. The actual `SendTesterPresent` follows a
+successful block response and precedes private accumulation and count
+publication. Typed transfer failures reset and publish count before
+percentage, while host callback faults stop at their exact point. Standalone
+writer progress retains its local observer behavior. The focused
+actual CONTROL test checks a two-CPU, two-block-per-CPU loop against its issued
+targets, full scratch/global vectors and C48 snapshot, then consumes a frozen
+trace in a fresh strict replay.
 
 Native diagnostic and driver failures produce canonical separate error fields,
 including base native errors with no driver status. Getter pointer returns use

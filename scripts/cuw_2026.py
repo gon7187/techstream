@@ -502,6 +502,7 @@ class DHControllerState2026:
         self._progress: tuple[int, ...] = (0,) * maximum
         self._transferred_bytes: tuple[int, ...] = (0,) * maximum
         self._dh_flash_size: int | None = None
+        self._dh_flash_size_metadata = None
         self._getter_stage = 0
         self._writable_cid = False
         self._alternate_can_address = False
@@ -523,9 +524,60 @@ class DHControllerState2026:
         return self._engine
 
     @property
+    def _family_metadata(self):
+        engine = self.engine
+        if engine._controller_export_target2026 is not None:
+            return engine.family_metadata
+        return self.metadata
+
+    @property
+    def _family_native_cpu_index(self) -> int:
+        engine = self.engine
+        if engine._controller_export_target2026 is not None:
+            return engine.family_cpu_index
+        return self.native_cpu_index
+
+    def _family_progress_vectors(self) -> tuple[list[int], list[int]]:
+        engine = self.engine
+        if engine._controller_export_target2026 is None:
+            return list(self._transferred_bytes), list(self._progress)
+        controller = engine._controller_execution
+        target = engine._controller_export_target2026
+        if controller is None:
+            raise ValueError("Native CONTROL export scope has expired")
+        target.validate(engine, controller)
+        context = controller.native_control_context2026(engine)
+        return list(context.count_scratch), list(context.percentage_scratch)
+
+    def _store_family_progress_vectors(
+        self, counts: list[int], percentages: list[int]
+    ) -> None:
+        engine = self.engine
+        if engine._controller_export_target2026 is None:
+            self._transferred_bytes = tuple(counts)
+            self._progress = tuple(percentages)
+            return
+        controller = engine._controller_execution
+        target = engine._controller_export_target2026
+        if controller is None:
+            raise ValueError("Native CONTROL export scope has expired")
+        target.validate(engine, controller)
+        context = controller.native_control_context2026(engine)
+        if len(counts) != len(context.count_scratch) or len(percentages) != len(
+            context.percentage_scratch
+        ):
+            raise ValueError("CONTROL output vector length changed while issued")
+        for index, value in enumerate(counts):
+            context._store_count2026(target, index, value)
+        for index, value in enumerate(percentages):
+            context._store_percentage2026(target, index, value)
+
+    @property
     def native_cpu_index(self) -> int:
         """Ordered358 progress index; global_cpu_index remains parser-facing."""
         engine = self.engine
+        if engine._controller_export_target2026 is not None:
+            return engine.family_cpu_index
         if engine._worker is None:
             return self.global_cpu_index
         return engine.worker.source_state.current_global_cpu_index
@@ -534,8 +586,15 @@ class DHControllerState2026:
         """Map an actual parser CPU to its issued native progress-array position."""
         from scripts.calibration_2026 import native2026_cpu_values
 
-        native2026_cpu_values(self.metadata, index)
+        native2026_cpu_values(self._family_metadata, index)
         engine = self.engine
+        if engine._controller_export_target2026 is not None:
+            controller = engine._controller_execution
+            if controller is None:
+                raise ValueError("Native CONTROL export scope has expired")
+            return controller.native_control_context2026(
+                engine
+            ).native_index_for_source_cpu(index)
         if engine._worker is None:
             return index
         return engine.worker.native_index_for_source_cpu(index)
@@ -599,46 +658,59 @@ class DHControllerState2026:
         return self._divided_image_index
 
     def advance_divided_image(self, expected: int) -> None:
-        cpu = self.metadata.cpu
+        metadata = self._family_metadata
+        cpu_index = (
+            self._family_native_cpu_index
+            if self.engine._controller_export_target2026 is not None
+            else self.global_cpu_index
+        )
+        cpu = metadata.cpu
         files = cpu.files if cpu is not None else ()
         if (
-            self.global_cpu_index != 0
+            cpu_index != 0
             or type(expected) is not int
             or expected != self._divided_image_index
             or not 0 <= expected < len(files)
         ):
             raise ValueError("Bounded actualCPU0 divided-image transition required")
         self._divided_image_index += 1
+        self.engine._publish_control_divided_index2026(self._divided_image_index)
 
     def reset_divided_image(self) -> None:
         self._divided_image_index = 0
+        self.engine._publish_control_divided_index2026(0)
 
     def resume_divided_image_count(self) -> None:
         """DHUDS2120 adds completed Format4 images without changing percent."""
         from scripts.calibration_2026 import native2026_archive
 
-        cpu = self.metadata.cpu
+        metadata = self._family_metadata
+        cpu_index = (
+            self._family_native_cpu_index
+            if self.engine._controller_export_target2026 is not None
+            else self.global_cpu_index
+        )
+        cpu = metadata.cpu
         if (
-            self.metadata.format_version != 4
-            or self.global_cpu_index != 0
+            metadata.format_version != 4
+            or cpu_index != 0
             or cpu is None
             or not cpu.files
             or not 0 <= self._divided_image_index < len(cpu.files)
         ):
             raise ValueError("Actual CPU0 Format4 divided-image resume required")
-        total = native2026_archive(self.metadata).flash_size
+        total = native2026_archive(metadata).flash_size
         remaining = tuple(
-            native2026_archive(self.metadata, file_index=index).flash_size
+            native2026_archive(metadata, file_index=index).flash_size
             for index in range(1, len(cpu.files))
         )
         first = total - sum(remaining)
         if first < 0:
             raise ValueError("Native divided-image lengths exceed aggregate size")
         prefix = sum((first, *remaining)[: self._divided_image_index])
-        self._transferred_bytes = (
-            (self._transferred_bytes[0] + prefix) & 0xFFFFFFFF,
-            *self._transferred_bytes[1:],
-        )
+        counts, percentages = self._family_progress_vectors()
+        counts[0] = (counts[0] + prefix) & 0xFFFFFFFF
+        self._store_family_progress_vectors(counts, percentages)
 
     def notify_divided_image(self) -> None:
         from scripts.cuw_persistence import CUWPersistence
@@ -656,25 +728,29 @@ class DHControllerState2026:
 
         if type(count) is not int or not 0 <= count <= 0xFFFFFFFF:
             raise ValueError("Native unsigned acknowledged transfer count required")
-        total = native2026_archive(self.metadata).flash_size
+        total = native2026_archive(self._family_metadata).flash_size
         if not 0 < total <= 0xFFFFFFFF:
             raise ValueError("Positive source-bound native flash size required")
         index = self.native_cpu_index
-        transferred = (self._transferred_bytes[index] + count) & 0xFFFFFFFF
-        counts, percentages = list(self._transferred_bytes), list(self._progress)
+        counts, percentages = self._family_progress_vectors()
+        transferred = (counts[index] + count) & 0xFFFFFFFF
         counts[index], percentages[index] = (
             transferred,
             (100 * transferred // total) & 0xFFFFFFFF,
         )
-        self._transferred_bytes, self._progress = tuple(counts), tuple(percentages)
+        self._store_family_progress_vectors(counts, percentages)
 
     def reset_usb_progress(self) -> None:
-        self._progress = (0, *self._progress[1:])
+        counts, percentages = self._family_progress_vectors()
+        percentages[0] = 0
+        self._store_family_progress_vectors(counts, percentages)
 
     def complete_usb_progress(self, response: bytes) -> None:
         if type(response) is not bytes or not response.startswith(b"\x5a\xb1\x00"):
             raise ValueError("Actual native USB5ab100 completion response required")
-        self._progress = (100, *self._progress[1:])
+        counts, percentages = self._family_progress_vectors()
+        percentages[0] = 100
+        self._store_family_progress_vectors(counts, percentages)
 
     @property
     def native_context_964(self) -> bool:
@@ -687,16 +763,22 @@ class DHControllerState2026:
     def _set_native_vector(self, field: str, cpu_index: int, value: int) -> None:
         from scripts.calibration_2026 import native2026_cpu_count
 
+        metadata = self._family_metadata
         if (
             type(cpu_index) is not int
-            or not 0 <= cpu_index < native2026_cpu_count(self.metadata)
+            or not 0 <= cpu_index < native2026_cpu_count(metadata)
             or type(value) is not int
             or not 0 <= value <= 0xFFFFFFFF
         ):
             raise ValueError("Source-bound global CPU index and native DWORD required")
-        values = list(getattr(self, field))
+        counts, percentages = self._family_progress_vectors()
+        values = counts if field == "_transferred_bytes" else percentages
         values[cpu_index] = value
-        setattr(self, field, tuple(values))
+        if field == "_transferred_bytes":
+            counts = values
+        else:
+            percentages = values
+        self._store_family_progress_vectors(counts, percentages)
 
     def set_native_count(self, cpu_index: int, value: int) -> None:
         """Concrete family math mutates the native count before its observer."""
@@ -708,23 +790,43 @@ class DHControllerState2026:
 
     @property
     def progress(self) -> tuple[int, ...]:
+        engine = self._engine
+        if engine._controller_export_target2026 is None:
+            return self._progress
+        engine = self.engine
+        if engine._controller_export_target2026 is not None:
+            if engine._controller_execution is None:
+                raise ValueError("Native CONTROL export scope has expired")
+            return engine._controller_execution.native_control_context2026(
+                engine
+            ).percentage_scratch
         return self._progress
 
     @property
     def transferred_bytes(self) -> tuple[int, ...]:
+        engine = self._engine
+        if engine._controller_export_target2026 is None:
+            return self._transferred_bytes
+        engine = self.engine
+        if engine._controller_export_target2026 is not None:
+            if engine._controller_execution is None:
+                raise ValueError("Native CONTROL export scope has expired")
+            return engine._controller_execution.native_control_context2026(
+                engine
+            ).count_scratch
         return self._transferred_bytes
 
     def reset_dh_count(self) -> None:
         """CommonFlash4080 mutation, performed before the count notification."""
-        values = list(self._transferred_bytes)
+        values, percentages = self._family_progress_vectors()
         values[self.native_cpu_index] = 0
-        self._transferred_bytes = tuple(values)
+        self._store_family_progress_vectors(values, percentages)
 
     def reset_dh_progress(self) -> None:
         """CommonFlash4080 mutation, performed before the percent notification."""
-        values = list(self._progress)
+        counts, values = self._family_progress_vectors()
         values[self.native_cpu_index] = 0
-        self._progress = tuple(values)
+        self._store_family_progress_vectors(counts, values)
 
     def record_dh_transfer(
         self, count: int, offset: int, total: int, *, verification: bool, checksum: bool
@@ -745,20 +847,24 @@ class DHControllerState2026:
             or type(checksum) is not bool
         ):
             raise ValueError("Bounded native DH transfer fields required")
-        flash_size = self._dh_flash_size
+        metadata = self._family_metadata
+        flash_size = (
+            self._dh_flash_size if self._dh_flash_size_metadata == metadata else None
+        )
         if flash_size is None:
-            flash_size = native2026_archive(self.metadata).flash_size
+            flash_size = native2026_archive(metadata).flash_size
         if total != flash_size:
             raise ValueError("DH transfer total differs from bound native flash size")
         progress = 100 * offset // total
         if not checksum:
             progress = progress // 2 + (50 if verification else 0)
-        counts, percentages = list(self._transferred_bytes), list(self._progress)
-        index = self.native_cpu_index
+        counts, percentages = self._family_progress_vectors()
+        index = self._family_native_cpu_index
         counts[index] = (counts[index] + count) & 0xFFFFFFFF
         percentages[index] = progress
         self._dh_flash_size = flash_size
-        self._transferred_bytes, self._progress = tuple(counts), tuple(percentages)
+        self._dh_flash_size_metadata = metadata
+        self._store_family_progress_vectors(counts, percentages)
 
     def _gateway_transfer(self, offset: int, total: int) -> None:
         from scripts.calibration_2026 import (
@@ -766,27 +872,37 @@ class DHControllerState2026:
             native2026_metadata_for_cpu,
         )
 
+        engine = self.engine
+        metadata = self._family_metadata
+        if engine._controller_export_target2026 is not None:
+            controller = engine._controller_execution
+            if controller is None:
+                raise ValueError("Native CONTROL export scope has expired")
+            metadata = controller.native_control_context2026(engine).metadata_for_cpu(0)
+        else:
+            metadata = native2026_metadata_for_cpu(self.metadata, 0)
         if (
             type(offset) is not int
             or type(total) is not int
             or not 0 <= offset <= total <= 0xFFFFFFFF
             or total == 0
-            or total
-            != native2026_archive(
-                native2026_metadata_for_cpu(self.metadata, 0)
-            ).flash_size
+            or total != native2026_archive(metadata).flash_size
         ):
             raise ValueError("Gateway transfer requires bound globalCPU0 flash size")
 
     def record_gateway_count(self, offset: int, total: int) -> None:
         """Gateway1070 stores the offset before invoking its count observer."""
         self._gateway_transfer(offset, total)
-        self._transferred_bytes = (offset, *self._transferred_bytes[1:])
+        counts, percentages = self._family_progress_vectors()
+        counts[0] = offset
+        self._store_family_progress_vectors(counts, percentages)
 
     def record_gateway_progress(self, offset: int, total: int) -> None:
         """Gateway1070 stores percent after the count observer returns."""
         self._gateway_transfer(offset, total)
-        self._progress = (100 * offset // total, *self._progress[1:])
+        counts, percentages = self._family_progress_vectors()
+        percentages[0] = 100 * offset // total
+        self._store_family_progress_vectors(counts, percentages)
 
     def record_multirom_transfer(self, count: int, binding) -> None:
         """MultiROM1970 uses both decimal EachWriteDataSize entries, not flash size."""
@@ -795,7 +911,7 @@ class DHControllerState2026:
         if (
             type(binding) is not NativeParameterBinding2026
             or binding.module_name != "TCUWCanDHMultiROMFlashWriter.dll"
-            or binding.metadata != self.metadata
+            or binding.metadata != self._family_metadata
             or type(count) is not int
             or not 0 <= count <= 0xFFFFFFFF
         ):
@@ -812,11 +928,13 @@ class DHControllerState2026:
                 )
             sizes.append(int(parsed[1]))
         total = sum(sizes)
-        transferred = self._transferred_bytes[0] + count
+        counts, percentages = self._family_progress_vectors()
+        transferred = counts[0] + count
         if total > 0xFFFFFFFF or transferred > total:
             raise ValueError("MultiROM transfer exceeds source-bound partition lengths")
-        self._transferred_bytes = (transferred, *self._transferred_bytes[1:])
-        self._progress = (100 * transferred // total, *self._progress[1:])
+        counts[0] = transferred
+        percentages[0] = 100 * transferred // total
+        self._store_family_progress_vectors(counts, percentages)
 
     @property
     def getter_stage(self) -> int:
@@ -832,6 +950,11 @@ class DHControllerState2026:
 
     @property
     def central_gateway_type(self) -> int:
+        engine = self.engine
+        if engine._controller_export_target2026 is not None:
+            if engine._controller_execution is None:
+                raise ValueError("Native CONTROL export scope has expired")
+            return engine.worker.control_state.source_mode
         return self._central_gateway_type
 
     @property
@@ -869,6 +992,11 @@ class DHControllerState2026:
         if type(value) is not int or value not in (1, 2):
             raise ValueError("Native DH gateway type must be1 or2")
         self._central_gateway_type = value
+        engine = self.engine
+        if engine._controller_export_target2026 is not None:
+            if engine._controller_execution is None:
+                raise ValueError("Native CONTROL export scope has expired")
+            engine.worker._publish_control_gateway_type2026(self)
 
     def advance_getter_stage(self, expected: int, following: int) -> None:
         """Called by concrete getters after their actual verified stage succeeds."""
@@ -1057,6 +1185,12 @@ class CUWEngine2026:
         self._worker_phase: int | None = None
         self._repro_gateway_node = 0
         self._gateway_classifier_cache = 0
+        self._ssmid_cache2026 = 0
+        self._dh_type_cache2026 = 0
+        self._control_retry_cache2026 = False
+        self._control_phase_cache2026 = 2
+        self._control_alternate_cache2026 = False
+        self._control_divided_index_cache2026 = 0
         self._native_error_output = (0, 0)
         self._native_fatal_output = False
         self._native_control_fatal_output = False
@@ -1096,6 +1230,9 @@ class CUWEngine2026:
         self._received_hardware = b""
         self._working_hardware = b""
         self._identifier_context_epoch = 0
+        self._identifier_context_importing = False
+        self._native_control_context2026 = None
+        self._controller_export_target2026 = None
         self._last_completed_standalone_getter = None
         self._working_identifier_records: tuple[bytes, ...] = ()
         self._working_contact_buffer = bytes(33)
@@ -1815,6 +1952,68 @@ class CUWEngine2026:
         return self._metadata
 
     @property
+    def family_metadata(self):
+        """Metadata projected by the currently scoped native CONTROL export."""
+        target = self._controller_export_target2026
+        if target is None:
+            return self.native_metadata
+        controller = self._controller_execution
+        if controller is None:
+            raise ValueError("Native CONTROL export scope has expired")
+        target.validate(self, controller)
+        self._require_owned_phase()
+        return target.metadata
+
+    @property
+    def family_source_container(self):
+        return self.family_metadata.source_container
+
+    @property
+    def family_cpu_index(self) -> int:
+        target = self._controller_export_target2026
+        if target is None:
+            from scripts.calibration_2026 import native2026_global_cpu_index
+
+            return native2026_global_cpu_index(self.native_metadata)
+        _ = self.family_metadata
+        return target.cpu_index
+
+    @property
+    def family_target_index(self) -> int:
+        target = self._controller_export_target2026
+        if target is None:
+            return self.native_writer_target_index
+        _ = self.family_metadata
+        return target.target_index
+
+    @contextmanager
+    def controller_export_target(self, controller, target):
+        """Scope one authentic CONTROL target to its current owned export thread."""
+        from scripts.programming_2026_common import (
+            ControlCommPhase2026,
+            NativeControlExportTarget2026,
+        )
+
+        if (
+            type(controller) is not ControlCommPhase2026
+            or controller is not self._controller_execution
+            or type(target) is not NativeControlExportTarget2026
+        ):
+            raise ValueError("Actual controller and issued CONTROL target required")
+        self._require_owned_phase()
+        target.validate(self, controller)
+        if self._controller_export_target2026 is not None:
+            raise ValueError("Nested native CONTROL target scopes are forbidden")
+        self._controller_export_target2026 = target
+        try:
+            yield target
+        finally:
+            if self._controller_export_target2026 is not target:
+                self._controller_export_target2026 = None
+                raise ValueError("Native CONTROL target scope ownership changed")
+            self._controller_export_target2026 = None
+
+    @property
     def notification(self):
         """The shared native engine+3a0 Boolean for every programming family."""
         self._validate_persistence_source(self.native_metadata)
@@ -2330,6 +2529,9 @@ class CUWEngine2026:
             state._progress = (0,) * len(state._progress)
             state._transferred_bytes = (0,) * len(state._transferred_bytes)
             self._cleanup_retired_dh_state = None
+        if self._persistence is None:
+            self._ssmid_cache2026 = 0
+            self._dh_type_cache2026 = 0
         self._identifier_records = self._received_identifiers = ()
         self._working_identifier_records = ()
         self._working_contact_buffer = bytes(33)
@@ -2457,7 +2659,9 @@ class CUWEngine2026:
 
         if type(selection) is not NativeParameterBinding2026:
             raise TypeError("Concrete native writer parameter binding required")
-        metadata = self.native_metadata
+        # CONTROL writer bindings follow the held export target even when an
+        # earlier callback has moved the engine's outer FILE selection.
+        metadata = self.family_metadata
         if selection.metadata != metadata:
             raise ValueError("Writer addresses differ from the actual engine target")
         expected = native2026_write_address_groups(metadata.source_container, selection)
@@ -2472,16 +2676,51 @@ class CUWEngine2026:
                 "Native context mutation requires its active concrete phase"
             )
 
-    def _import_identifier_context(self) -> None:
+    def _import_identifier_context(
+        self, *, actual_control_import: bool = False
+    ) -> None:
         """59ab0 zeroes34records and contact, then copies existing12byte records."""
-        self._identifier_context_epoch += 1
-        self._last_completed_standalone_getter = None
-        self._working_identifier_records = self._identifier_records + (bytes(12),) * (
-            34 - len(self._identifier_records)
-        )
-        self._working_contact_buffer = bytes(33)
-        self._working_hardware = b""
-        self.dh_state._flashing_ended = False
+        if actual_control_import:
+            self._require_owned_phase()
+            controller = self._controller_execution
+            if (
+                controller is None
+                or self._worker is None
+                or self._worker.controller is not controller
+                or self._native_control_context2026 is not None
+                or self._identifier_context_importing
+            ):
+                raise ValueError("Once-only owned native CONTROL import required")
+        self._identifier_context_importing = actual_control_import
+        try:
+            self._identifier_context_epoch += 1
+            self._last_completed_standalone_getter = None
+            self._working_identifier_records = self._identifier_records + (
+                bytes(12),
+            ) * (34 - len(self._identifier_records))
+            self._working_contact_buffer = bytes(33)
+            self._working_hardware = b""
+            self.dh_state._flashing_ended = False
+            if actual_control_import:
+                capture = self.worker.capture_control_file2026(controller)
+                self._native_control_context2026 = (
+                    controller._begin_native_control_context2026(self, capture)
+                )
+        finally:
+            self._identifier_context_importing = False
+
+    def _end_native_control_context2026(self, controller, prior_error=None) -> None:
+        context = self._native_control_context2026
+        if context is None:
+            return
+        try:
+            controller._end_native_control_context2026(self, context)
+        except BaseException as error:
+            if prior_error is None:
+                raise
+            prior_error.add_note("CONTROL context cleanup: " + type(error).__name__)
+        finally:
+            self._native_control_context2026 = None
 
     @property
     def dcm_getter_state(self) -> DCMGetterState2026:
@@ -2838,6 +3077,7 @@ class CUWEngine2026:
             if self._retry_controller is not None:
                 self._retry_controller.close()
             if self._worker is not None:
+                self._worker.controller._close_control_pool2026(self)
                 self._worker.close()
             from scripts.cuw_engine_cleanup import _revoke_engine_cleanup
             from scripts.cuw_gateway_startup import _revoke_gateway_startup
@@ -2906,6 +3146,202 @@ class CUWEngine2026:
         if self._persistence is not None:
             self._persistence.state.repro_gw_node = value
 
+    @property
+    def native_ssmid_cache2026(self) -> int:
+        value = (
+            self._ssmid_cache2026
+            if self._persistence is None
+            else self._persistence.state.ssmid
+        )
+        if type(value) is not int or not 0 <= value <= 255:
+            raise ValueError("Native ED29 SSMID cache must be a byte")
+        return value
+
+    @property
+    def native_dh_type_cache2026(self) -> int:
+        value = (
+            self._dh_type_cache2026
+            if self._persistence is None
+            else self._persistence.state.dh_central_gw_type
+        )
+        if type(value) is not int or not 0 <= value <= 255:
+            raise ValueError("Native ED8A DH type cache must be a byte")
+        return value
+
+    def _validate_control_cache_publisher2026(self, worker) -> None:
+        if worker is not self.worker or self._controller_execution is None:
+            raise ValueError("Actual active CONTROL worker required for cache publish")
+        controller = self._controller_execution
+        context = controller.native_control_context2026(self)
+        context.validate(self, self._controller_execution)
+        if self._controller_export_target2026 is not None:
+            raise ValueError("Post-export cache publish requires an ended export scope")
+        from scripts.programming_2026_common import (
+            _control_helper_entry2026,
+            _control_helper_primary_return_seen2026,
+        )
+
+        helper_lease = _control_helper_entry2026(context)
+        if not _control_helper_primary_return_seen2026(context, helper_lease, "8990"):
+            raise ValueError("Completed 8990 primary BOOL return required")
+        worker._validate_control_postexport_cache2026(context)
+
+    def _validate_control_cache_helper2026(
+        self, worker, helper: str, *, primary_return: bool
+    ):
+        if worker is not self.worker or self._controller_execution is None:
+            raise ValueError("Actual active CONTROL worker required for cache callback")
+        controller = self._controller_execution
+        context = controller.native_control_context2026(self)
+        context.validate(self, controller)
+        if self._controller_export_target2026 is not None:
+            raise ValueError("CONTROL cache callback follows export-scope teardown")
+        from scripts.programming_2026_common import (
+            _control_helper_entry2026,
+            _control_helper_primary_return_seen2026,
+        )
+
+        lease = _control_helper_entry2026(context)
+        if primary_return and not _control_helper_primary_return_seen2026(
+            context, lease, helper
+        ):
+            raise ValueError(f"Completed {helper} primary return required")
+        if not primary_return:
+            from scripts.programming_2026_common import (
+                _control_helper_primary_return_seen2026,
+            )
+
+            if _control_helper_primary_return_seen2026(context, lease, helper):
+                raise ValueError(f"Active {helper} getter entry required")
+            # The entry lookup authenticates the actual helper identity; the
+            # receipt is not available yet at its in-helper callback site.
+        worker._validate_control_output_context2026(context)
+        return controller, context
+
+    @property
+    def native_control_retry_cache2026(self) -> bool:
+        value = (
+            self._control_retry_cache2026
+            if self._persistence is None
+            else self._persistence.state.use_new_software_password
+        )
+        if type(value) is not bool:
+            raise ValueError("Native EC99 retry cache must be Boolean")
+        return value
+
+    def _publish_control_retry_cache2026(self, *, worker) -> None:
+        self._validate_control_cache_helper2026(worker, "4c10", primary_return=True)
+        value = worker.control_state.initial_command_retry
+        if type(value) is not bool:
+            raise ValueError("Source worker retry cache must be Boolean")
+        self._control_retry_cache2026 = value
+        if self._persistence is not None:
+            self._persistence.state.use_new_software_password = value
+
+    @property
+    def native_control_phase_cache2026(self) -> int:
+        value = (
+            self._control_phase_cache2026
+            if self._persistence is None
+            else self._persistence.state.comm_phase
+        )
+        if type(value) is not int or not 0 <= value <= 0xFF:
+            raise ValueError("Native ECFC communication-phase cache must be a byte")
+        return value
+
+    def _publish_control_phase_cache2026(self, *, worker) -> None:
+        self._validate_control_cache_helper2026(worker, "4c10", primary_return=True)
+        value = self.dh_state.comm_phase
+        if type(value) is not int or not 0 <= value <= 0xFF:
+            raise ValueError("Live native communication phase must be a byte")
+        self._control_phase_cache2026 = value
+        if self._persistence is not None:
+            self._persistence.state.comm_phase = value
+
+    @property
+    def native_control_alternate_cache2026(self) -> bool:
+        value = (
+            self._control_alternate_cache2026
+            if self._persistence is None
+            else self._persistence.state.sequence_changed_for_get_cid
+        )
+        if type(value) is not bool:
+            raise ValueError("Native ED28 alternate-getter cache must be Boolean")
+        return value
+
+    def _publish_control_alternate_cache2026(self, *, worker) -> None:
+        controller, _context = self._validate_control_cache_helper2026(
+            worker, "6f20", primary_return=False
+        )
+        value = controller.alternate_cid_used
+        if type(value) is not bool:
+            raise ValueError("Source alternate-getter state must be Boolean")
+        self._control_alternate_cache2026 = value
+        if self._persistence is not None:
+            self._persistence.state.sequence_changed_for_get_cid = value
+
+    @property
+    def native_control_divided_index2026(self) -> int:
+        value = (
+            self._control_divided_index_cache2026
+            if self._persistence is None
+            else self._persistence.state.write_target_divided_cpu_image_index
+        )
+        if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError("Native ED6C divided-image index must be a DWORD")
+        return value
+
+    def _publish_control_divided_index2026(self, value: int) -> None:
+        if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError("Native ED6C divided-image index must be a DWORD")
+        self._control_divided_index_cache2026 = value
+        if self._persistence is not None:
+            self._persistence.update_divided_image(value)
+
+    def _publish_control_ssmid_cache2026(self, *, worker) -> None:
+        self._validate_control_cache_publisher2026(worker)
+        controller = self._controller_execution
+        if controller is None:
+            raise ValueError("Active CONTROL controller required for cache publish")
+        context = controller.native_control_context2026(self)
+        value = worker.publish_control_callback_28_2026(context)
+        if type(value) is not int or not 0 <= value <= 255:
+            raise ValueError("Worker C25 SSMID must be a raw byte")
+        self._ssmid_cache2026 = value
+        if self._persistence is not None:
+            self._persistence.state.ssmid = value
+
+    def _publish_control_dh_type_cache2026(self, *, worker) -> None:
+        self._validate_control_cache_publisher2026(worker)
+        controller = self._controller_execution
+        if controller is None:
+            raise ValueError("Active CONTROL controller required for cache publish")
+        context = controller.native_control_context2026(self)
+        value = worker.publish_control_callback_2f2026(context)
+        if type(value) is not int or not 0 <= value <= 255:
+            raise ValueError("Worker C08 low byte must be a raw byte")
+        self._dh_type_cache2026 = value
+        if self._persistence is not None:
+            self._persistence.state.dh_central_gw_type = value
+
+    def _reset_control_callback_caches_for_cleanup2026(self, cleanup) -> None:
+        self._validate_cleanup_controller(cleanup)
+        if self._persistence is not None and (
+            self._persistence.state.ssmid != 0
+            or self._persistence.state.dh_central_gw_type != 0
+            or self._persistence.state.use_new_software_password
+            or self._persistence.state.comm_phase != 2
+            or self._persistence.state.sequence_changed_for_get_cid
+            or self._persistence.state.write_target_divided_cpu_image_index != 0
+        ):
+            raise ValueError("Reset the actual recovery aggregate before its caches")
+        self._ssmid_cache2026 = 0
+        self._dh_type_cache2026 = 0
+        self._control_retry_cache2026 = False
+        self._control_phase_cache2026 = 2
+        self._control_alternate_cache2026 = False
+        self._control_divided_index_cache2026 = 0
+
     def _publish_gateway_classifier_cache(self, producer) -> None:
         """1ad30 stores the issued classifier before authentication may fail."""
         from scripts.cuw_gateway_startup import GatewayStartup2026
@@ -2953,7 +3389,7 @@ class CUWEngine2026:
         """Slot28/58870→5b670 copies the actual current logical-block ordinal."""
         self._require_owned_phase()
         if type(ordinal) is not int or not 0 <= ordinal < len(
-            self.native_metadata.logical_blocks
+            self.family_metadata.logical_blocks
         ):
             raise ValueError("Actual selected-node logical-block ordinal required")
         self._logical_block_index = ordinal
@@ -3133,11 +3569,9 @@ class CUWEngine2026:
         """4c10 callback46 copies native ED6C into the current C60 working index."""
         self._require_owned_phase()
         _ = self.worker
-        if self._persistence is None:
-            value = 0
-        else:
+        if self._persistence is not None:
             self._validate_persistence_source(self.native_metadata)
-            value = self._persistence.state.write_target_divided_cpu_image_index
+        value = self.native_control_divided_index2026
         self.dh_state._divided_image_index = value
 
     def notify_next_cpu(self) -> None:
@@ -3745,11 +4179,16 @@ class CUWEngine2026:
             try:
                 if self._retry_controller is not None:
                     self._retry_controller.worker_started()
+                # 3cb90 copies the requested outer phase into worker BD0;
+                # 59ab0 imports that byte into CONTROL +978 before raw Execute.
+                self.dh_state._native_comm_phase = phase
                 worker._phase_started(phase)
-                self._import_identifier_context()
+                self._import_identifier_context(actual_control_import=True)
                 yield worker
+                self._end_native_control_context2026(controller)
                 worker._phase_finished(phase)
             except (Exception, KeyboardInterrupt) as error:
+                self._end_native_control_context2026(controller, error)
                 try:
                     worker._phase_failed(error)
                 except (Exception, KeyboardInterrupt) as cleanup_error:  # noqa: BLE001 - preserve the original failure
@@ -3758,6 +4197,8 @@ class CUWEngine2026:
                     )
                 raise
         finally:
+            self._end_native_control_context2026(controller)
+            self._controller_export_target2026 = None
             if self._retry_controller is not None and not (
                 self._thread_job is not None and self._thread_job.is_child_thread
             ):

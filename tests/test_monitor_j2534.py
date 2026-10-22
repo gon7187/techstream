@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import Any, Literal, cast
 
 from scripts.data_monitor import MonitorError, SelectedMonitorSession
-from scripts.diagnostic_db import Database, Section
+from scripts.diagnostic_db import Database, Section, parse_database
 from scripts.drive_recorder import RecorderCancelled
 from scripts.frame_transport import (
     DriverProperties,
@@ -42,7 +42,11 @@ from scripts.monitor_j2534 import (
     selected_packet_frame_cache,
 )
 from scripts.monitor_support import PacketReceive
-from scripts.native_communication import NativeCommunication, NativeFrameController
+from scripts.native_communication import (
+    NativeCommunication,
+    NativeFrameController,
+    SessionError,
+)
 from scripts.profiles import ProtocolProfile, VehicleCatalog, VehicleProfile
 from scripts.toyota_session import Limits
 
@@ -1726,6 +1730,241 @@ class NativeEventTests(unittest.TestCase):
         for spans in (((0, -8),), ((True, 8),), ((0, 7),), ((0,),)):
             with self.subTest(spans=spans), self.assertRaises(MonitorError):
                 DataMonitorEvent(0, b"\x01", b"\x01", 2, pickup_spans=cast(Any, spans))
+
+    def test_retained_worker_reuses_controller_restores_temp_config_and_keeps_channel(
+        self,
+    ):
+        operations, observed = authored_operations()
+        management = operations.profile.catalog.management
+        can = bytearray(management.sections[14].payload)
+        can[26] = 1
+        struct.pack_into("<H", can, 20, 100)
+        operations.profile.catalog.management = replace(
+            management,
+            sections={
+                **management.sections,
+                14: replace(management.sections[14], payload=bytes(can)),
+            },
+        )
+        parent = observed.invoke
+
+        def exchange(operation, fields, *, deadline, cancelled):
+            result = parent(operation, fields, deadline=deadline, cancelled=cancelled)
+            if operation == "ioctl" and fields["ioctl_id"] == 1:
+                return J2534Result(configs=(NativeConfig(0x23, 0x7777),))
+            return result
+
+        observed.invoke = exchange
+        controller = NativeFrameController(operations)
+        communication = NativeCommunication(
+            operations.profile,
+            controller,
+            "engine",
+            bus_id=operations.bus_id,
+            clock=lambda: 10,
+        )
+        self.assertEqual(operations.open(), 0)
+        before = len(observed.calls)
+        worker = DirectJ2534Worker(
+            operations,
+            DataMonitorEvent(0, b"\x0c", b"\x02", 2),
+            request_id=1,
+            response_id=0,
+            default_source=0x7E8,
+            communication=communication,
+            clock=lambda: 10,
+        )
+        self.assertIs(worker.controller, controller)
+        self.assertEqual(worker.start(), OK)
+        self.assertIsNotNone(operations._temporary_config)
+        self.assertEqual(worker.close(), 0)
+        calls = observed.calls[before:]
+        self.assertNotIn("connect", [op for op, _ in calls])
+        configs = [
+            (fields["ioctl_id"], fields["input"])
+            for op, fields in calls
+            if op == "ioctl" and fields["ioctl_id"] == 2
+        ]
+        self.assertEqual(configs[0][1], (NativeConfig(0x23, 100),))
+        self.assertEqual(configs[-1][1], (NativeConfig(0x23, 0x7777),))
+        self.assertIsNotNone(operations.channel)
+        self.assertTrue(operations.owns_channel)
+        self.assertFalse(communication.closed)
+
+    def test_retained_worker_applies_and_restores_initialized_closed_handle_zero(self):
+        operations, observed = authored_operations()
+        management = operations.profile.catalog.management
+        can = bytearray(management.sections[14].payload)
+        can[26] = 1
+        struct.pack_into("<H", can, 20, 100)
+        operations.profile.catalog.management = replace(
+            management,
+            sections={
+                **management.sections,
+                14: replace(management.sections[14], payload=bytes(can)),
+            },
+        )
+        parent = observed.invoke
+
+        def exchange(operation, fields, *, deadline, cancelled):
+            result = parent(operation, fields, deadline=deadline, cancelled=cancelled)
+            if operation == "ioctl" and fields["ioctl_id"] == 1:
+                return J2534Result(configs=(NativeConfig(0x23, 0x7777),))
+            return result
+
+        observed.invoke = exchange
+        controller = NativeFrameController(operations)
+        communication = NativeCommunication(
+            operations.profile,
+            controller,
+            "engine",
+            bus_id=operations.bus_id,
+            clock=lambda: 10,
+        )
+        self.assertEqual(operations.open(), 0)
+        self.assertEqual((operations._stmin_enabled, operations._stmin_value), (1, 100))
+        self.assertEqual(operations.close(), 0)
+        before = len(observed.calls)
+        worker = DirectJ2534Worker(
+            operations,
+            DataMonitorEvent(0, b"\x0c", b"\x02", 2),
+            request_id=1,
+            response_id=0,
+            default_source=0x7E8,
+            communication=communication,
+            clock=lambda: 10,
+        )
+        self.assertEqual(worker.start(), OK)
+        self.assertEqual(operations._temporary_config, 0x7777)
+        self.assertEqual(worker.close(), 0)
+        stmin = [
+            (fields["ioctl_id"], fields["channel_id"], fields["input"])
+            for op, fields in observed.calls[before:]
+            if op == "ioctl" and fields["ioctl_id"] in (1, 2)
+        ]
+        self.assertEqual(
+            stmin,
+            [
+                (1, 0, (NativeConfig(0x23, 0),)),
+                (2, 0, (NativeConfig(0x23, 100),)),
+                (2, 0, (NativeConfig(0x23, 0x7777),)),
+            ],
+        )
+        self.assertIsNone(operations.channel)
+
+    def test_retained_cold_worker_lazy_opens_on_first_real_send(self):
+        operations, observed = authored_operations()
+        controller = NativeFrameController(operations)
+        communication = NativeCommunication(
+            operations.profile,
+            controller,
+            "engine",
+            bus_id=operations.bus_id,
+            clock=lambda: 10,
+        )
+        worker = DirectJ2534Worker(
+            operations,
+            DataMonitorEvent(0, b"\x0c", b"\x02", 2),
+            request_id=1,
+            response_id=0,
+            default_source=0x7E8,
+            communication=communication,
+            clock=lambda: 10,
+        )
+        self.assertEqual(worker.start(), OK)
+        self.assertEqual(observed.calls, [])
+        self.assertEqual(worker.step(), OK)
+        self.assertEqual(worker.step(), OK)
+        operations_now = controller.operations
+        self.assertIsNotNone(operations_now.channel)
+        self.assertEqual([op for op, _ in observed.calls].count("connect"), 1)
+        self.assertTrue(any(op == "write_messages" for op, _ in observed.calls))
+        self.assertFalse(
+            any(
+                op == "ioctl" and fields["ioctl_id"] == 1
+                for op, fields in observed.calls
+            )
+        )
+        self.assertEqual(worker.close(), 0)
+        self.assertIsNotNone(controller.operations.channel)
+
+    def test_retained_worker_rejects_channel_change_before_start_io(self):
+        operations, observed = authored_operations()
+        controller = NativeFrameController(operations)
+        communication = NativeCommunication(
+            operations.profile,
+            controller,
+            "engine",
+            bus_id=operations.bus_id,
+            clock=lambda: 10,
+        )
+        worker = DirectJ2534Worker(
+            operations,
+            DataMonitorEvent(0, b"\x0c", b"\x02", 2),
+            request_id=1,
+            response_id=0,
+            default_source=0x7E8,
+            communication=communication,
+            clock=lambda: 10,
+        )
+        self.assertEqual(operations.open(), 0)
+        prior = len(observed.calls)
+        with self.assertRaisesRegex(MonitorError, "changed before worker start"):
+            worker.start()
+        self.assertEqual(len(observed.calls), prior)
+
+    def test_retained_worker_rechecks_source_context_and_poison_before_io(self):
+        for mutation in (
+            "bus",
+            "profile",
+            "diagnostic",
+            "management",
+            "poison",
+        ):
+            with self.subTest(mutation=mutation):
+                operations, observed = authored_operations()
+                controller = NativeFrameController(operations)
+                communication = NativeCommunication(
+                    operations.profile,
+                    controller,
+                    "engine",
+                    bus_id=operations.bus_id,
+                    clock=lambda: 10,
+                )
+                worker = DirectJ2534Worker(
+                    operations,
+                    DataMonitorEvent(0, b"\x0c", b"\x02", 2),
+                    request_id=1,
+                    response_id=0,
+                    default_source=0x7E8,
+                    communication=communication,
+                    clock=lambda: 10,
+                )
+                if mutation == "bus":
+                    operations.bus_id += 1
+                elif mutation == "profile":
+                    other, _ = authored_operations()
+                    operations.profile = other.profile
+                elif mutation == "diagnostic":
+                    operations.diagnostic_mode = b"\x01" + bytes(15)
+                elif mutation == "management":
+                    from scripts.demo import _ddb
+
+                    sections = {
+                        key: (section.count, section.payload)
+                        for key, section in operations.profile.catalog.management.sections.items()
+                    }
+                    operations.profile.catalog.management = parse_database(
+                        _ddb(1, sections)
+                    )
+                else:
+                    operations.poisoned = True
+                expected_error = (
+                    SessionError if mutation == "management" else MonitorError
+                )
+                with self.assertRaises(expected_error):
+                    worker.start()
+                self.assertEqual(observed.calls, [])
 
 
 if __name__ == "__main__":

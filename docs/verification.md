@@ -2,6 +2,34 @@
 
 В проекте несколько уровней проверки. Зелёный синтетический тест подтверждает только авторский путь и данные, которые он запускал. Он не доказывает такое же поведение OEM-программы, адаптера, ЭБУ или автомобиля.
 
+## Контрольная точка 22 октября 2026 — текущая рабочая ветка
+
+Текущая incremental acceptance привязана к frozen source pins: `techstream.py` SHA256 `a16a49b4e36f0eeee53a60a5bef28e07df66b62e635f0f119fad8d735b9210d5`, `.github/workflows/ci.yml` SHA256 `520166b5e4c27401131ea7875c3cbae7f7a7988ee12ba2b91ec758ce02323972`. Это file pins, не commit SHA.
+
+| Проверка | Результат | Граница |
+| --- | --- | --- |
+| Полный private suite | **6 452 теста, 0 failures, 0 errors, 0 skips**, 207,258 с | Локальный частный корпус; `full-private-checks.log`, root reports G3 PASS |
+| Свежий GitHub clone `0f99a6c` | **6 443 теста, 0 failures, 0 errors, 744 пропуска**, 69,417 с; offline workflows PASS | Все 74 уникальные skip-причины проверены: отсутствующие optional private/source/OEM packets. Более ранний чистый source snapshot: те же counts, 68,764 с |
+| Automatic CONTROL | **19 checks PASS** для leaf G1/G4/G6/G8 | Отдельно root подтверждает G2 offline workflows PASS; не означает закрытие G1–G6 |
+| GTK normal + compact | PASS после GUI-исправлений на frozen snapshot A16 | Проверены cancel/run и pending-close UI состояния; не физическое поведение |
+| SourceSpec | **SCOPED_PASS final candidate** на A16 по независимому static review | Остальные source obligations открыты |
+| Delivery-standards backend | PASS на `be752462` | Узкий backend verdict, не закрытие всех source/cleanup contracts |
+| Source manifest | **299 записей, zero drift — PASS** | `final-private-acceptance.json` |
+
+Два GUI-дефекта были найдены независимым static source/code review после более раннего успешного GTK smoke: idle-owner cancel/run должен восстанавливать каталог, а retry незавершённого cleanup — сохранять тот же owner. Исправления прошли новый normal/compact GTK. Свежий GitHub clone проверен на `0f99a6c`; все пять jobs публичного [CI 39803649029](https://github.com/gon7187/techstream/actions/runs/39803649029) прошли на том же SHA. Последующую интеграцию и проверки графа фиксирует [PR #6](https://github.com/gon7187/techstream/pull/6). Полное принятие 171 software obligations и full port не заявляются.
+
+Точечные результаты этой работы имеют ограниченную область. Источник данных для каждого типа указан отдельно:
+
+- **Публичные synthetic/regression checks:** Body/Sonar сохранил 62 исходных тестовых метода и проверки; добавлен bounded двух-CPU тест. Он подтверждает конкретное выполнение по двум адресам, не общую native multi-row cardinality. Исправление source-only Body skip guard не ослабляет исходные assertions.
+- **Private source-dependent review:** scoped review принял Body/Sonar caller migration и лист 74 held-address consumer guard. Это не закрывает G2/G3 или оставшиеся raw retry/outer-job ветви.
+- **Private source-dependent capture/admission:** SBR strict replay использует точные request/response пары, но capture adaptation переставляет целые action rows, включая SDK rows; заранее заданная хронология устройства не подтверждена. ADS linked-index имеет только scoped admission verdict. FullID имеет bounded software-source PASS: synthetic capture/strict replay и два original-backend monitor replay, но это не полнота DDR/TSE или всех входных источников.
+- **Private source-dependent Utility83 verdict:** scoped SMRT55 receipt reconciliation и bounded public `TYPlusEx2.InitializeDoIP` method с тремя аргументами приняты. Другие PlusDoIP exports, более широкие external consumers, полный UtilityEx, lifecycle parity и живой DoIP остаются открыты.
+- Native GTK: normal и compact smoke после GUI-исправлений PASS на frozen snapshot A16. Это подтверждает только проверенные экранные состояния и действия.
+- Leaf 11/143 GUI: приняты bounded authored selection → same-owner P4/P5 normal monitor → typed DRS/DM, late load/systems callback cancel, idle close result 9, retry result 0 и catalog restore. Leaf-11 G1 и manual G3/G4/G5 PASS; leaf-11 G2 и full leaf-143 queue/G2 остаются OPEN.
+- SBR count-before-store: проверен порядок счётчика до записи и ленивого будущего CPU; уже выполненные два CPU пропускаются. Это программный контракт авторских входов.
+
+Контрольный узкий прогон четырёх модулей Body, ADS, CommandAPI и UtilityEx (244 теста за 107 секунд) относится к более раннему снимку до корректировки durable-anchor пути. Текущие counts приведены в таблице выше. Физическое состояние оборудования по-прежнему `PHYSICAL_UNCONFIRMED`.
+
 ## Публичные проверки
 
 Проект использует Python 3.11+ и `unittest`, не pytest:
@@ -46,7 +74,7 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 - **Skipped/unrun** означает неизвестный результат, а не pass. Это включает проверки, код которых написан, но не запускался до паузы.
 - **Red/error** остаётся активной проблемой, пока исправление не проверено по исходному контракту. Сохранять красный вывод как свидетельство.
 - **Source omission** или неучтённый export/module означает открытый контракт; это не безопасное исключение и не утверждение о физическом оборудовании.
-- **Открытый gate** означает, что работа ещё нужна, даже если многие leaf-тесты зелёные. Полные source/consumer-гейты G1–G6 остаются открытыми независимо от результата доступного набора тестов. Исторические красные прогоны ниже относятся к своим снимкам; текущие результаты сверяются по контрольной точке 22 октября и точному SHA в PR #1.
+- **Открытый gate** означает, что работа ещё нужна, даже если многие leaf-тесты зелёные. Полная closure G1–G6 остаётся открытой; отдельные subgate уже PASS, включая G2 offline workflow check. Исторические CI и публичные прогоны ниже относятся к указанным снимкам; текущий проверенный код — `0f99a6c`, его CI и статус интеграции доступны по ссылкам выше.
 
 Актуальные красные и ожидающие проверки перечислены в [handoff разработки](development-handoff.md#известные-красные-и-открытые-места). Локальные `analysis/evidence/no-car-*/` содержат команды, снимки и ограничения; это частные необязательные свидетельства, не требование публичной сборки.
 
@@ -56,7 +84,7 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 
 Физический статус остаётся **`PHYSICAL_UNCONFIRMED`**. Будущая проверка должна указать адаптер и firmware, версии host/library, автомобиль и ЭБУ, точную операцию, измеренные обмены/тайминги, очистку после ошибки и границы безопасности. Пока таких данных нет, описывать результат только как Linux-программную реализацию, offline-инструмент, отдельное source-backed поведение или симуляцию — в зависимости от того, что реально проверялось.
 
-## Контрольная точка 22 октября 2026
+## Историческая контрольная точка 22 октября 2026
 
 Исправления кода и callers зафиксированы в `649b53a` и `05b7249`. Независимое source/caller-ревью Sol приняло сохранение retry-state, canonical ED0C join, исключительное владение авторской fixture и каноническую private-only границу. Дополнительно проверены оба cleanup-исключения: живой поток при timeout сохраняет владельца; ошибка уже присоединённого потока освобождает его и продолжает распространяться.
 

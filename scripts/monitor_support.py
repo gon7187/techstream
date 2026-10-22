@@ -243,6 +243,8 @@ class MonitorSupportCache:
         ] = {}
         self.limits, self.cancelled, self.clock = limits or Limits(), cancelled, clock
         self.identity = monitor_source_identity(profile, ecu)
+        self._response_scope = self._discovery_scope = self.identity[1:]
+        self._native_storage_namespace = False
         self.deadline = clock() + self.limits.seconds
         self.calls = 0
         self._responses: dict[tuple[object, ...], bytes] = {}
@@ -307,7 +309,7 @@ class MonitorSupportCache:
         if not isinstance(request, bytes):
             raise TypeError("Native response-cache request must be immutable bytes")
         responses = self._temporary_responses if temporary else self._responses
-        identity = self._temporary_identity if temporary else self.identity[1:]
+        identity = self._temporary_identity if temporary else self._response_scope
         return (*identity, request) in responses
 
     def invalidate_response(self, request: bytes, *, temporary: bool = False) -> None:
@@ -316,7 +318,7 @@ class MonitorSupportCache:
         if not isinstance(request, bytes):
             raise TypeError("Native response-cache request must be immutable bytes")
         responses = self._temporary_responses if temporary else self._responses
-        identity = self._temporary_identity if temporary else self.identity[1:]
+        identity = self._temporary_identity if temporary else self._response_scope
         responses.pop((*identity, request), None)
 
     def _frames(self, function: int) -> tuple[SelectedFrame, ...]:
@@ -363,7 +365,10 @@ class MonitorSupportCache:
         _uint(native_parameter, 65535, "communication parameter")
         # CSndRcvBufferList::SearchBuffer matches ECU and literal send bytes;
         # different selected functions/timers do not create another cache entry.
-        key = (*(self._temporary_identity if temporary else self.identity[1:]), request)
+        key = (
+            *(self._temporary_identity if temporary else self._response_scope),
+            request,
+        )
         if temporary and cached:
             raise ValueError("Select either temporary or Ever cache")
         responses = (
@@ -915,7 +920,7 @@ class MonitorSupportCache:
         """CreateLid26d60, native CB pages, FF LID escapes and Freeze truncation."""
         self._ecu_profile()
         self._check()
-        key = self.identity[1:]
+        key = self._discovery_scope
         if key in self._mode35:
             status, entries = self._mode35[key]
             if status:
@@ -990,7 +995,7 @@ class MonitorSupportCache:
         if kind not in (1, 2, 3, 4):
             raise ValueError("Invalid native support-bit kind")
         self._check()
-        key = (*self.identity[1:], kind)
+        key = (*self._discovery_scope, kind)
         if key in self._support_bits:
             status, data = self._support_bits[key]
             if status:
@@ -1898,7 +1903,15 @@ class MonitorSupportCache:
             return
         if self._responses:
             raise SessionError("Cannot replace an already populated native Ever cache")
+        scope = (
+            self._canonical_category_scope()
+            if owner._native_storage_namespace
+            else None
+        )
         self._responses = owner._responses
+        if scope is not None:
+            self._response_scope = scope
+            self._native_storage_namespace = True
 
     def share_discovery_cache(self, owner: MonitorSupportCache) -> None:
         """Bind native ShareData support slots10/11/19/1a and Mode35 slot21."""
@@ -1921,8 +1934,80 @@ class MonitorSupportCache:
             raise SessionError(
                 "Cannot replace an already populated native discovery cache"
             )
+        scope = (
+            self._canonical_category_scope()
+            if owner._native_storage_namespace
+            else None
+        )
         self._support_bits = owner._support_bits
         self._mode35 = owner._mode35
+        if scope is not None:
+            self._discovery_scope = scope
+            self._native_storage_namespace = True
+
+    def _canonical_category_scope(self) -> tuple[object, ...]:
+        profile = self.profile.catalog.build_protocol_profile(
+            self.profile.category, exception_ids=tuple(self.profile.exception_ids)
+        )
+        return monitor_source_identity(profile, self.ecu)[1:]
+
+    def _bind_selected_vehicle_storage(
+        self,
+        owner: MonitorSupportCache,
+        *,
+        protocol_profile: ProtocolProfile,
+    ) -> None:
+        """View this selected category's native DataCtrl ShareData slots."""
+        self._check()
+        if not isinstance(owner, MonitorSupportCache):
+            raise SessionError("Native cache owner is invalid")
+        owner._check()
+        exceptions = tuple(self.profile.exception_ids)
+        owner_exceptions = tuple(owner.profile.exception_ids)
+        if (
+            type(protocol_profile) is not ProtocolProfile
+            or not isinstance(self.profile, VehicleProfile)
+            or self.source_build != 18
+            or self.source_build != owner.source_build
+            or self.profile.catalog is not owner.profile.catalog
+            or self.profile.catalog.management.sha256
+            != owner.profile.catalog.management.sha256
+            or exceptions != owner_exceptions
+            or protocol_profile.catalog is not self.profile.catalog
+            or protocol_profile.category != self.profile.category
+            or tuple(protocol_profile.exception_ids) != exceptions
+            or protocol_profile.category_record != self.profile.category_record
+        ):
+            raise SessionError(
+                "Native selected-vehicle cache belongs to another source"
+            )
+        canonical = self.profile.catalog.build_protocol_profile(
+            self.profile.category, exception_ids=exceptions
+        )
+        owner_canonical = owner.profile.catalog.build_protocol_profile(
+            owner.profile.category, exception_ids=owner_exceptions
+        )
+        if (
+            protocol_profile != canonical
+            or owner_canonical.category_record != owner.profile.category_record
+        ):
+            raise SessionError(
+                "Native selected-vehicle category resource is not canonical"
+            )
+        if (
+            self._native_storage_namespace
+            or self._responses
+            or self._support_bits
+            or self._mode35
+        ):
+            raise SessionError("Cannot bind populated native selected-vehicle storage")
+        self._responses = owner._responses
+        self._support_bits = owner._support_bits
+        self._mode35 = owner._mode35
+        scope = monitor_source_identity(protocol_profile, self.ecu)[1:]
+        self._response_scope = scope
+        self._discovery_scope = scope
+        self._native_storage_namespace = True
 
     def temporary_observations(self) -> tuple[tuple[bytes, bytes], ...]:
         """Snapshot the active native TEMP buffer in insertion order, including empty replies."""
@@ -2207,7 +2292,7 @@ class MonitorSupportCache:
         if kind not in (1, 2, 3, 4):
             raise ToyotaCodecError("Invalid A8 cache kind", 0xC0040001)
         self._check()
-        self._support_bits.pop((*self.identity[1:], kind), None)
+        self._support_bits.pop((*self._discovery_scope, kind), None)
 
     def frame_map(self, pid: int) -> Mode35FrameMap:
         _uint(pid, 255, "frame PID")

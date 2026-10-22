@@ -3,6 +3,7 @@
 import struct
 import unittest
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 from scripts.monitor_support import (
@@ -10,8 +11,14 @@ from scripts.monitor_support import (
     PacketFrame,
     PacketFrameCache,
     mode35_frame_map,
+    monitor_source_identity,
 )
-from scripts.profiles import ProtocolProfile, SelectedFrame, VehicleProfile
+from scripts.profiles import (
+    ProtocolProfile,
+    SelectedFrame,
+    VehicleCatalog,
+    VehicleProfile,
+)
 from scripts.toyota import CommandFrame, ToyotaCodecError
 from scripts.toyota_session import Cancelled, Limits, SessionError
 
@@ -1014,7 +1021,7 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0x91010009)
 
 
-class OperationBudgetTests(unittest.TestCase):
+class OperationBudgetEverTests(unittest.TestCase):
     def test_explicit_native_ever_owner_shares_source_not_display_name(self):
         selected = profile({})
         frame = selected.frame_records(15)[0]
@@ -1043,6 +1050,148 @@ class OperationBudgetTests(unittest.TestCase):
                 selected, Mock(), "wrong-build", source_build=12
             ).share_ever_cache(owner)
 
+
+class SelectedVehicleStorageTests(unittest.TestCase):
+    @staticmethod
+    def caches(*categories):
+        catalog = cast(
+            VehicleCatalog,
+            SimpleNamespace(management=SimpleNamespace(sha256="selected-management")),
+        )
+        category_rows = {
+            category: bytes(68) + category.to_bytes(2, "little") + bytes(10)
+            for category in categories
+        }
+        catalog.build_protocol_profile = lambda category, exception_ids=(): (
+            ProtocolProfile(catalog, category_rows[category], tuple(exception_ids))
+        )
+
+        def make(category, exchange):
+            selected = profile({})
+            selected.catalog = catalog
+            selected.category = category
+            selected.category_record = category_rows[category]
+            selected.vehicle_name_key = 42
+            selected.exception_ids = (3,)
+            return MonitorSupportCache(selected, exchange, "selected-ecu"), selected
+
+        return catalog, make
+
+    def test_selected_category_alias_reads_literal_ever_and_temp_stays_local(self):
+        catalog, make = self.caches(7)
+        owner_exchange = Mock(return_value=b"\x61\x01\x80")
+        owner, _ = make(7, owner_exchange)
+        target_exchange = Mock(return_value=b"\x61\x02\x80")
+        target, selected = make(7, target_exchange)
+        scope = monitor_source_identity(
+            catalog.build_protocol_profile(7, exception_ids=(3,)), "selected-ecu"
+        )[1:]
+        owner._responses[(*scope, b"\x21\x01")] = b"\x61\x01\x80"
+        target._bind_selected_vehicle_storage(
+            owner,
+            protocol_profile=catalog.build_protocol_profile(7, exception_ids=(3,)),
+        )
+        self.assertIs(target._responses, owner._responses)
+        frame = selected.frame_records(15)[0]
+        self.assertEqual(target.transaction(frame, b"\x21\x01"), b"\x61\x01\x80")
+        self.assertEqual(target_exchange.call_count, 0)
+        target.transaction(frame, b"\x21\x02", cached=False, temporary=True)
+        self.assertNotIn((*target._response_scope, b"\x21\x02"), owner._responses)
+        self.assertEqual(target_exchange.call_count, 1)
+
+    def test_selected_category_alias_retains_support_and_mode35_status(self):
+        catalog, make = self.caches(7)
+        owner, _ = make(7, Mock())
+        target, _ = make(7, Mock(side_effect=AssertionError("cached discovery")))
+        scope = monitor_source_identity(
+            catalog.build_protocol_profile(7, exception_ids=(3,)), "selected-ecu"
+        )[1:]
+        owner._support_bits[(*scope, 2)] = (0, ((1, b"\xaa"),))
+        owner._mode35[scope] = (0xA0030107, ())
+        target._bind_selected_vehicle_storage(
+            owner,
+            protocol_profile=catalog.build_protocol_profile(7, exception_ids=(3,)),
+        )
+        self.assertEqual(target.support_bits(2), {1: b"\xaa"})
+        with self.assertRaises(ToyotaCodecError) as raised:
+            target.mode35()
+        self.assertEqual(raised.exception.code, 0xA0030107)
+
+    def test_different_category_misses_and_full_source_guard_precedes_hit(self):
+        catalog, make = self.caches(7, 8)
+        calls = []
+
+        def exchange(query):
+            calls.append(query.request)
+            return b"\x61\x01\x80"
+
+        owner, _ = make(7, exchange)
+        other, other_profile = make(8, exchange)
+        category7_scope = monitor_source_identity(
+            catalog.build_protocol_profile(7, exception_ids=(3,)), "selected-ecu"
+        )[1:]
+        owner._responses[(*category7_scope, b"\x21\x01")] = b"\x61\x01\x80"
+        other._bind_selected_vehicle_storage(
+            owner,
+            protocol_profile=catalog.build_protocol_profile(8, exception_ids=(3,)),
+        )
+        frame = other_profile.frame_records(15)[0]
+        self.assertEqual(other.transaction(frame, b"\x21\x01"), b"\x61\x01\x80")
+        self.assertEqual(calls, [b"\x21\x01"])
+        other_profile.ecu_database_sha256 = "changed-after-hit"
+        with self.assertRaisesRegex(SessionError, "identity changed"):
+            other.transaction(frame, b"\x21\x01")
+        self.assertEqual(calls, [b"\x21\x01"])
+
+    def test_foreign_catalog_and_populated_target_reject_before_alias(self):
+        catalog, make = self.caches(7)
+        owner, _ = make(7, Mock())
+        target, selected = make(7, Mock(return_value=b"\x61\x01\x80"))
+        _, foreign_make = self.caches(7)
+        foreign, _ = foreign_make(7, Mock())
+        with self.assertRaisesRegex(SessionError, "another source"):
+            target._bind_selected_vehicle_storage(
+                foreign,
+                protocol_profile=catalog.build_protocol_profile(7, exception_ids=(3,)),
+            )
+        self.assertIsNot(target._responses, owner._responses)
+        frame = selected.frame_records(15)[0]
+        target.transaction(frame, b"\x21\x01")
+        with self.assertRaisesRegex(SessionError, "populated"):
+            target._bind_selected_vehicle_storage(
+                owner,
+                protocol_profile=catalog.build_protocol_profile(7, exception_ids=(3,)),
+            )
+
+    def test_generic_sibling_inherits_namespace_using_its_own_category(self):
+        catalog, make = self.caches(7, 8)
+        owner, _ = make(7, Mock())
+        bound, _ = make(7, Mock())
+        bound._bind_selected_vehicle_storage(
+            owner,
+            protocol_profile=catalog.build_protocol_profile(7, exception_ids=(3,)),
+        )
+        calls = []
+        sibling, selected = make(
+            8,
+            lambda query: calls.append(query.request) or b"\x61\x01\x80",
+        )
+        sibling.share_ever_cache(bound)
+        sibling.share_discovery_cache(bound)
+        expected_scope = monitor_source_identity(
+            catalog.build_protocol_profile(8, exception_ids=(3,)), "selected-ecu"
+        )[1:]
+        self.assertTrue(sibling._native_storage_namespace)
+        self.assertEqual(sibling._response_scope, expected_scope)
+        self.assertEqual(sibling._discovery_scope, expected_scope)
+        self.assertEqual(
+            sibling.transaction(selected.frame_records(15)[0], b"\x21\x01"),
+            b"\x61\x01\x80",
+        )
+        self.assertEqual(calls, [b"\x21\x01"])
+
+
+class OperationBudgetTests(unittest.TestCase):
     def test_active_temporary_observations_keep_order_empty_and_scope_identity(self):
         selected = profile({})
         frame = selected.frame_records(15)[0]

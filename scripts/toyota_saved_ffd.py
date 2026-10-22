@@ -3089,10 +3089,10 @@ def capture_ads_image_record_phase(
                     processed.add(index & 0xFFFF)
                 else:
                     rollback = True
-            elif index and index >> 16 in processed:
+            else:
                 # Native4850 compares index highWORD with lowWORD of a stored
                 # CCmdDwordId value (GetAt object+8), not the stored highWORD.
-                rollback = True
+                rollback = index == 0 or (index >> 16) not in processed
             if not log_status:
                 log_status, offset = _image_log_position(packet_log, rollback, offset)
         if status:

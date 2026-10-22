@@ -5,13 +5,14 @@ import tempfile
 import unittest
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 from test_frame_transport import DRIVER, selected_profile
 from test_frame_transport_variants import EthernetPrimitive, ethernet_profile
 from test_profiles import encode_database
 
 from scripts.diagnostic_db import parse_database
-from scripts.frame_transport import J2534Result, NativeMessage
+from scripts.frame_transport import FrameTransportError, J2534Result, NativeMessage
 from scripts.native_communication import (
     NO_RESPONSE,
     PARTIAL_RESPONSE,
@@ -113,6 +114,362 @@ def serialized_profile(
     struct.pack_into("<I", serialized, 28, profile.catalog.management.version)
     profile.catalog.management = parse_database(bytes(serialized))
     return profile
+
+
+class SelectedVehicleBindingTests(unittest.TestCase):
+    def binding_target(
+        self, *, initial_bus_id=0x12, target_psa=False, omit_tester=False
+    ):
+        from scripts.demo import create_demo
+        from scripts.drive_recorder import NativeVehicleSelector, NativeVehicleSession
+        from scripts.profiles import VehicleCatalog
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = create_demo(Path(temporary.name) / "authored") / "Techstream_DB_NA"
+        candidate = serialized_profile(bus=0x12)
+        original = VehicleCatalog(root).management
+        sections = {
+            key: (section.count, section.payload)
+            for key, section in original.sections.items()
+        }
+        for slot in (0, 13, 14, 15, 17, 18, 29, 51):
+            section = candidate.catalog.management.sections[slot]
+            payload = bytearray(section.payload)
+            if slot == 13:
+                struct.pack_into("<H", payload, 0, 1)
+                payload[24] = initial_bus_id
+                if initial_bus_id != 0x12:
+                    target_row = bytearray(payload[:28])
+                    target_row[24] = 0x12
+                    payload = target_row + payload
+                    sections[slot] = (section.count + 1, bytes(payload))
+                    continue
+            elif slot == 18:
+                for index in range(section.count):
+                    struct.pack_into("<H", payload, index * 16, 1)
+            sections[slot] = (section.count, bytes(payload))
+        count, payload = sections[16]
+        category = bytearray(payload)
+        category[72] = 0x14 if target_psa else 1
+        sections[16] = (count, bytes(category))
+        if omit_tester:
+            count, payload = sections[18]
+            payload = b"".join(
+                payload[index : index + 16]
+                for index in range(0, len(payload), 16)
+                if struct.unpack_from("<H", payload, index + 2)[0] != 0x7F
+            )
+            sections[18] = (count - 1, payload)
+        management = bytearray(encode_database(1, sections))
+        struct.pack_into("<I", management, 28, original.version)
+        (root / "Toyota.ddb").write_bytes(management)
+
+        catalog = VehicleCatalog(root)
+        protocol = catalog.build_protocol_profile(1)
+        backend = J2534Fixture([])
+        owner = NativeCommunication.from_backend(
+            protocol,
+            backend,
+            "recorded-ecu",
+            first_request=b"\x22\x01",
+            driver=DRIVER,
+            device_kind=8,
+            bus_id=initial_bus_id,
+            source_build=18,
+            clock=lambda: 0.0,
+        )
+        session = NativeVehicleSession(owner)
+        selector = NativeVehicleSelector(session, info_ids=(), text_encoding="ascii")
+        selection = selector._manual_finish(10001, postlude=False)
+        profile = catalog.build_profile(1, vehicle_name_key=10001)
+        return owner, session, selector, selection, profile, backend
+
+    def test_selector_terminal_binds_same_controller_without_io(self):
+        owner, session, _selector, selection, profile, backend = self.binding_target()
+        bound = owner.bind_selected_vehicle(
+            session,
+            selection,
+            profile,
+            "recorded-ecu",
+            bus_id=0x12,
+            first_request=b"\x22\x01",
+        )
+
+        self.assertEqual(selection.trailing_words, (0, session.current_model))
+        self.assertIs(bound.operations, owner.operations)
+        self.assertEqual(bound.profile.vehicle_name_key, 10001)
+        self.assertEqual(
+            bound.cache.identity,
+            (
+                "recorded-ecu",
+                profile.database.sha256,
+                profile.catalog.management.sha256,
+                profile.category,
+                profile.category_record,
+                profile.exception_ids,
+                10001,
+            ),
+        )
+        self.assertIs(bound.cache._responses, owner.cache._responses)
+        self.assertIs(bound.cache._support_bits, owner.cache._support_bits)
+        self.assertIs(bound.cache._mode35, owner.cache._mode35)
+        self.assertTrue(owner._shared_controller)
+        self.assertTrue(bound._shared_controller)
+        self.assertEqual(backend.calls, [])
+
+    def test_same_target_is_idempotent_and_owner_rejects_rebinding(self):
+        owner, session, selector, selection, profile, backend = self.binding_target()
+        args = (session, selection, profile, "recorded-ecu")
+        kwargs = {"bus_id": 0x12, "first_request": b"\x22\x01"}
+        bound = owner.bind_selected_vehicle(*args, **kwargs)
+        self.assertIs(owner.bind_selected_vehicle(*args, **kwargs), bound)
+
+        other = selector._manual_finish(10002, postlude=False)
+        other_profile = profile.catalog.build_profile(1, vehicle_name_key=10002)
+        with self.assertRaisesRegex(ValueError, "already bound"):
+            owner.bind_selected_vehicle(
+                session,
+                other,
+                other_profile,
+                "recorded-ecu",
+                bus_id=0x12,
+                first_request=b"\x22\x01",
+            )
+        self.assertEqual(backend.calls, [])
+
+    def test_foreign_session_catalog_and_nonterminal_selection_reject_before_io(self):
+        owner, session, _selector, selection, profile, backend = self.binding_target()
+        from scripts.drive_recorder import NativeVehicleSelection, NativeVehicleSession
+
+        foreign_owner = NativeCommunication(
+            owner.profile,
+            owner.operations,
+            owner.ecu,
+            bus_id=owner.bus_id,
+            source_build=owner.source_build,
+            clock=owner.clock,
+        )
+        foreign = NativeVehicleSession(foreign_owner)
+        with self.assertRaisesRegex(ValueError, "original session"):
+            owner.bind_selected_vehicle(
+                foreign,
+                selection,
+                profile,
+                "recorded-ecu",
+                bus_id=0x12,
+                first_request=b"\x22\x01",
+            )
+        self.assertIsNot(foreign, session)
+
+        foreign_catalog = type(profile.catalog)(profile.catalog.root).build_profile(
+            1, vehicle_name_key=10001
+        )
+        with self.assertRaisesRegex(ValueError, "source or retained controller"):
+            owner.bind_selected_vehicle(
+                session,
+                selection,
+                foreign_catalog,
+                "recorded-ecu",
+                bus_id=0x12,
+                first_request=b"\x22\x01",
+            )
+        pending = NativeVehicleSelection(
+            selection.core_words,
+            selection.vin,
+            selection.list_core_words,
+            selection.select_names,
+            selection.car_info,
+            selection.options,
+            (1, selection.trailing_words[1]),
+        )
+        with self.assertRaisesRegex(ValueError, "terminal native vehicle"):
+            owner.bind_selected_vehicle(
+                session,
+                pending,
+                profile,
+                "recorded-ecu",
+                bus_id=0x12,
+                first_request=b"\x22\x01",
+            )
+        malformed = NativeVehicleSelection(
+            selection.core_words,
+            selection.vin,
+            selection.list_core_words,
+            selection.select_names,
+            selection.car_info,
+            selection.options,
+            cast(tuple[int, int], (0,)),
+        )
+        with self.assertRaisesRegex(ValueError, "malformed terminal words"):
+            owner.bind_selected_vehicle(
+                session,
+                malformed,
+                profile,
+                "recorded-ecu",
+                bus_id=0x12,
+                first_request=b"\x22\x01",
+            )
+        self.assertEqual(backend.calls, [])
+
+    def test_disposed_session_and_bad_constructor_request_reject_without_io(self):
+        owner, session, _selector, selection, profile, backend = self.binding_target()
+        with self.assertRaisesRegex(ValueError, "Invalid selected vehicle binding"):
+            owner.bind_selected_vehicle(
+                session,
+                selection,
+                profile,
+                "recorded-ecu",
+                bus_id=True,
+                first_request=b"\x22\x01",
+            )
+        self.assertFalse(owner._shared_controller)
+        session.dispose()
+        with self.assertRaisesRegex(SessionError, "disposed"):
+            owner.bind_selected_vehicle(
+                session,
+                selection,
+                profile,
+                "recorded-ecu",
+                bus_id=0x12,
+                first_request=b"\x22\x01",
+            )
+        self.assertEqual(backend.calls, [])
+
+    def test_original_owner_survives_actual_controller_context_change(self):
+        owner, session, _selector, selection, profile, backend = self.binding_target()
+        bound = owner.bind_selected_vehicle(
+            session,
+            selection,
+            profile,
+            "recorded-ecu",
+            bus_id=0x12,
+            first_request=b"\x22\x01",
+        )
+        controller = cast(NativeFrameController, bound.operations)
+        context = profile.catalog.build_protocol_profile(
+            profile.category, exception_ids=tuple(profile.exception_ids)
+        )
+
+        self.assertEqual(
+            controller.change_context(
+                context,
+                bus_id=0x12,
+                first_request=b"\x22\x01",
+                request=None,
+                deadline=1.0,
+            ),
+            0,
+        )
+        session._check()
+        self.assertIs(bound.operations, owner.operations)
+        self.assertEqual(backend.calls, [])
+
+    def test_target_psa_variant_does_not_require_normal_tester_frame(self):
+        owner, session, _selector, selection, profile, backend = self.binding_target(
+            target_psa=True, omit_tester=True
+        )
+
+        bound = owner.bind_selected_vehicle(
+            session,
+            selection,
+            profile,
+            "recorded-ecu",
+            bus_id=0x12,
+            first_request=b"\x22\x01",
+        )
+
+        self.assertEqual(profile.category_record[72] & 0x1F, 0x14)
+        self.assertEqual(
+            cast(NativeFrameController, owner.operations).operations.native_variant,
+            "psa",
+        )
+        self.assertIs(bound.operations, owner.operations)
+        self.assertEqual(backend.calls, [])
+
+    def test_normal_target_still_rejects_missing_tester_metadata(self):
+        owner, session, _selector, selection, profile, backend = self.binding_target(
+            target_psa=True, omit_tester=True
+        )
+
+        with self.assertRaises(FrameTransportError):
+            owner.bind_selected_vehicle(
+                session,
+                selection,
+                profile,
+                "recorded-ecu",
+                bus_id=0x11,
+                first_request=b"\x22\x01",
+            )
+        self.assertFalse(owner._shared_controller)
+        self.assertEqual(backend.calls, [])
+
+    def test_normal_initial_owner_validates_psa_selected_context_variant(self):
+        owner, session, _selector, selection, profile, backend = self.binding_target(
+            initial_bus_id=0x17, target_psa=True
+        )
+        self.assertEqual(
+            cast(NativeFrameController, owner.operations).operations.native_variant,
+            "normal",
+        )
+
+        bound = owner.bind_selected_vehicle(
+            session,
+            selection,
+            profile,
+            "recorded-ecu",
+            bus_id=0x12,
+            first_request=b"\x22\x01",
+        )
+
+        self.assertIs(bound.operations, owner.operations)
+        self.assertEqual(backend.calls, [])
+
+    def test_cleanly_closed_retained_controller_can_bind_and_reopen(self):
+        owner, session, _selector, selection, profile, backend = self.binding_target()
+        controller = cast(NativeFrameController, owner.operations)
+        lower = controller.operations
+        self.assertEqual(lower.open(deadline=1.0, setup=False), 0)
+        self.assertEqual(lower.close(deadline=1.0), 0)
+        self.assertTrue(lower._native_close_started)
+        self.assertIsNone(lower.channel)
+        before_bind = list(backend.calls)
+
+        bound = owner.bind_selected_vehicle(
+            session,
+            selection,
+            profile,
+            "recorded-ecu",
+            bus_id=0x12,
+            first_request=b"\x22\x01",
+        )
+
+        self.assertIs(bound.operations, controller)
+        self.assertEqual(backend.calls, before_bind)
+        self.assertTrue(lower._native_close_started)
+        self.assertEqual(lower.open(deadline=1.0, setup=False), 0)
+        self.assertFalse(lower._native_close_started)
+        self.assertEqual(lower.close(deadline=1.0), 0)
+        self.assertEqual(
+            [operation for operation, _fields in backend.calls],
+            ["connect", "disconnect", "connect", "disconnect"],
+        )
+
+    def test_replaced_backend_is_rejected_before_binding(self):
+        owner, session, _selector, selection, profile, backend = self.binding_target()
+        cast(NativeFrameController, owner.operations).operations.backend = J2534Fixture(
+            []
+        )
+        with self.assertRaisesRegex(ValueError, "source or retained controller"):
+            owner.bind_selected_vehicle(
+                session,
+                selection,
+                profile,
+                "recorded-ecu",
+                bus_id=0x12,
+                first_request=b"\x22\x01",
+            )
+        self.assertEqual(backend.calls, [])
 
 
 class CommonTransactions(unittest.TestCase):

@@ -467,6 +467,75 @@ def _validate_connection(
         )
 
 
+def _retained_normal_snapshot(operations: NativeFrameOperations) -> tuple[object, ...]:
+    return (
+        operations,
+        operations.backend,
+        operations.profile,
+        operations.native_build,
+        operations.driver,
+        operations.device_kind,
+        operations.bus_id,
+        operations.diagnostic_mode,
+        operations.channel,
+        operations.owns_channel,
+    )
+
+
+def _validate_retained_normal_communication(
+    operations: NativeFrameOperations,
+    plan: PollPlan,
+    connection: SelectedMonitorConnection,
+    communication: NativeCommunication,
+    *,
+    snapshot: tuple[object, ...] | None = None,
+) -> None:
+    if (
+        not isinstance(communication, NativeCommunication)
+        or not isinstance(communication.operations, NativeFrameController)
+        or communication.operations.operations is not operations
+        or communication.profile is not operations.profile
+        or communication.operations.profile is not communication.profile
+        or communication.source_build != operations.native_build
+        or communication.bus_id != operations.bus_id
+        or communication.closed
+        or not communication._shared_controller
+        or not isinstance(communication._context_first_request, bytes)
+        or len(communication._context_first_request) > 65535
+        or communication.operations._context_failed
+        or operations.poisoned
+        or operations.device_kind != 8
+        or not isinstance(plan, (SelectedP4Monitor, SelectedP5PollingMonitor))
+        or plan.source_build != operations.native_build
+        or plan.definitions.source_identity
+        != monitor_source_identity(communication.profile, "")
+    ):
+        raise MonitorError(
+            "Retained normal polling context differs from selected source", INVALID
+        )
+    current = _retained_normal_snapshot(operations)
+    if snapshot is not None and (
+        snapshot[0] is not current[0]
+        or snapshot[1] is not current[1]
+        or snapshot[2] is not current[2]
+        or snapshot[3] != current[3]
+        or snapshot[4] is not current[4]
+        or snapshot[5:] != current[5:]
+    ):
+        raise MonitorError(
+            "Retained normal polling lower or channel ownership changed", INVALID
+        )
+    if operations.channel is None:
+        if operations.owns_channel:
+            raise MonitorError(
+                "Retained cold lower has inconsistent ownership", INVALID
+            )
+    elif not operations.owns_channel:
+        raise MonitorError("Retained normal polling channel is borrowed", INVALID)
+    communication._check()
+    _validate_connection(operations, plan, connection)
+
+
 class NormalPollingWorker:
     """Native normal P5 three-slot ThreadMain, one primitive per step.
 
@@ -493,16 +562,24 @@ class NormalPollingWorker:
         ticks: Callable[[], int] | None = None,
         cancelled: Callable[[], bool] = lambda: False,
         packet_sink: Callable[[NativeMonitorPacket], None] | None = None,
+        communication: NativeCommunication | None = None,
     ):
+        if communication is not None:
+            _validate_retained_normal_communication(
+                operations, plan, connection, communication
+            )
         self.event = selected_poll_event(operations, plan, routine_info=routine_info)
-        _validate_connection(operations, plan, connection)
+        if communication is None:
+            _validate_connection(operations, plan, connection)
         if (
             operations.device_kind != 8
-            or operations.channel is not None
+            or communication is None
+            and operations.channel is not None
             or operations.poisoned
         ):
             raise MonitorError(
-                "Normal direct worker requires fresh owned non-DMCI operations", INVALID
+                "Normal direct worker requires an admitted retained or fresh non-DMCI transport",
+                INVALID,
             )
         if (
             type(timeout) not in (int, float)
@@ -554,7 +631,15 @@ class NormalPollingWorker:
         self.active_drive, self.before_drive = False, True
         self.end_results: list[tuple[int, int]] = []
         self.operations, self.plan, self.connection = operations, plan, connection
-        self.controller = NativeFrameController(operations)
+        self.communication = communication
+        if communication is not None:
+            assert isinstance(communication.operations, NativeFrameController)
+            self.controller = communication.operations
+        else:
+            self.controller = NativeFrameController(operations)
+        self.retained_snapshot = (
+            _retained_normal_snapshot(operations) if communication is not None else None
+        )
         self.clock, self.ticks, self.cancelled = clock, ticks, cancelled
         self.timeout, self.max_steps, self.max_packets, self.max_bytes = (
             timeout,
@@ -664,9 +749,18 @@ class NormalPollingWorker:
             raise MonitorError(
                 "Normal polling start requires configured state", INVALID
             )
-        if self.operations.channel is not None or self.operations.poisoned:
-            raise MonitorError(
-                "Normal polling requires a fresh owned transport", INVALID
+        if self.communication is None:
+            if self.operations.channel is not None or self.operations.poisoned:
+                raise MonitorError(
+                    "Normal polling requires a fresh owned transport", INVALID
+                )
+        else:
+            _validate_retained_normal_communication(
+                self.operations,
+                self.plan,
+                self.connection,
+                self.communication,
+                snapshot=self.retained_snapshot,
             )
         self.deadline = self._now() + self.timeout
         self._check()
@@ -677,8 +771,14 @@ class NormalPollingWorker:
         original_cancelled = self.original_cancelled
         self.operations.cancelled = lambda: original_cancelled() or self.cancelled()
         self.operations.defer_cancel_cleanup = True
-        status = self.operations.open(deadline=self.deadline)
+        status = (
+            0
+            if self.communication is not None
+            else self.operations.open(deadline=self.deadline)
+        )
         self._alive()
+        if not status and self.communication is not None:
+            self.operations.apply_temporary_config(deadline=self.deadline)
         self.state = "fault" if status else "select"
         if not status and isinstance(self.event, DataMonitorEvent):
             self.event.start()
@@ -965,7 +1065,9 @@ class NormalPollingWorker:
         try:
             self.operations.cancelled = lambda: False
             self.active_rids.clear()
-            if self.active is not None:
+            if self.active is not None and self.operations.poisoned:
+                self.active.stop()
+            if self.active is not None and not self.operations.poisoned:
                 self.active.stop()
                 until, calls = self._now() + self.timeout, 0
                 while self.active.item.status != 5:
@@ -1006,7 +1108,7 @@ class NormalPollingWorker:
                     self.end_results.append((sent, received))
                     self.active.item.status = 5
                     self.active.advance()
-            if self.clear_ids:
+            if self.clear_ids and not self.operations.poisoned:
                 try:
                     selected = self.operations.profile.frame_records(0xD4)[0]
                 except (ToyotaCodecError, ValueError, IndexError) as error:
@@ -1055,9 +1157,21 @@ class NormalPollingWorker:
                 until = self._now() + self.timeout
             except BaseException as error:  # noqa: BLE001 - release after broken host clock
                 failure = error
-            status = self.controller.disconnect(
-                int(self.security_release or self.stop_fault), deadline=until
-            )
+            if self.communication is not None and not self.operations.poisoned:
+                try:
+                    self.operations.restore_temporary_config(deadline=until)
+                except BaseException as error:  # noqa: BLE001 - disconnect still releases the owner
+                    failure = failure or error
+            try:
+                status = self.controller.disconnect(
+                    int(self.security_release or self.stop_fault), deadline=until
+                )
+            except BaseException as error:  # noqa: BLE001 - retain the primary cleanup failure
+                if failure is None:
+                    failure = error
+                else:
+                    failure.add_note(f"Normal polling disconnect failed: {error}")
+                status = INVALID
         finally:
             self.operations.cancelled = (
                 self.original_cancelled
@@ -1127,8 +1241,16 @@ def selected_normal_poll_worker(
     ticks: Callable[[], int] | None = None,
     cancelled: Callable[[], bool] = lambda: False,
     packet_sink: Callable[[NativeMonitorPacket], None] | None = None,
+    communication: NativeCommunication | None = None,
 ) -> DirectJ2534Worker | NormalPollingWorker:
     """Actual normal P4 packet/pair or P5 constructor; A8 remains distinct."""
+    if communication is not None and (
+        oscilloscope is not None
+        or not isinstance(plan, (SelectedP4Monitor, SelectedP5PollingMonitor))
+    ):
+        raise MonitorError(
+            "Retained normal polling supports only selected P4/P5 plans", INVALID
+        )
     if oscilloscope is not None and (
         not isinstance(oscilloscope, NormalOscilloscopeSelection)
         or not isinstance(plan, SelectedP4Monitor)
@@ -1234,6 +1356,7 @@ def selected_normal_poll_worker(
             ticks=ticks,
             cancelled=cancelled,
             packet_sink=packet_sink,
+            communication=communication,
         )
         if oscilloscope is not None:
             selected_worker_oscilloscope(
@@ -1271,6 +1394,7 @@ def selected_normal_poll_worker(
         ticks=ticks,
         cancelled=cancelled,
         packet_sink=packet_sink,
+        communication=communication,
     )
 
 

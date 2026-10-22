@@ -1256,6 +1256,131 @@ class SavedFfdTests(unittest.TestCase):
                     self.assertIn(native_request, writes)
                 self.assertEqual(writes[-2:], ["231501000010000c", "2315010000100c01"])
 
+    def _run_ads_image_record_phase(self, indices, scalars, first_ddr):
+        from test_frame_transport import DRIVER
+        from test_native_communication import J2534Fixture, serialized_profile
+
+        from scripts.database_resources import DdrPacketLog
+        from scripts.diagnostic_db import parse_database
+        from scripts.frame_transport import J2534Result, NativeMessage
+        from scripts.native_communication import (
+            NativeCommunication,
+            NativeFrameController,
+        )
+
+        selected = serialized_profile(request=b"\x21\x00", mask=b"", check=b"")
+        sections = {
+            slot: (item.count, item.payload)
+            for slot, item in selected.catalog.management.sections.items()
+        }
+        count, rows = sections[18]
+        rows += struct.pack("<8H", 42, 0x66, 1, 0, 0, 0, 0, 0)
+        sections[18] = (
+            count + 1,
+            b"".join(
+                sorted(
+                    (rows[offset : offset + 16] for offset in range(0, len(rows), 16)),
+                    key=lambda row: struct.unpack_from("<HH", row),
+                )
+            ),
+        )
+        selected.catalog.management = parse_database(database(1, sections))
+
+        def record(index, scalar):
+            return (
+                bytes.fromhex("eb232820")
+                + index.to_bytes(4, "big")
+                + bytes.fromhex("025004023300050102")
+                + scalar.to_bytes(2, "big")
+            )
+
+        raw_records = tuple(
+            record(index, scalar) for index, scalar in zip(sorted(indices), scalars)
+        )
+        answers = [
+            bytes.fromhex("6100"),
+            bytes.fromhex("eb2128209999"),
+            bytes.fromhex("eb222820")
+            + b"".join(index.to_bytes(4, "big") for index in indices),
+            *raw_records,
+        ]
+        backend = J2534Fixture(
+            [
+                J2534Result(
+                    count=1,
+                    messages=(
+                        NativeMessage(
+                            6, 0, 0, 0, 0, bytes.fromhex("000007e8") + answer
+                        ),
+                    ),
+                )
+                for answer in answers
+            ]
+        )
+        channel = NativeCommunication.from_backend(
+            selected,
+            backend,
+            "ads-image-linked-phase",
+            first_request=b"\x21\x00",
+            driver=DRIVER,
+            device_kind=8,
+            bus_id=0x12,
+            source_build=18,
+            clock=lambda: 0.0,
+        )
+        assert isinstance(channel.operations, NativeFrameController)
+        with tempfile.TemporaryDirectory() as directory:
+            logger = DdrPacketLog(Path(directory), channel.operations)
+            self.assertEqual(logger.start(24), 0)
+            self.assertEqual(channel.connection_no_buffer().status, 0)
+            with channel.cache.temporary_scope(no_init=True):
+                result = capture_ads_image_record_phase(
+                    channel.cache,
+                    selected.frame_records(0x66)[0],
+                    logger,
+                    (1,),
+                    first_ddr,
+                )
+            self.assertEqual(result.native_status, 0)
+            self.assertEqual(result.log_status, 0)
+            self.assertEqual(backend.replies, [])
+            self.assertEqual(logger.stop(), 0)
+            data = logger.path.read_bytes()
+        channel.disconnect(1)
+        return result, data, raw_records
+
+    def test_ads_image_linked_extended_keeps_raw_log_orphan_and_zero_rollback(self):
+        from scripts.database_resources import DdrP5SupportValue
+
+        indices = (0, 1, 2, 0xF000, 0x10001, 0x30001)
+        result, data, raw_records = self._run_ads_image_record_phase(
+            indices,
+            (0x1111, 0x1234, 0x1235, 0x2222, 0x3333, 0x4444),
+            DdrP5SupportValue(170, False, 0),
+        )
+        self.assertEqual(
+            tuple(row.values[0] for row in result.freezes), (0x1234, 0x1235)
+        )
+        self.assertEqual(tuple(row.index for row in result.records), indices)
+        for index, raw in zip(indices, raw_records):
+            self.assertEqual(
+                raw.hex().upper().encode() in data, index in (1, 2, 0x10001)
+            )
+
+    def test_ads_image_extended_requires_counter_accepted_regular_parent(self):
+        from scripts.database_resources import DdrP5SupportValue
+
+        indices = (1, 2, 0x10001, 0x20001)
+        result, data, raw_records = self._run_ads_image_record_phase(
+            indices,
+            (0x1234, 0x1235, 0x3333, 0x4444),
+            DdrP5SupportValue(170, True, 0x1234),
+        )
+        self.assertEqual(tuple(row.values[0] for row in result.freezes), (0x1235,))
+        self.assertEqual(tuple(row.index for row in result.records), indices)
+        for index, raw in zip(indices, raw_records):
+            self.assertEqual(raw.hex().upper().encode() in data, index in (2, 0x20001))
+
     def test_ads_image_native_record_phase_actual_wire_type_counter_and_file_filter(
         self,
     ):
@@ -1366,7 +1491,7 @@ class SavedFfdTests(unittest.TestCase):
                 else:
                     self.assertIn(first.hex().upper().encode(), data)
                     self.assertIn(second.hex().upper().encode(), data)
-                    self.assertNotIn(bulk.hex().upper().encode(), data)
+                    self.assertIn(bulk.hex().upper().encode(), data)
                 self.assertEqual(backend.replies, [])
                 channel.disconnect(1)
 

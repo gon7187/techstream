@@ -157,12 +157,15 @@ are restored; typed native StopFilter faults preserve the saved Boolean. Gateway
 `bind_gateway_client` with the same engine state and three exact dependency images;
 its gateway-type mutation occurs before authentication, matching native6e00.
 
-Initial central-gateway fallback before `LoadParameter` consumes the actual controller's
-constructor-empty `NativeEmptyControlParameter2026`, issued under its owned engine
-phase. `bind_gateway_client` authenticates that capability against the engine state,
-worker/runtime, current metadata and unloaded parameter pool. Each public gateway
-entry validates it again before I/O; copied, cross-engine and stale capabilities fail.
-After parameter loading, selected native rows use `NativeParameter2026.boolean`: the
+Initial central-gateway fallback consumes the controller's exact pool BASE
+`NativeControlParameterBase2026`, issued under its owned engine phase. It reads slot0
+as held, including a prior FILE's row, without selecting or rebinding a parameter row.
+`bind_gateway_client` authenticates a pool-backed BASE against its exact engine DH
+state, worker/runtime and current held context. The separate constructor-empty factory
+remains valid only before any parameter slot loads and retains exact current metadata.
+Each public gateway entry validates its capability again before I/O; copied,
+cross-engine and stale capabilities fail. After parameter loading, selected native rows
+use `NativeParameter2026.boolean`: the
 parsed native LONG is true when nonzero (including2). Legacy `CalibrationSelection`
 wire fixtures retain their separate0/1 contract.
 

@@ -1405,6 +1405,7 @@ def suzuki_get_identification(
     *,
     baudrate_kbps: int,
     receive_timeout_ms: int,
+    address_context=None,
     result: SuzukiUSBResult | None = None,
 ) -> bytes:
     """Getter RVA14e0: connect/configure/filter/version/software/hardware/CID.
@@ -1412,7 +1413,11 @@ def suzuki_get_identification(
     Addresses and numeric fields are native producer inputs. CUW metadata
     selection is separate and must establish their source before calling this.
     """
-    from scripts.programming_2026_common import NativeRuntime2026
+    from scripts.programming_2026_common import (
+        NativeRuntime2026,
+        is_native_exception2026,
+        native_error_fields2026,
+    )
 
     require_identity(identity)
     require_identity(utility_identity)
@@ -1445,6 +1450,9 @@ def suzuki_get_identification(
         result.cleanup_errors.clear()
         result.suppressed_cleanup_errors.clear()
         result.native_error.clear()
+        result.native_return_reached = False
+    saved_success = False
+    cid = b""
     try:
         runtime.call_owned("connect", "disconnect", protocol=6)
         connected = True
@@ -1462,9 +1470,26 @@ def suzuki_get_identification(
         version = utility.software_version()
         software = utility.software_id()
         hardware = utility.hardware_id()
-        if result is not None:
-            result.success = True
-        return hardware + b"_" + software + b"_" + version.encode("ascii")
+        cid = hardware + b"_" + software + b"_" + version.encode("ascii")
+        # RVA1d09 stores the separate getter BOOL after the actual CID vector.
+        saved_success = True
+    except (Exception, KeyboardInterrupt) as error:
+        if not is_native_exception2026(error):
+            raise
+        try:
+            fields = native_error_fields2026(error)
+        except TypeError:
+            # RVA1e95 is an explicit native catch-all preserving old fields.
+            fields = None
+        state = getattr(address_context, "controller_state", None)
+        if fields is not None and state is not None:
+            state.record_native_error(None, fields[0], fields[1])
+            if result is not None:
+                result.native_error = {
+                    "native_error_kind": state.error_kind,
+                    "native_primary_error": state.primary_error,
+                    "native_passthru_error": state.passthru_error,
+                }
     finally:
         try:
             if handle is not None:
@@ -1472,11 +1497,14 @@ def suzuki_get_identification(
                     runtime.release("stop_filter", identifier=handle)
                 except (InterruptedError, TimeoutError):
                     raise
-                except Exception as exc:  # noqa: BLE001 - native state11 catch-all1e9b
+                except (Exception, KeyboardInterrupt) as error:
+                    if not is_native_exception2026(error):
+                        raise
                     if result is not None:
-                        result.suppressed_cleanup_errors.append(type(exc).__name__)
+                        result.suppressed_cleanup_errors.append(type(error).__name__)
         finally:
             if connected:
+                # RVA1e54 disconnect is outside both native catch scopes.
                 runtime.release("disconnect")
                 if handle is not None and runtime.owns_resource(
                     "stop_filter", identifier=handle
@@ -1484,6 +1512,17 @@ def suzuki_get_identification(
                     runtime.forget_invalidated_resource(
                         "stop_filter", identifier=handle
                     )
+    if result is not None:
+        result.success = saved_success
+        result.native_return_reached = True
+        state = getattr(address_context, "controller_state", None)
+        if state is not None:
+            result.native_error = {
+                "native_error_kind": state.error_kind,
+                "native_primary_error": state.primary_error,
+                "native_passthru_error": state.passthru_error,
+            }
+    return cid
 
 
 def get_suzuki_cid(
@@ -1558,6 +1597,7 @@ def get_suzuki_cid(
         response,
         baudrate_kbps=native2026_baud_rate(metadata),
         receive_timeout_ms=(timeout or 0) & 0xFFFFFFFF,
+        address_context=address_context,
         result=result,
     )
 
@@ -3392,9 +3432,9 @@ def execute_context(context: NativeFamilyContext2026, runtime) -> dict:
                 report
                 | result.report()
                 | {
-                    "state": "read_completed",
-                    "native_success": True,
-                    "identifiers": [cid.decode("latin1")],
+                    "state": "read_completed" if result.success else "failed",
+                    "native_success": result.success,
+                    "identifiers": [cid.decode("latin1")] if cid else [],
                 }
             )
         if context.family == "suzuki_usb":
@@ -3484,7 +3524,9 @@ def execute_context(context: NativeFamilyContext2026, runtime) -> dict:
                 ),
             }
         )
-    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - native result retains bounded failure state
+    except (Exception, KeyboardInterrupt) as exc:
+        if context.operation == "get_cid":
+            raise
         native_error = (
             {} if result.native_return_reached is False else _native_error_fields(exc)
         )

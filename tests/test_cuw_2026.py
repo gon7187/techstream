@@ -8,6 +8,7 @@ import zipfile
 import zlib
 from dataclasses import replace
 from pathlib import Path
+from threading import Thread
 from unittest.mock import MagicMock, patch
 
 from scripts.cuw_2026 import (
@@ -240,8 +241,10 @@ class ManagedServicesTests(unittest.TestCase):
 
     def test_actual_worker_lease_and_cross_file_source_guards(self):
         from scripts.calibration_2026 import native2026_metadata, parse_cuw_2026
+        from scripts.demo_calibration import table
         from scripts.programming_2026_common import (
             ControlCommPhase2026,
+            NativeGeneralParameters2026,
             NativeRuntime2026,
         )
         from tests.test_calibration_2026 import cpu_text, cuw
@@ -259,7 +262,22 @@ class ManagedServicesTests(unittest.TestCase):
         second = ControlCommPhase2026(
             identity, NativeRuntime2026(lambda event, remaining: None)
         )
-        engine = CUWEngine2026((folder / "CUW.dll").read_bytes())
+        parameters = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": table(
+                    (
+                        "ParamFileKeySystemProtocolMicon",
+                        "M16CTypeFlag",
+                        "FORESTTypeFlag",
+                    ),
+                    (("149P5-Unified311", "0", "0"),),
+                )
+            },
+            encoded=False,
+        )
+        engine = CUWEngine2026(
+            (folder / "CUW.dll").read_bytes(), general_parameters=parameters
+        )
         source = cuw(cpu_text())
         self.assertEqual(engine.native_phase, 4)
         self.assertEqual(engine.check_j2534_connection(), 4003)
@@ -1776,6 +1794,427 @@ class ManagedServicesTests(unittest.TestCase):
             ),
             (195, 150),
         )
+
+
+class ControlContextScopeTests(unittest.TestCase):
+    def engine_and_controller(self, cpu_count=1):
+        from scripts.demo_calibration import table
+        from scripts.programming_2026_common import (
+            ControlCommPhase2026,
+            NativeGeneralParameters2026,
+            NativeRuntime2026,
+        )
+        from tests.test_calibration_2026 import cpu_text, cuw
+
+        folder = Path("runtime/no-car-21/recovered")
+        if not (folder / "CUW.dll").is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        identity = identity_2026(
+            (folder / "TCUWControlCommPhase.dll").read_bytes(),
+            "TCUWControlCommPhase.dll",
+        )
+        controller = ControlCommPhase2026(
+            identity,
+            NativeRuntime2026(
+                lambda event, remaining: None,
+                local_milliseconds_of_day=lambda: 1000,
+            ),
+        )
+        parameters = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": table(
+                    (
+                        "ParamFileKeySystemProtocolMicon",
+                        "M16CTypeFlag",
+                        "FORESTTypeFlag",
+                    ),
+                    (("149P5-Unified311", "0", "0"),),
+                )
+            },
+            encoded=False,
+        )
+        engine = CUWEngine2026(
+            (folder / "CUW.dll").read_bytes(), general_parameters=parameters
+        )
+        text = cpu_text(8).replace(
+            "NumberOfCalibration=1", f"NumberOfCalibration={cpu_count}"
+        )
+        for index in range(2, cpu_count + 1):
+            text += (
+                f"[CPU{index:02d}]\nCPUImageName=cpu{index}.vbf\n"
+                "CPUType=311\nStartAddress=0100002000\n"
+                f"SizeOfUncompressedDownloadData={0x20 * index:08X}\n"
+                "SizeOfDownloadData=00000004\n"
+            )
+        engine.configure(struct.pack("<IIddII", cpu_count, 0, 0, 0, 0, 0))
+        engine.load_cuw(cuw(text, (b"image", b"image-longer")[:cpu_count]))
+        return engine, controller
+
+    def test_actual_import_issues_and_expires_control_context(self):
+        engine, controller = self.engine_and_controller()
+        with engine:
+            with engine.controller_execution(controller, 0) as worker:
+                context = controller.native_control_context2026(engine)
+                capture = context._capture
+                self.assertIs(worker._control_file_capture, capture)
+                self.assertEqual(capture.control_cpu_start, worker.control_cpu_start)
+                self.assertEqual(context.metadata, capture.metadata_for_cpu(0))
+                self.assertFalse(engine._identifier_context_importing)
+                self.assertEqual(
+                    engine._identifier_context_epoch, capture._import_epoch
+                )
+                with (
+                    self.assertRaises(ValueError),
+                    engine.controller_execution(controller, 0),
+                ):
+                    pass
+            self.assertIsNone(worker._control_file_capture)
+            self.assertIsNone(engine._native_control_context2026)
+            with self.assertRaises(ValueError):
+                controller.native_control_context2026(engine)
+            with self.assertRaises(ValueError):
+                context.validate(engine, controller)
+
+    def test_control_capture_rejects_foreign_thread_and_fake_import(self):
+        engine, controller = self.engine_and_controller()
+        with engine, engine.controller_execution(controller, 0):
+            context = controller.native_control_context2026(engine)
+            failures = []
+
+            def validate_from_foreign_thread():
+                try:
+                    context.validate(engine, controller)
+                except ValueError as error:
+                    failures.append(error)
+
+            thread = Thread(target=validate_from_foreign_thread)
+            thread.start()
+            thread.join()
+            self.assertEqual(len(failures), 1)
+            with self.assertRaises(ValueError):
+                engine.worker.capture_control_file2026(controller)
+            self.assertIs(controller.native_control_context2026(engine), context)
+
+    def test_held_control_metadata_survives_outer_cpu_change(self):
+        engine, controller = self.engine_and_controller(cpu_count=2)
+        with engine:
+            with engine.controller_execution(controller, 0):
+                context = controller.native_control_context2026(engine)
+                held = context.metadata
+                engine.select_target(1, 1, controller=controller)
+                self.assertEqual(engine.native_metadata.cpu_index, 1)
+                self.assertEqual(context.metadata, held)
+                self.assertEqual(context.cpu_index, 0)
+            self.assertEqual(engine.native_metadata.cpu_index, 1)
+
+    def test_export_scope_rejects_unissued_target_without_projecting_metadata(self):
+        engine, controller = self.engine_and_controller()
+        with engine:
+            outer = engine.native_metadata
+            with engine.controller_execution(controller, 0):
+                with (
+                    self.assertRaises(ValueError),
+                    engine.controller_export_target(controller, object()),
+                ):
+                    pass
+                self.assertIs(engine.family_metadata, outer)
+                self.assertIsNone(engine._controller_export_target2026)
+
+    def test_unscoped_gateway_transfer_keeps_cpu_zero_flash_size(self):
+        from scripts.calibration_2026 import native2026_archive
+
+        engine, controller = self.engine_and_controller(cpu_count=2)
+        with engine:
+            engine.bind_worker(controller)
+            cpu_zero = native2026_archive(engine.worker.metadata_for_native_cpu(0))
+            cpu_one = native2026_archive(engine.worker.metadata_for_native_cpu(1))
+            self.assertNotEqual(cpu_zero.flash_size, cpu_one.flash_size)
+            engine.select_target(1, 1, controller=controller)
+            self.assertEqual(engine.native_metadata.cpu_index, 1)
+            engine.dh_state._gateway_transfer(0, cpu_zero.flash_size)
+
+    def test_control_callback_caches_keep_distinct_canonical_values(self):
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+
+        engine, _controller = self.engine_and_controller()
+        self.assertFalse(engine.native_control_retry_cache2026)
+        self.assertEqual(engine.native_control_phase_cache2026, 2)
+        self.assertFalse(engine.native_control_alternate_cache2026)
+        self.assertEqual(engine.native_control_divided_index2026, 0)
+        with engine:
+            source = engine._source
+            assert source is not None
+            state = ReproInfoState((RecoveryCalibration("authored.cuw", source),))
+            with tempfile.TemporaryDirectory() as directory:
+                engine.bind_persistence(CUWPersistence(Path(directory), state))
+            state.use_new_software_password = True
+            state.comm_phase = 3
+            state.sequence_changed_for_get_cid = True
+            state.write_target_divided_cpu_image_index = 7
+            engine.dh_state._native_comm_phase = 1
+            self.assertTrue(engine.native_control_retry_cache2026)
+            self.assertEqual(engine.native_control_phase_cache2026, 3)
+            self.assertTrue(engine.native_control_alternate_cache2026)
+            self.assertEqual(engine.native_control_divided_index2026, 7)
+            self.assertEqual(engine.dh_state.comm_phase, 1)
+
+    def test_control_callback_publishers_require_their_source_helper(self):
+        engine, controller = self.engine_and_controller()
+        with engine:
+            engine.bind_worker(controller)
+            with engine.controller_execution(controller, 0) as worker:
+                with self.assertRaises(ValueError):
+                    engine._publish_control_retry_cache2026(worker=worker)
+                with self.assertRaises(ValueError):
+                    engine._publish_control_phase_cache2026(worker=worker)
+                with self.assertRaises(ValueError):
+                    engine._publish_control_alternate_cache2026(worker=worker)
+
+    def test_controller_entry_imports_outer_phase_then_keeps_live_mutations(self):
+        engine, controller = self.engine_and_controller()
+        with engine:
+            with engine.controller_execution(controller, 1):
+                self.assertEqual(engine.dh_state.comm_phase, 1)
+                engine.set_comm_phase(3, controller=controller)
+                self.assertEqual(engine.dh_state.comm_phase, 3)
+            with engine.controller_execution(controller, 2):
+                self.assertEqual(engine.dh_state.comm_phase, 2)
+
+    def test_engine_close_revokes_only_its_owned_control_pool_idempotently(self):
+        from scripts.cuw_parameter_pool import ControlParameterPool2026
+
+        engine, controller = self.engine_and_controller()
+        other, other_controller = self.engine_and_controller()
+        with engine.controller_execution(controller, 0):
+            pool = ControlParameterPool2026.issue(
+                engine,
+                controller,
+                {
+                    "149P5-Unified311.ini": (
+                        b"ParamFileKeySystemProtocolMicon,DLLFileNameForGetCID\r\n"
+                        b"149P5-Unified311,Authored.dll\r\n"
+                    )
+                },
+                encoded=False,
+            )
+            pool.load_for(engine, controller, "get_cid")
+            controller._control_parameter_pool2026 = pool
+        with other.controller_execution(other_controller, 0):
+            other_pool = ControlParameterPool2026.issue(
+                other,
+                other_controller,
+                {
+                    "149P5-Unified311.ini": (
+                        b"ParamFileKeySystemProtocolMicon,DLLFileNameForGetCID\r\n"
+                        b"149P5-Unified311,Other.dll\r\n"
+                    )
+                },
+                encoded=False,
+            )
+            other_pool.load_for(other, other_controller, "get_cid")
+            other_controller._control_parameter_pool2026 = other_pool
+        engine.close()
+        with self.assertRaises(ValueError):
+            pool.slot(0)
+        self.assertEqual(pool._state.slots[0].parameter.headers, ())
+        with other.controller_execution(other_controller, 0):
+            self.assertEqual(other_pool.slot(0).index, 0)
+        other.close()
+        with self.assertRaises(ValueError):
+            other_pool.slot(0)
+        engine.close()
+
+    def test_control_pool_survives_repeated_owned_phase_execution(self):
+        from scripts.cuw_parameter_pool import ControlParameterPool2026
+
+        engine, controller = self.engine_and_controller()
+        with engine:
+            pool = None
+            for phase in (0, 1):
+                with engine.controller_execution(controller, phase):
+                    if pool is None:
+                        pool = ControlParameterPool2026.issue(
+                            engine,
+                            controller,
+                            {
+                                "149P5-Unified311.ini": (
+                                    b"ParamFileKeySystemProtocolMicon,DLLFileNameForGetCID\r\n"
+                                    b"149P5-Unified311,Authored.dll\r\n"
+                                )
+                            },
+                            encoded=False,
+                        )
+                        pool.load_for(engine, controller, "get_cid")
+                        controller._control_parameter_pool2026 = pool
+                    self.assertIs(controller._control_parameter_pool2026, pool)
+                    self.assertTrue(pool.slot(0).loaded)
+                self.assertIs(controller._control_parameter_pool2026, pool)
+
+    def test_control_progress_uses_worker_scratch_until_whole_vector_publish(self):
+        from scripts.cuw_parameter_pool import ControlParameterPool2026
+        from scripts.programming_2026_common import NativeControlExportTarget2026
+
+        engine, controller = self.engine_and_controller()
+        with engine:
+            engine.dh_state._transferred_bytes = (9,)
+            engine.dh_state._progress = (31,)
+            engine.bind_worker(controller)
+            with engine.controller_execution(controller, 0) as worker:
+                pool = ControlParameterPool2026.issue(
+                    engine,
+                    controller,
+                    {
+                        "149P5-Unified311.ini": (
+                            b"ParamFileKeySystemProtocolMicon,DLLFileNameForGetCID\r\n"
+                            b"149P5-Unified311,Authored.dll\r\n"
+                        )
+                    },
+                    encoded=False,
+                )
+                pool.load_for(engine, controller, "get_cid")
+                target = NativeControlExportTarget2026.issue(
+                    engine, controller, pool, 0, "get_cid"
+                )
+                context = controller.native_control_context2026(engine)
+                state = engine.dh_state
+                old_counts, old_percentages = state.transferred_bytes, state.progress
+                with engine.controller_export_target(controller, target):
+                    self.assertEqual(context.count_scratch, (0,))
+                    self.assertEqual(context.percentage_scratch, (31,))
+                    state.set_native_count(0, 42)
+                    state.set_native_percentage(0, 73)
+                    self.assertEqual(state.transferred_bytes, (42,))
+                    self.assertEqual(state.progress, (73,))
+                    self.assertEqual(state._transferred_bytes, old_counts)
+                    self.assertEqual(state._progress, old_percentages)
+                    worker.publish_control_count2026(context)
+                    self.assertEqual(state._transferred_bytes, (42,))
+                    self.assertEqual(state._progress, old_percentages)
+                    worker.publish_control_percent2026(context)
+                    self.assertEqual(state._progress, (73,))
+                    self.assertEqual(worker._previous_percentages2026, old_percentages)
+                    with self.assertRaises(ValueError):
+                        engine._publish_control_ssmid_cache2026(worker=worker)
+                    self.assertEqual(engine.native_ssmid_cache2026, 0)
+                    self.assertEqual(worker.read_control_callback_29_2026(context), 0)
+            self.assertEqual((state.transferred_bytes, state.progress), ((42,), (73,)))
+
+    def test_writer_address_groups_follow_held_control_target(self):
+        from scripts.cuw_parameter_pool import ControlParameterPool2026
+        from scripts.programming_2026_common import (
+            ControlCommPhase2026,
+            NativeControlExportTarget2026,
+            NativeRuntime2026,
+        )
+        from scripts.programming_2026_vendor import native2026_write_address_groups
+        from tests.test_programming_2026_body import SONAR_WRITE, writer_selection
+
+        folder = Path("runtime/no-car-21/recovered")
+        if not (folder / "CUW.dll").is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        identity = identity_2026(
+            (folder / "TCUWControlCommPhase.dll").read_bytes(),
+            "TCUWControlCommPhase.dll",
+        )
+        controller = ControlCommPhase2026(
+            identity,
+            NativeRuntime2026(
+                lambda event, remaining: None,
+                local_milliseconds_of_day=lambda: 1000,
+            ),
+        )
+        raw, _, selection, general = writer_selection(
+            SONAR_WRITE,
+            cpu_index=0,
+            initialize_prepare=True,
+            encoded=False,
+        )
+        engine = CUWEngine2026(
+            (folder / "CUW.dll").read_bytes(), general_parameters=general
+        )
+        engine.configure(struct.pack("<IIddII", 2, 0, 0, 0, 0, 0))
+        engine.load_cuw(raw)
+        with engine:
+            engine.bind_worker(controller)
+            with engine.controller_execution(controller, 0):
+                pool = ControlParameterPool2026.issue(
+                    engine,
+                    controller,
+                    selection.catalog_sources,
+                    encoded=False,
+                )
+                pool.load_for(engine, controller, "write")
+                target = NativeControlExportTarget2026.issue(
+                    engine, controller, pool, 0, "write"
+                )
+                selection = target.binding
+                groups = native2026_write_address_groups(
+                    target.metadata.source_container, selection
+                )
+                engine.select_target(1, 1, controller=controller)
+                self.assertNotEqual(target.metadata, engine.native_metadata)
+                with engine.controller_export_target(controller, target):
+                    engine.validate_address_groups(selection, groups)
+                    from dataclasses import replace
+
+                    foreign_selection = replace(
+                        selection, metadata=engine.native_metadata
+                    )
+                    with self.assertRaisesRegex(ValueError, "actual engine target"):
+                        engine.validate_address_groups(foreign_selection, groups)
+                with self.assertRaisesRegex(ValueError, "actual engine target"):
+                    engine.validate_address_groups(selection, groups)
+
+    def test_control_dh_mode_and_persistent_byte_cache_share_native_field(self):
+        from scripts.cuw_parameter_pool import ControlParameterPool2026
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+        from scripts.programming_2026_common import NativeControlExportTarget2026
+
+        engine, controller = self.engine_and_controller()
+        with engine:
+            source = engine._source
+            assert source is not None
+            repro_state = ReproInfoState((RecoveryCalibration("authored.cuw", source),))
+            with tempfile.TemporaryDirectory() as directory:
+                engine.bind_persistence(CUWPersistence(Path(directory), repro_state))
+            engine.bind_worker(controller)
+            with engine.controller_execution(controller, 0) as worker:
+                pool = ControlParameterPool2026.issue(
+                    engine,
+                    controller,
+                    {
+                        "149P5-Unified311.ini": (
+                            b"ParamFileKeySystemProtocolMicon,DLLFileNameForPrepareWrite\r\n"
+                            b"149P5-Unified311,Authored.dll\r\n"
+                        )
+                    },
+                    encoded=False,
+                )
+                pool.load_for(engine, controller, "prepare")
+                target = NativeControlExportTarget2026.issue(
+                    engine, controller, pool, 0, "prepare"
+                )
+                state = engine.dh_state
+                with engine.controller_export_target(controller, target):
+                    state.set_central_gateway_type(2)
+                    self.assertEqual(state.central_gateway_type, 2)
+                    self.assertEqual(worker._source_mode, 2)
+                with self.assertRaises(ValueError):
+                    engine._publish_control_ssmid_cache2026(worker=worker)
+                with self.assertRaises(ValueError):
+                    engine._publish_control_dh_type_cache2026(worker=worker)
+                self.assertEqual(engine.native_ssmid_cache2026, 0)
+                self.assertEqual(engine.native_dh_type_cache2026, 0)
+                self.assertEqual(repro_state.ssmid, 0)
+                self.assertEqual(repro_state.dh_central_gw_type, 0)
 
 
 if __name__ == "__main__":

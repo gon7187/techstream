@@ -1091,14 +1091,31 @@ class UtilityExEngine:
             else:
                 return uint32(p5.get_status())
             return None
-        if source == "TY18" and export == "_Ex2InitializeDoIP@0":
+        if source in ("TY18", "TYPlus") and export in (
+            "_Ex2InitializeDoIP@0",
+            "Ex2InitializeDoIP",
+        ):
+            if (source, export) not in (
+                ("TY18", "_Ex2InitializeDoIP@0"),
+                ("TYPlus", "Ex2InitializeDoIP"),
+            ):
+                raise LookupError("DoIP export is not reviewed for exact source")
             from scripts.utility_ex_lifecycle import UtilityExSISDriver
 
             if args:
                 raise ValueError(f"{export} takes no arguments")
-            self.context.state["native_global:1011f684"] = 0
+            reset_global = "1011f684" if source == "TY18" else "10135be4"
+            self.context.state[f"native_global:{reset_global}"] = 0
             # Actual manager vslot78(1b600) returnsout22 only for20/20.
-            if self.context.mode != 20 or self.context.broker(0x70) != 20:
+            mode, protocol = (
+                (self.context.mode, self.context.broker(0x70))
+                if source == "TY18"
+                else (
+                    uint32(self.context.state.get("native_global:1013fa40", 0)),
+                    uint32(self.context.state.get("native_global:1013fa44", 0)),
+                )
+            )
+            if mode != 20 or protocol != 20:
                 return None
             key = f"utility_ex:sis_driver:{self.context.module_sha256}"
             driver = self.context.state.get(key)

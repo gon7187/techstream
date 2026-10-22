@@ -133,6 +133,85 @@ class WorkerUSBRecoveryContext2026:
     prior_software_count: int
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class ControlFileCapture2026:
+    """One source-issued 59ab0 FILE/order/target snapshot for an active phase."""
+
+    _worker_ref: weakref.ReferenceType[EngineWorker2026] = field(repr=False)
+    _engine: CUWEngine2026 = field(repr=False)
+    _controller: ControlCommPhase2026 = field(repr=False)
+    _runtime: NativeRuntime2026 = field(repr=False)
+    metadata: Native2026Metadata
+    native_order: tuple[int, ...]
+    target_indices: tuple[int, ...]
+    control_cpu_start: int
+    _phase: int = field(repr=False)
+    _thread_id: int = field(repr=False)
+    _thread_job: object | None = field(repr=False)
+    _import_epoch: int = field(repr=False)
+
+    def __copy__(self):
+        return replace(self)
+
+    def __deepcopy__(self, memo):
+        clone = replace(self)
+        memo[id(self)] = clone
+        return clone
+
+    def validate(self, engine, controller) -> None:
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.cuw_engine_threads import EngineThreadJob2026
+        from scripts.programming_2026_common import ControlCommPhase2026
+
+        if (
+            type(engine) is not CUWEngine2026
+            or type(controller) is not ControlCommPhase2026
+        ):
+            raise ValueError("Active source-issued CONTROL FILE capture required")
+        worker = self._worker_ref()
+        current_thread_id = threading.get_ident()
+        thread_owned = engine._phase_thread == current_thread_id
+        if thread_owned and current_thread_id != self._thread_id:
+            job = self._thread_job
+            if type(job) is EngineThreadJob2026 and engine.thread_job is job:
+                try:
+                    job.validate_owner(engine, controller)
+                    thread_owned = job.validate_callback_handoff() == self._thread_id
+                except (RuntimeError, TypeError, ValueError):
+                    thread_owned = False
+            else:
+                thread_owned = False
+        if (
+            type(self) is not ControlFileCapture2026
+            or worker is None
+            or worker._control_file_capture is not self
+            or engine is not self._engine
+            or controller is not self._controller
+            or controller.runtime is not self._runtime
+            or engine._worker is not worker
+            or worker.engine is not engine
+            or worker.controller is not controller
+            or worker._closed
+            or not engine.active
+            or not thread_owned
+            or engine.worker_phase != self._phase
+            or worker._phase_started_ms is None
+            or engine._identifier_context_epoch != self._import_epoch
+        ):
+            raise ValueError("Active source-issued CONTROL FILE capture required")
+        from scripts.calibration_2026 import native2026_validate_runtime_metadata
+
+        native2026_validate_runtime_metadata(self.metadata)
+
+    def metadata_for_cpu(self, index: int) -> Native2026Metadata:
+        if type(index) is not int:
+            raise TypeError("Unsigned ordered CONTROL CPU index required")
+        self.validate(self._engine, self._controller)
+        if not 0 <= index < len(self.native_order):
+            raise ValueError("Ordered CONTROL CPU index is outside the held FILE")
+        return native2026_metadata_for_cpu(self.metadata, self.native_order[index])
+
+
 class NativeWorkerIntegerError2026(NativeException2026):
     """33f80's literal native integer exception, limited to source values0/1."""
 
@@ -409,8 +488,6 @@ class EngineWorker2026:
         )
         self._retained_cpu_type = ""
         self._prepare_handshake = 0
-        self._callback_28_state = 0
-        self._callback_47_state = 0
         self._battery_voltage: float | None = None
         self._complete = False
         self._fatal = False
@@ -427,6 +504,15 @@ class EngineWorker2026:
         assert configuration is not None
         maximum = configuration.cpu_maximum
         self._phase_started_ms: int | None = None
+        self._control_file_capture: ControlFileCapture2026 | None = None
+        # 59070 owns scratch independently from the engine's published vectors.
+        control_state = engine.dh_state
+        self._control_count_scratch2026 = [0] * len(control_state._transferred_bytes)
+        self._control_percent_scratch2026 = list(control_state._progress)
+        self._control_ssm_byte2026 = 0
+        self._sbr_ssm_producer2026 = None
+        self._control_return_receipt2026 = None
+        self._control_scratch_reset_pending2026 = False
         self._phase_elapsed_ms = [0] * maximum
         self._continuation_sequence = 0
         self._pending_continuation: WorkerContinuation2026 | None = None
@@ -478,8 +564,6 @@ class EngineWorker2026:
             self._cpu_offset = previous._cpu_offset
             self._progress_base = previous._progress_base
             self._retained_cpu_type = previous._retained_cpu_type
-            self._callback_28_state = previous._callback_28_state
-            self._callback_47_state = previous._callback_47_state
             self._battery_voltage = previous._battery_voltage
             self._complete = previous._complete
             self._ig_off_pending = self._engine.native_cycle_output
@@ -507,6 +591,169 @@ class EngineWorker2026:
         with self._lock:
             self.validate_source()
             return self._loaded_metadata_view()
+
+    @property
+    def control_cpu_start(self) -> int:
+        """Read-only ordered BC8 scalar copied into the source 59ab0 context."""
+        with self._lock:
+            self.validate_source()
+            return self._current_global_cpu_index
+
+    def capture_control_file2026(self, controller) -> ControlFileCapture2026:
+        """Capture the held FILE only during the engine's once-only59ab0 import."""
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.programming_2026_common import ControlCommPhase2026
+
+        engine = self._engine
+        with self._lock:
+            if (
+                type(controller) is not ControlCommPhase2026
+                or controller is not self._controller
+                or type(engine) is not CUWEngine2026
+                or engine._worker is not self
+                or getattr(engine, "_identifier_context_importing", False) is not True
+                or not engine.active
+                or engine._phase_thread != threading.get_ident()
+                or engine.worker_phase not in (0, 1, 2)
+                or self._phase_started_ms is None
+                or self._lifecycle != "running"
+                or self._control_file_capture is not None
+                or controller.runtime is not self._runtime
+            ):
+                raise ValueError("Actual once-only owned 59ab0 CONTROL import required")
+            file_index = self._current_file_index
+            if not 0 <= file_index < len(self._all_loaded_metadata):
+                raise ValueError("Current worker FILE is outside the issued vector")
+            metadata = engine.native_metadata
+            issued_file = self._all_loaded_metadata[file_index]
+            if metadata.source_container is not issued_file.source_container:
+                raise ValueError(
+                    "Current engine FILE differs from the issued worker FILE"
+                )
+            native_order = tuple(self._cpu_orders_by_file[file_index])
+            target_indices = tuple(self._targets_by_file[file_index])
+            control_cpu_start = self._current_global_cpu_index
+            if (
+                not native_order
+                or len(native_order) != len(target_indices)
+                or len(set(native_order)) != len(native_order)
+                or any(
+                    type(value) is not int
+                    or not 0 <= value < native2026_cpu_count(metadata)
+                    for value in native_order
+                )
+                or any(type(value) is not int for value in target_indices)
+                or type(control_cpu_start) is not int
+                or not 0 <= control_cpu_start < len(native_order)
+            ):
+                raise ValueError("Ordered CONTROL FILE vectors are inconsistent")
+            if (
+                native2026_metadata_for_cpu(metadata, native_order[control_cpu_start])
+                != metadata
+            ):
+                raise ValueError("BC8 start CPU differs from the held FILE mapping")
+            capture = ControlFileCapture2026(
+                weakref.ref(self),
+                engine,
+                controller,
+                self._runtime,
+                metadata,
+                native_order,
+                target_indices,
+                control_cpu_start,
+                engine.worker_phase,
+                threading.get_ident(),
+                engine.thread_job,
+                engine._identifier_context_epoch,
+            )
+            self._control_file_capture = capture
+            return capture
+
+    def _invalidate_control_file_capture2026(self) -> None:
+        self._control_file_capture = None
+        self._sbr_ssm_producer2026 = None
+        self._control_return_receipt2026 = None
+
+    def _validate_control_output_context2026(self, context):
+        """Validate shared CONTROL capability before any scratch/output access."""
+        from scripts.programming_2026_common import NativeControlContext2026
+
+        if type(context) is not NativeControlContext2026:
+            raise TypeError("Exact source-issued CONTROL context required")
+        context.validate(self._engine, self._controller)
+        if (
+            context._worker is not self
+            or context._runtime is not self._runtime
+            or context._capture is not self._control_file_capture
+        ):
+            raise ValueError("CONTROL output context differs from worker lineage")
+        return context
+
+    def _control_progress_scratch2026(self, context):
+        """Return immutable observations of the worker-owned CONTROL vectors."""
+        with self._lock:
+            self._validate_control_output_context2026(context)
+            state = self._engine.dh_state
+            if len(self._control_count_scratch2026) != len(
+                state._transferred_bytes
+            ) or len(self._control_percent_scratch2026) != len(state._progress):
+                raise ValueError("CONTROL output vector length changed while issued")
+            return (
+                tuple(self._control_count_scratch2026),
+                tuple(self._control_percent_scratch2026),
+            )
+
+    @property
+    def _previous_percentages2026(self) -> tuple[int, ...]:
+        """Expose C48/C4C through its existing source-owned worker vector."""
+        return tuple(self._cpu_percentages)
+
+    def _store_control_output2026(self, context, target, index, value, *, percent):
+        from scripts.programming_2026_common import NativeControlExportTarget2026
+
+        with self._lock:
+            self._validate_control_output_context2026(context)
+            if (
+                type(target) is not NativeControlExportTarget2026
+                or target._context is not context
+                or self._engine._controller_export_target2026 is not target
+            ):
+                raise ValueError("Active source-issued CONTROL target required")
+            target.validate(self._engine, self._controller)
+            scratch = (
+                self._control_percent_scratch2026
+                if percent
+                else self._control_count_scratch2026
+            )
+            if type(index) is not int or not 0 <= index < len(scratch):
+                raise ValueError("CONTROL output index is outside its fixed vector")
+            if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+                raise ValueError("CONTROL output value must be an unsigned DWORD")
+            scratch[index] = value
+
+    def _store_control_count2026(self, context, target, index, value) -> None:
+        self._store_control_output2026(context, target, index, value, percent=False)
+
+    def _store_control_percentage2026(self, context, target, index, value) -> None:
+        self._store_control_output2026(context, target, index, value, percent=True)
+
+    def publish_control_count2026(self, context) -> None:
+        with self._lock:
+            self._validate_control_output_context2026(context)
+            state = self._engine.dh_state
+            if len(state._transferred_bytes) != len(self._control_count_scratch2026):
+                raise ValueError("CONTROL count output vector length changed")
+            state._transferred_bytes = tuple(self._control_count_scratch2026)
+
+    def publish_control_percent2026(self, context) -> None:
+        with self._lock:
+            self._validate_control_output_context2026(context)
+            state = self._engine.dh_state
+            if len(state._progress) != len(self._control_percent_scratch2026):
+                raise ValueError("CONTROL percentage output vector length changed")
+            previous = tuple(state._progress)
+            self._cpu_percentages = list(previous)
+            state._progress = tuple(self._control_percent_scratch2026)
 
     def _loaded_metadata_view(self) -> tuple[Native2026Metadata, ...]:
         """Expose the live current FILE while retaining the issued FILE vector."""
@@ -831,8 +1078,8 @@ class EngineWorker2026:
                 tuple(self._phase_elapsed_ms),
                 self._pending_continuation is not None,
                 self._engine.native_gateway_cache,
-                self._callback_28_state,
-                self._callback_47_state,
+                self._engine.native_ssmid_cache2026,
+                self._engine.native_dh_type_cache2026,
                 tuple(self._cpu_percentages),
                 self._unmatched_identifiers_by_file[self._current_file_index],
                 self._unmatched_companions_by_file[self._current_file_index],
@@ -898,6 +1145,38 @@ class EngineWorker2026:
                 kind & 0xFFFFFFFF, state.primary_error, state.passthru_error
             )
             self._native_fatal_input = True
+
+    def _record_control_helper_cpass2026(
+        self, context, error: BaseException, helper_lease
+    ) -> None:
+        """5a835 family-helper CPass catch; preserve kind/status and set native fatal."""
+        from scripts import programming_2026_common
+        from scripts.j2534_2026 import NativePassThruError2026
+        from scripts.programming_2026_common import NativePassThruException2026
+
+        with self._lock:
+            self._validate_control_output_context2026(context)
+            helper_entry = getattr(
+                programming_2026_common, "_control_helper_entry2026", None
+            )
+            if not callable(helper_entry):
+                raise TypeError("Source-issued CONTROL helper entry is unavailable")
+            issued_entry = helper_entry(context)
+            if helper_lease is not issued_entry:
+                raise ValueError("Exact CONTROL helper-entry lease required")
+            if not isinstance(
+                error, (NativePassThruException2026, NativePassThruError2026)
+            ):
+                raise TypeError("Actual CPassThruException helper fault required")
+            code = error.native_error_code
+            if type(code) is not int or not -0x80000000 <= code <= 0xFFFFFFFF:
+                raise TypeError("Bounded native CPass error enum required")
+            state = self._engine.dh_state
+            state.record_native_error(
+                state.error_kind, code & 0xFFFFFFFF, state.passthru_error
+            )
+            self._native_fatal_input = True
+            self._fatal = True
 
     def _begin_outer_control_loader(self) -> None:
         """5a790 clears controller+68/+70 only while comm phase bd0 is zero."""
@@ -1132,6 +1411,7 @@ class EngineWorker2026:
                 self._engine._accept_worker_file_reset(
                     sources, replacement, worker=self
                 )
+                self._control_scratch_reset_pending2026 = True
                 retry._record_postwait_file_reset(self)
             self._restore_file_selection_47e60()
             metadata = self._engine.native_metadata
@@ -1390,8 +1670,6 @@ class EngineWorker2026:
         with self._lock:
             self._retained_cpu_type = ""
             self._prepare_handshake = 0
-            self._callback_28_state = 0
-            self._callback_47_state = 0
             self._battery_voltage = None
             self._complete = self._fatal = self._failed = False
             self._native_fatal_input = False
@@ -1528,24 +1806,227 @@ class EngineWorker2026:
             self.validate_source()
             self._engine._publish_cached_gateway_kind(worker=self)
 
-    def record_callback_28(self, value: int) -> None:
-        """58ca0 stores callback28's raw byte in DAT1008ed29."""
-        self._engine._require_owned_phase()
+    def publish_control_callback_30_2026(self, context) -> int:
+        """59000 callback30 zero-extends cached ED8A into shared C08."""
         with self._lock:
-            self._callback_28_state = self._callback_byte(value)
+            self._validate_control_output_context2026(context)
+            value = self._engine.native_dh_type_cache2026
+            if type(value) is not int or not 0 <= value <= 0xFF:
+                raise ValueError("Persistent ED8A gateway cache must be a byte")
+            self._source_mode = value
+            self._engine.dh_state._central_gateway_type = value
+            return value
 
-    def record_callback_47(self, value: int) -> None:
-        """58f80 stores callback47's raw source-mode byte in DAT1008ed8a."""
-        self._engine._require_owned_phase()
+    def publish_control_callback_2f2026(self, context) -> int:
+        """58f80 publishes actual C08 low byte to persistent ED8A."""
         with self._lock:
-            self._callback_47_state = self._callback_byte(value)
+            self._validate_control_postexport_cache2026(context)
+            raw_value = self._source_mode
+            if type(raw_value) is not int or not 0 <= raw_value <= 0xFFFFFFFF:
+                raise ValueError("Actual worker C08 DWORD required")
+            return raw_value & 0xFF
 
-    def publish_callback_48_source_mode(self) -> None:
-        """59000 callback48 copies cached DAT8ed8a into typData9c0/C08."""
-        self._engine._require_owned_phase()
+    def publish_control_callback_28_2026(self, context) -> int:
+        """58ca0 copies actual C25 into the shared ED29 byte."""
         with self._lock:
-            self.validate_source()
-            self._source_mode = self._callback_47_state
+            self._validate_control_postexport_cache2026(context)
+            return self._control_ssm_byte2026
+
+    def _validate_control_postexport_cache2026(self, context) -> None:
+        """Require the actual 8990 helper's completed primary-return receipt."""
+        from scripts import programming_2026_common
+
+        self._validate_control_output_context2026(context)
+        entry_lookup = getattr(
+            programming_2026_common, "_control_helper_entry2026", None
+        )
+        returned = getattr(
+            programming_2026_common,
+            "_control_helper_primary_return_seen2026",
+            None,
+        )
+        if not callable(entry_lookup) or not callable(returned):
+            raise TypeError("Source-issued CONTROL post-export receipt is unavailable")
+        helper_lease = entry_lookup(context)
+        if returned(context, helper_lease, "8990") is not True:
+            raise ValueError("Completed CONTROL 8990 primary return is required")
+
+    def read_control_callback_29_2026(self, context) -> int:
+        """58d20 reads ED29 and copies that same source byte back into C25."""
+        with self._lock:
+            self._validate_control_output_context2026(context)
+            value = self._engine.native_ssmid_cache2026
+            if type(value) is not int or not 0 <= value <= 0xFF:
+                raise ValueError("Persistent ED29 SSM cache must be a byte")
+            self._control_ssm_byte2026 = value
+            return value
+
+    def store_control_ssm_retry2026(self, context) -> int:
+        """Named retry seam delegates callback29's ED29-to-C25 source copy."""
+        return self.read_control_callback_29_2026(context)
+
+    def _publish_control_gateway_type2026(self, state) -> None:
+        """Join an actual DH source setter to the shared native C08 field."""
+        from scripts.cuw_2026 import DHControllerState2026
+
+        with self._lock:
+            context = self._controller.native_control_context2026(self._engine)
+            self._validate_control_output_context2026(context)
+            target = self._engine._controller_export_target2026
+            if (
+                type(state) is not DHControllerState2026
+                or state is not self._engine.dh_state
+                or target is None
+                or target._context is not context
+            ):
+                raise ValueError("Active source-issued CONTROL DH state required")
+            target.validate(self._engine, self._controller)
+            operation = target.binding.operation
+            if operation == "write":
+                from scripts import programming_2026_common
+
+                dispatch = programming_2026_common._control_export_dispatch2026(
+                    target, "PrepareRetry"
+                )
+                if dispatch["module"] not in {
+                    "TCUWCanDHFlashWriter.dll",
+                    "TCUWCanDHUDSFlashWriter.dll",
+                    "TCUWP5CanDHUDSFlashWriter.dll",
+                }:
+                    raise ValueError("Native DH PrepareRetry export required")
+                helper_entry = programming_2026_common._control_helper_entry2026(
+                    context
+                )
+                entries = programming_2026_common._NATIVE_CONTROL_HELPER_ENTRIES_2026
+                helper_record = entries.get(id(helper_entry))
+                if (
+                    helper_record is None
+                    or helper_record[0] is not helper_entry
+                    or helper_record[1]["engine"] is not self._engine
+                    or helper_record[1]["controller"] is not self._controller
+                    or helper_record[1]["context"] is not context
+                    or helper_record[1]["helper"] not in ("4c10", "5c30")
+                ):
+                    raise ValueError("Active native CONTROL writer helper required")
+            elif operation != "prepare":
+                raise ValueError("Active source-issued CONTROL DH state required")
+            value = state._central_gateway_type
+            if type(value) is not int or value not in (1, 2):
+                raise ValueError("Actual DH gateway type must be native DWORD1 or2")
+            self._source_mode = value
+
+    def _bind_sbr_ssm_producer2026(self, utility, target) -> None:
+        from scripts.programming_2026_common import NativeControlExportTarget2026
+        from scripts.programming_2026_vendor import SBRUtils2026, Vendor2026Context
+
+        with self._lock:
+            context = self._controller.native_control_context2026(self._engine)
+            self._validate_control_output_context2026(context)
+            if (
+                type(utility) is not SBRUtils2026
+                or utility.runtime is not self._runtime
+                or type(utility.context) is not Vendor2026Context
+                or utility.context.family != "SBR"
+                or type(target) is not NativeControlExportTarget2026
+                or target._context is not context
+                or self._engine._controller_export_target2026 is not target
+                or getattr(self._runtime._device_calls, "control_export", None)
+                != (self._engine, self._controller, target)
+            ):
+                raise ValueError("Active source-issued SBR utility and target required")
+            target.validate(self._engine, self._controller)
+            if (
+                target.binding.operation not in ("prepare", "write")
+                or utility.context.selection is not target.binding
+                or utility.context.stage != target.binding.operation
+                or utility.context.identity.module_name
+                != target.module_binding.module_name
+            ):
+                raise ValueError("SBR utility differs from its active CONTROL binding")
+            self._sbr_ssm_producer2026 = (utility, target, context, utility.context)
+
+    def publish_sbr_ssm2026(self, utility) -> None:
+        from scripts.programming_2026_vendor import SBRUtils2026, Vendor2026Context
+
+        with self._lock:
+            context = self._controller.native_control_context2026(self._engine)
+            self._validate_control_output_context2026(context)
+            producer = self._sbr_ssm_producer2026
+            if (
+                type(utility) is not SBRUtils2026
+                or type(utility.context) is not Vendor2026Context
+                or producer is None
+                or producer[0] is not utility
+                or producer[2] is not context
+                or utility.context is not producer[3]
+                or utility.context.selection is not producer[1].binding
+                or utility.context.family != "SBR"
+                or utility.context.stage != producer[1].binding.operation
+                or utility.context.identity.module_name
+                != producer[1].module_binding.module_name
+                or utility.runtime is not self._runtime
+                or self._engine._controller_export_target2026 is not producer[1]
+                or getattr(self._runtime._device_calls, "control_export", None)
+                != (self._engine, self._controller, producer[1])
+            ):
+                raise ValueError("Exact active source-issued SBR producer required")
+            producer[1].validate(self._engine, self._controller)
+            if type(utility.ssm) is not int or not 0 <= utility.ssm <= 0xFF:
+                raise ValueError("SBR producer must hold an actual native byte")
+            self._control_ssm_byte2026 = utility.ssm
+
+    def record_control_return2026(self, context, snapshot) -> None:
+        """Retain only the exact J2534 snapshot registered at raw 4be0 tail."""
+        from scripts.j2534_2026 import J2534InterfacePair2026, NativeInterfaceData2026
+        from scripts.programming_2026_common import _control_return_snapshot2026
+
+        with self._lock:
+            self._validate_control_output_context2026(context)
+            pair = self._engine.interface_pair
+            if (
+                type(pair) is not J2534InterfacePair2026
+                or type(snapshot) is not NativeInterfaceData2026
+                or _control_return_snapshot2026(context) is not snapshot
+            ):
+                raise ValueError("Exact ordinary CONTROL raw-tail snapshot required")
+            pair.validate_views()
+            if self._control_return_receipt2026 is not None:
+                raise ValueError("CONTROL raw return snapshot was already recorded")
+            self._control_return_receipt2026 = (context, pair, snapshot, False)
+
+    def import_control_getter_return2026(self, context) -> None:
+        """Consume the ordinary raw snapshot once at the actual outer getter join."""
+        from scripts import programming_2026_common
+        from scripts.j2534_2026 import J2534InterfacePair2026
+
+        with self._lock:
+            self._validate_control_output_context2026(context)
+            receipt = self._control_return_receipt2026
+            if (
+                context._capture._phase != 0
+                or receipt is None
+                or receipt[0] is not context
+                or receipt[1] is not self._engine.interface_pair
+                or type(receipt[1]) is not J2534InterfacePair2026
+                or receipt[2]
+                is not programming_2026_common._control_return_snapshot2026(context)
+                or receipt[3]
+            ):
+                raise ValueError("Unconsumed ordinary CONTROL getter return required")
+            pair, snapshot = receipt[1], receipt[2]
+            getter_values = getattr(
+                programming_2026_common, "_control_getter_return_values2026", None
+            )
+            if not callable(getter_values):
+                raise TypeError("Ordinary CONTROL getter result receipt is unavailable")
+            values = getter_values(context)
+            if type(values) is not tuple:
+                raise ValueError("Ordinary CONTROL getter result vector is invalid")
+            pair.import_into(pair.engine, snapshot)
+            self._engine.commit_received_identifiers(
+                values, controller=self._controller
+            )
+            self._control_return_receipt2026 = (context, pair, snapshot, True)
 
     def finish_classic_prepare(self) -> None:
         """8990 post-export phase transition; callback BOOL is not success."""
@@ -1731,6 +2212,7 @@ class EngineWorker2026:
                 )
                 ig_cycle = self._ig_cycle(current, following)
                 if kind == "file":
+                    self._control_scratch_reset_pending2026 = True
                     self._progress_base += max(
                         0,
                         native2026_cpu_count(current)
@@ -1857,6 +2339,15 @@ class EngineWorker2026:
         with self._lock:
             if self._phase_started_ms is None:
                 raise ValueError("Worker phase was not started")
+            if self._prepare_handshake != 2 and self._control_scratch_reset_pending2026:
+                self._control_count_scratch2026[:] = [0] * len(
+                    self._control_count_scratch2026
+                )
+                self._control_percent_scratch2026[:] = [0] * len(
+                    self._control_percent_scratch2026
+                )
+                self._control_scratch_reset_pending2026 = False
+            self._invalidate_control_file_capture2026()
             # Outer unwind records timing after the operation's own cancel point;
             # a fresh runtime check here would replace the primary exception.
             ended = self._runtime.local_milliseconds_of_day()
@@ -1873,6 +2364,7 @@ class EngineWorker2026:
         if not isinstance(error, BaseException):
             raise TypeError("Actual phase exception required")
         with self._lock:
+            self._invalidate_control_file_capture2026()
             self._phase_started_ms = None
             self._lifecycle = (
                 "cancelled" if isinstance(error, InterruptedError) else "faulted"
@@ -2037,6 +2529,7 @@ class EngineWorker2026:
                     "Finish the active CUW phase before closing its worker"
                 )
             self._pending_continuation = None
+            self._invalidate_control_file_capture2026()
             if self._prepare_handshake == 1:
                 self._prepare_handshake = 2
             self._closed = True

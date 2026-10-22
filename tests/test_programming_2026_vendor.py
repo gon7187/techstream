@@ -4,7 +4,10 @@ import csv
 import io
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from scripts.calibration import CalibrationContainer
 from scripts.calibration_2026 import (
     native2026_metadata,
     native2026_with_cpu_type,
@@ -27,6 +30,7 @@ from scripts.programming_2026_vendor import (
     execute_sbr_utility,
     hino_key,
     native2026_write_address_groups,
+    prepare_sbr,
     run_native,
     sbr_cipher_function,
     sbr_des_key,
@@ -55,6 +59,7 @@ def context(
     *,
     cpu_count=1,
     cpu_index=0,
+    cpu_type="282",
     cpu_type_second="282",
     contact_type="P5-CAN",
     native_observations=None,
@@ -70,7 +75,7 @@ def context(
     sbr = "SBR" in name
     text = (
         f"[Format]\nVersion={9 if sbr else 7}\n[Vehicle]\nNumberOfCalibration=1\n"
-        f"ContactType={contact_type}\nKindOfECU=106\n[CPU01]\nCPUType=282\n"
+        f"ContactType={contact_type}\nKindOfECU=106\n[CPU01]\nCPUType={cpu_type}\n"
         + (
             "NumberOfFiles=1\n[File1001]\nALFID=44\nEraseBlock=1\nDownloadAddress=00001000\nDownloadMemsize=00000004\n"
             if sbr
@@ -95,11 +100,13 @@ def context(
                 count=1,
             )
         )
+    if not isinstance(container, CalibrationContainer):
+        raise TypeError("Authored vendor fixture must remain a CUW container")
     suffix = {"get_cid": "GetCID", "prepare": "PrepareWrite", "write": "FlashWrite"}[
         stage
     ]
     values = {
-        "ParamFileKeySystemProtocolMicon": f"106{contact_type}282",
+        "ParamFileKeySystemProtocolMicon": f"106{contact_type}{cpu_type}",
         "DLLFileNameFor" + suffix: name,
         "GetCANIDFunctionNameFor" + suffix: "GetCanIDsFromParamForGetCID"
         if stage == "get_cid"
@@ -118,7 +125,7 @@ def context(
     writer = csv.writer(table)
     writer.writerow(values)
     writer.writerow(values.values())
-    catalogs = {f"106{contact_type}282.ini": table.getvalue().encode()}
+    catalogs = {f"106{contact_type}{cpu_type}.ini": table.getvalue().encode()}
     if cpu_count == 2 and cpu_type_second != "282":
         second_values = {
             **values,
@@ -406,6 +413,899 @@ class HinoTests(unittest.TestCase):
         with self.assertRaises(InterruptedError):
             run_native(context("TCUWCanHINOFlashWriter.dll"), p.runtime())
         self.assertEqual(p.filters, [])
+
+
+class SBRControlPublicationTests(unittest.TestCase):
+    def test_replaced_active_export_scope_fails_before_scratch_publication(self):
+        from tests.test_programming_replay import make_authentic_sbr_replay_fixture
+
+        engine, controller, session, _driver, runtime, actions, _key = (
+            make_authentic_sbr_replay_fixture(self)
+        )
+        rows = session.trace.rows
+        if type(rows) is not list:
+            raise TypeError("Mutable stale-scope trace rows required")
+        transfer_index = next(
+            index
+            for index, row in enumerate(rows)
+            if row["request"].get("operation") == "passthru_write"
+            and row["request"]["messages"][0]["data"]["value"].startswith(
+                "000007e03601"
+            )
+        )
+        response_index = next(
+            index
+            for index, row in enumerate(rows[transfer_index + 1 :], transfer_index + 1)
+            if row["request"].get("operation") == "passthru_read"
+            and row["result"]["value"]["value"]["value"][0]["value"]["data"][
+                "value"
+            ].startswith("000007e87601")
+        )
+        stop_filter_index = next(
+            index
+            for index, row in enumerate(rows[response_index + 1 :], response_index + 1)
+            if row["request"].get("operation") == "passthru_stop_filter"
+        )
+        tester_index = next(
+            index
+            for index, row in enumerate(rows[response_index + 1 :], response_index + 1)
+            if row["request"].get("operation") == "passthru_write"
+            and row["request"]["messages"][0]["data"]["value"].endswith("3e80")
+        )
+        next_wire_index = next(
+            index
+            for index, row in enumerate(rows[tester_index + 1 :], tester_index + 1)
+            if row["request"].get("operation") == "passthru_write"
+        )
+        stop_filter = rows[stop_filter_index]
+        final_clock_index = next(
+            index
+            for index, row in enumerate(
+                rows[stop_filter_index + 1 :], stop_filter_index + 1
+            )
+            if row["request"].get("operation") == "get_local_milliseconds_of_day"
+        )
+        final_clock = rows[final_clock_index]
+        rows[next_wire_index:stop_filter_index] = []
+        current_stop_filter_index = next(
+            index for index, row in enumerate(rows) if row is stop_filter
+        )
+        rows[current_stop_filter_index + 1 :] = [final_clock]
+
+        trace_capture = runtime.action.__self__.consume
+        recorded_action = trace_capture.recorded_consume
+
+        def replace_scope_after_transfer(kind, event, remaining=None):
+            result = recorded_action(kind, event, remaining)
+            if event.get("operation") == "passthru_write" and event["messages"][
+                0
+            ].data.startswith(bytes.fromhex("000007e03601")):
+                runtime._device_calls.control_export = (
+                    engine,
+                    controller,
+                    object(),
+                )
+            return result
+
+        trace_capture.recorded_consume = replace_scope_after_transfer
+        with engine.controller_execution(controller, 1):
+            session._bind_control_prelude2026(engine, controller, controller.runtime)
+            engine.worker._control_count_scratch2026[0] = 7
+            engine.worker._control_percent_scratch2026[0] = 41
+            device = engine.engine_runtime_device()
+            device.open()
+            device.connect(6)
+            with self.assertRaisesRegex(ValueError, "scope expired or was replaced"):
+                controller.execute(engine, session)
+            control = controller.native_control_context2026(engine)
+            scratch = (control.count_scratch[0], control.percentage_scratch[0])
+            published = (
+                engine.dh_state._transferred_bytes[0],
+                engine.dh_state._progress[0],
+            )
+
+        self.assertEqual(scratch, (7, 41))
+        self.assertEqual(published, (0, 0))
+        self.assertEqual(actions, [])
+
+    def test_padded_transfer_uses_logical_total_and_actual_wire_bytes(self):
+        import tests.test_calibration_2026 as calibration_tests
+        import tests.test_programming_2026_vendor as vendor_tests
+        from tests.test_programming_replay import make_authentic_sbr_replay_fixture
+
+        original_cuw = calibration_tests.cuw
+        original_context = vendor_tests.context
+
+        def logical_seven_cuw(text, records, **kwargs):
+            return original_cuw(
+                text.replace("DownloadMemsize=00000008", "DownloadMemsize=00000007"),
+                records,
+                **kwargs,
+            )
+
+        def padded_context(*args, **kwargs):
+            kwargs["FlagToDataBlockPadding"] = "1"
+            return original_context(*args, **kwargs)
+
+        original_driver = vendor_tests.TypedDriver.__call__
+
+        def padded_file_replies(driver, event, remaining):
+            if event["operation"] == "passthru_write":
+                for message in event["messages"]:
+                    request = message.data[4:]
+                    if request.startswith(b"\x34\x04"):
+                        driver.replies[request] = [b"\x74\x20\x00\x0a"]
+                    elif request.startswith(b"\x31\x01\xff\x00"):
+                        driver.replies[request] = [b"\x71\x01\xff\x00"]
+                    elif request.startswith(b"\x31\x01\xff\x01"):
+                        driver.replies[request] = [b"\x71\x01\xff\x01\x01"]
+            return original_driver(driver, event, remaining)
+
+        with (
+            patch.object(calibration_tests, "cuw", logical_seven_cuw),
+            patch.object(vendor_tests, "context", padded_context),
+            patch.object(vendor_tests.TypedDriver, "__call__", padded_file_replies),
+        ):
+            engine, controller, session, _driver, _runtime, actions, _key = (
+                make_authentic_sbr_replay_fixture(self, data=b"12345678")
+            )
+        with engine.controller_execution(controller, 1):
+            session._bind_control_prelude2026(engine, controller, controller.runtime)
+            device = engine.engine_runtime_device()
+            device.open()
+            device.connect(6)
+            result = controller.execute(engine, session)
+            control = controller.native_control_context2026(engine)
+            scratch = (control.count_scratch, control.percentage_scratch)
+            published = (
+                engine.dh_state._transferred_bytes,
+                engine.dh_state._progress,
+                engine.worker._previous_percentages2026,
+            )
+
+        self.assertTrue(result["native_return"])
+        self.assertEqual(
+            tuple(
+                (a["operation"], a.get("transferred_bytes", a.get("progress")))
+                for a in actions
+            ),
+            (
+                ("notify_progress_count", 0),
+                ("notify_progress_percent", 57),
+                ("notify_progress_count", 4),
+                ("notify_progress_percent", 114),
+            ),
+        )
+        self.assertEqual(scratch, ((8,) + (0,) * 15, (114,) + (0,) * 15))
+        self.assertEqual(
+            published,
+            ((4,) + (0,) * 15, (114,) + (0,) * 15, (57,) + (0,) * 15),
+        )
+
+    def test_double_1_of_49_arithmetic_uses_source_truncation(self):
+        from tests.test_programming_replay import make_authentic_sbr_replay_fixture
+
+        engine, controller, session, _driver, _runtime, actions, _key = (
+            make_authentic_sbr_replay_fixture(
+                self,
+                data=bytes(range(49)),
+                block_response=bytes.fromhex("74200007"),
+            )
+        )
+        with engine.controller_execution(controller, 1):
+            session._bind_control_prelude2026(engine, controller, controller.runtime)
+            device = engine.engine_runtime_device()
+            device.open()
+            device.connect(6)
+            result = controller.execute(engine, session)
+            control = controller.native_control_context2026(engine)
+            scratch = (control.count_scratch, control.percentage_scratch)
+            published = (
+                engine.dh_state._transferred_bytes,
+                engine.dh_state._progress,
+                engine.worker._previous_percentages2026,
+            )
+
+        count_actions = tuple(
+            action["transferred_bytes"]
+            for action in actions
+            if action["operation"] == "notify_progress_count"
+        )
+        self.assertTrue(result["native_return"])
+        self.assertEqual(count_actions[:2], (0, 0))
+        self.assertEqual(len(count_actions), 49)
+        self.assertEqual(
+            scratch,
+            ((49,) + (0,) * 15, (100,) + (0,) * 15),
+        )
+        self.assertEqual(
+            published,
+            (
+                (48,) + (0,) * 15,
+                (100,) + (0,) * 15,
+                (97,) + (0,) * 15,
+            ),
+        )
+
+    def test_live_complete_scratch_skips_without_final_progress_flush(self):
+        from tests.test_programming_replay import make_authentic_sbr_replay_fixture
+
+        engine, controller, session, _driver, _runtime, actions, _key = (
+            make_authentic_sbr_replay_fixture(self)
+        )
+        rows = session.trace.rows
+        if type(rows) is not list:
+            raise TypeError("Mutable skip trace rows required")
+        mode_on_index = next(
+            index
+            for index, row in enumerate(rows)
+            if row["request"].get("operation") == "set_communication_log_mode"
+            and row["request"].get("mode") == 2
+        )
+        mode_off_index = next(
+            index
+            for index, row in enumerate(rows[mode_on_index + 1 :], mode_on_index + 1)
+            if row["request"].get("operation") == "set_communication_log_mode"
+            and row["request"].get("mode") == 0
+        )
+        final_clock_index = next(
+            index
+            for index, row in enumerate(rows[mode_off_index + 1 :], mode_off_index + 1)
+            if row["request"].get("operation") == "get_local_milliseconds_of_day"
+        )
+        mode_off, final_clock = rows[mode_off_index], rows[final_clock_index]
+        rows[mode_on_index + 1 : mode_off_index] = [mode_off, final_clock]
+        with engine.controller_execution(controller, 1):
+            session._bind_control_prelude2026(engine, controller, controller.runtime)
+            engine.worker._control_count_scratch2026[0] = 4
+            engine.worker._control_percent_scratch2026[0] = 100
+            device = engine.engine_runtime_device()
+            device.open()
+            device.connect(6)
+            result = controller.execute(engine, session)
+            control = controller.native_control_context2026(engine)
+            scratch = (control.count_scratch[0], control.percentage_scratch[0])
+            published = (
+                engine.dh_state._transferred_bytes[0],
+                engine.dh_state._progress[0],
+            )
+
+        self.assertTrue(result["native_return"])
+        self.assertTrue(
+            any(report.get("native_skipped_completed") for report in result["exports"])
+        )
+        self.assertEqual(scratch, (4, 100))
+        self.assertEqual(published, (0, 0))
+        self.assertEqual(actions, [])
+
+    def test_reset_count_observer_fault_stops_before_percent_reset(self):
+        from tests.test_programming_replay import make_authentic_sbr_replay_fixture
+
+        engine, controller, session, _driver, runtime, actions, _key = (
+            make_authentic_sbr_replay_fixture(self)
+        )
+        rows = session.trace.rows
+        if type(rows) is not list:
+            raise TypeError("Mutable reset-fault trace rows required")
+        write_index = next(
+            index
+            for index, row in enumerate(rows)
+            if row["request"].get("operation") == "passthru_write"
+            and row["request"]["messages"][0]["data"]["value"].startswith(
+                "000007e03601"
+            )
+        )
+        response_index = next(
+            index
+            for index, row in enumerate(rows[write_index + 1 :], write_index + 1)
+            if row["request"].get("operation") == "passthru_read"
+            and row["result"]["value"]["value"]["value"][0]["value"]["data"][
+                "value"
+            ].startswith("000007e87601")
+        )
+        rows[response_index]["result"]["value"]["value"]["value"][0]["value"]["data"][
+            "value"
+        ] = "000007e87f3611"
+        stop_filter_index = next(
+            index
+            for index, row in enumerate(rows[response_index + 1 :], response_index + 1)
+            if row["request"].get("operation") == "passthru_stop_filter"
+        )
+        stop_filter = rows[stop_filter_index]
+        final_clock_index = next(
+            index
+            for index, row in enumerate(
+                rows[stop_filter_index + 1 :], stop_filter_index + 1
+            )
+            if row["request"].get("operation") == "get_local_milliseconds_of_day"
+        )
+        final_clock = rows[final_clock_index]
+        rows[response_index + 1 : stop_filter_index] = []
+        current_stop_filter_index = next(
+            index for index, row in enumerate(rows) if row is stop_filter
+        )
+        rows[current_stop_filter_index + 1 :] = [final_clock]
+
+        fault = OSError("reset count observer fault")
+        trace_capture = runtime.action.__self__.consume
+        recorded_action = trace_capture.recorded_consume
+
+        def fail_after_count(kind, event, remaining=None):
+            result = recorded_action(kind, event, remaining)
+            if event.get("operation") == "notify_progress_count":
+                raise fault
+            return result
+
+        trace_capture.recorded_consume = fail_after_count
+        with engine.controller_execution(controller, 1):
+            session._bind_control_prelude2026(engine, controller, controller.runtime)
+            control = controller.native_control_context2026(engine)
+            engine.worker._control_count_scratch2026[0] = 7
+            engine.worker._control_percent_scratch2026[0] = 41
+            device = engine.engine_runtime_device()
+            device.open()
+            device.connect(6)
+            with self.assertRaises(OSError) as caught:
+                controller.execute(engine, session)
+            scratch = (control.count_scratch[0], control.percentage_scratch[0])
+            published = (
+                engine.dh_state._transferred_bytes[0],
+                engine.dh_state._progress[0],
+                engine.worker._previous_percentages2026,
+            )
+
+        self.assertIs(caught.exception, fault)
+        self.assertEqual(scratch, (0, 41))
+        self.assertEqual(published, (0, 0, ()))
+        self.assertEqual(
+            tuple(action["operation"] for action in actions),
+            ("notify_progress_count",),
+        )
+
+    def test_typed_transfer_failure_resets_count_then_percent(self):
+        from tests.test_programming_replay import make_authentic_sbr_replay_fixture
+
+        engine, controller, session, _driver, _runtime, actions, _key = (
+            make_authentic_sbr_replay_fixture(self)
+        )
+        rows = session.trace.rows
+        if type(rows) is not list:
+            raise TypeError("Mutable typed-failure trace rows required")
+        write_index = next(
+            index
+            for index, row in enumerate(rows)
+            if row["request"].get("operation") == "passthru_write"
+            and row["request"]["messages"][0]["data"]["value"].startswith(
+                "000007e03601"
+            )
+        )
+        response_index = next(
+            index
+            for index, row in enumerate(rows[write_index + 1 :], write_index + 1)
+            if row["request"].get("operation") == "passthru_read"
+            and row["result"]["value"]["value"]["value"][0]["value"]["data"][
+                "value"
+            ].startswith("000007e87601")
+        )
+        response = rows[response_index]
+        response["result"]["value"]["value"]["value"][0]["value"]["data"]["value"] = (
+            "000007e87f3611"
+        )
+        stop_filter_index = next(
+            index
+            for index, row in enumerate(rows[response_index + 1 :], response_index + 1)
+            if row["request"].get("operation") == "passthru_stop_filter"
+        )
+        stop_filter = rows[stop_filter_index]
+        log_off_index = next(
+            index
+            for index, row in enumerate(rows[response_index + 1 :], response_index + 1)
+            if row["request"].get("operation") == "set_communication_log_mode"
+            and row["request"].get("mode") == 0
+        )
+        final_clock_index = next(
+            index
+            for index, row in enumerate(rows[log_off_index + 1 :], log_off_index + 1)
+            if row["request"].get("operation") == "get_local_milliseconds_of_day"
+        )
+        final_clock = rows[final_clock_index]
+        rows[response_index + 1 : stop_filter_index] = []
+        current_stop_filter_index = next(
+            index for index, row in enumerate(rows) if row is stop_filter
+        )
+        rows[current_stop_filter_index + 1 :] = [final_clock]
+        reports = []
+        original_call = controller._control_call2026
+        boundary = OSError("stop after observing the returned family report")
+
+        def stop_after_family_report(*args, **kwargs):
+            report = original_call(*args, **kwargs)
+            if args[3] == "StartFlashWrite":
+                reports.append(report)
+                raise boundary
+            return report
+
+        with engine.controller_execution(controller, 1):
+            session._bind_control_prelude2026(engine, controller, controller.runtime)
+            device = engine.engine_runtime_device()
+            device.open()
+            device.connect(6)
+            with (
+                patch.object(
+                    controller,
+                    "_control_call2026",
+                    side_effect=stop_after_family_report,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                controller.execute(engine, session)
+            control = controller.native_control_context2026(engine)
+            scratch = (control.count_scratch[0], control.percentage_scratch[0])
+
+        self.assertIs(caught.exception, boundary)
+        self.assertEqual(len(reports), 1)
+        self.assertFalse(reports[0]["native_return"])
+        self.assertEqual(
+            tuple(
+                (
+                    action["operation"],
+                    action.get("transferred_bytes", action.get("progress")),
+                )
+                for action in actions
+            ),
+            (("notify_progress_count", 0), ("notify_progress_percent", 0)),
+        )
+        self.assertEqual(scratch, (0, 0))
+
+    def test_host_faults_preserve_each_count_percent_publication_boundary(self):
+        from tests.test_programming_replay import make_authentic_sbr_replay_fixture
+
+        for fault_operation in (
+            "notify_progress_count",
+            "notify_progress_percent",
+        ):
+            with self.subTest(operation=fault_operation):
+                engine, controller, session, _driver, runtime, actions, _key = (
+                    make_authentic_sbr_replay_fixture(self, data=b"DATA1234")
+                )
+                fault = OSError("observer fault")
+                chronology = []
+                trace_capture = runtime.action.__self__.consume
+                recorded_action = trace_capture.recorded_consume
+                original_runtime_call = runtime.call
+
+                def record_source_call(
+                    operation,
+                    *,
+                    chronology=chronology,
+                    original_runtime_call=original_runtime_call,
+                    **kwargs,
+                ):
+                    if operation in (
+                        "notify_progress_count",
+                        "notify_progress_percent",
+                    ):
+                        chronology.append(("callback", operation))
+                    return original_runtime_call(operation, **kwargs)
+
+                def record_actual_wire_then_fault(
+                    kind,
+                    event,
+                    remaining=None,
+                    *,
+                    chronology=chronology,
+                ):
+                    if kind == "action" and event.get("operation") == "passthru_write":
+                        for message in event["messages"]:
+                            payload = message.data[4:]
+                            if payload.startswith(b"\x36"):
+                                chronology.append(("block", payload))
+                            elif payload == b"\x3e\x80":
+                                chronology.append(("tester", payload))
+                    return fail_after_publication(kind, event, remaining)
+
+                def fail_after_publication(
+                    kind,
+                    event,
+                    remaining=None,
+                    action=recorded_action,
+                    operation=fault_operation,
+                    failure=fault,
+                ):
+                    result = action(kind, event, remaining)
+                    if event.get("operation") == operation:
+                        raise failure
+                    return result
+
+                runtime.call = record_source_call
+                trace_capture.recorded_consume = record_actual_wire_then_fault
+                with engine.controller_execution(controller, 1):
+                    session._bind_control_prelude2026(
+                        engine, controller, controller.runtime
+                    )
+                    device = engine.engine_runtime_device()
+                    device.open()
+                    device.connect(6)
+                    with self.assertRaises(OSError) as caught:
+                        try:
+                            controller.execute(engine, session)
+                        except OSError:
+                            rows = session.trace.rows
+                            if type(rows) is not list:
+                                raise TypeError("Mutable fault-trace rows required")
+                            final_clock_index = next(
+                                index
+                                for index in range(len(rows) - 1, -1, -1)
+                                if rows[index]["request"].get("operation")
+                                == "get_local_milliseconds_of_day"
+                            )
+                            rows.insert(
+                                session.trace.position,
+                                rows.pop(final_clock_index),
+                            )
+                            raise
+                    control = controller.native_control_context2026(engine)
+                    scratch = (control.count_scratch, control.percentage_scratch)
+                    published = (
+                        engine.dh_state._transferred_bytes,
+                        engine.dh_state._progress,
+                        engine.worker._previous_percentages2026,
+                    )
+
+                self.assertIs(caught.exception, fault)
+                block_index = next(
+                    index
+                    for index, item in enumerate(chronology)
+                    if item[0] == "block" and item[1][1] == 1
+                )
+                tester_index = next(
+                    index
+                    for index, item in enumerate(chronology)
+                    if index > block_index and item[0] == "tester"
+                )
+                count_index = next(
+                    index
+                    for index, item in enumerate(chronology)
+                    if item == ("callback", "notify_progress_count")
+                )
+                self.assertLess(block_index, tester_index)
+                self.assertLess(tester_index, count_index)
+                if fault_operation == "notify_progress_count":
+                    self.assertEqual(scratch[0][0], 0)
+                    self.assertEqual(scratch[1][0], 0)
+                    self.assertEqual(published[0][0], 0)
+                    self.assertEqual(published[1][0], 0)
+                    self.assertEqual(
+                        tuple(item["operation"] for item in actions),
+                        ("notify_progress_count",),
+                    )
+                else:
+                    self.assertEqual(scratch[0][0], 4)
+                    self.assertEqual(scratch[1][0], 50)
+                    self.assertEqual(published[0][0], 0)
+                    self.assertEqual(published[1][0], 50)
+                    self.assertEqual(published[2][0], 0)
+                    self.assertEqual(
+                        tuple(item["operation"] for item in actions),
+                        ("notify_progress_count", "notify_progress_percent"),
+                    )
+
+    def test_scoped_two_cpu_loop_uses_issued_entry_and_keeps_count_lag(self):
+        import copy
+
+        from scripts.calibration_2026 import native2026_global_cpu_index
+        from tests.test_programming_replay import make_authentic_sbr_replay_fixture
+
+        (
+            capture_engine,
+            capture_controller,
+            capture_session,
+            _driver,
+            _runtime,
+            capture_actions,
+            _key,
+        ) = make_authentic_sbr_replay_fixture(self, data=b"DATA1234", cpu_count=2)
+        entry_targets = []
+        entry_globals = []
+        scoped_callback_indices = []
+
+        def execute(engine, controller, session):
+            original_call = controller._control_call2026
+            original_runtime_call = controller.runtime.call
+
+            def capture_progress_scope(operation, **kwargs):
+                if operation in ("notify_progress_count", "notify_progress_percent"):
+                    active = controller.runtime._device_calls.control_export
+                    scoped_callback_indices.append(
+                        (active[2].entry_cpu_index, kwargs["cpu_index"])
+                    )
+                return original_runtime_call(operation, **kwargs)
+
+            def capture_entry(*args, **kwargs):
+                target = args[2]
+                if args[3] == "StartFlashWrite":
+                    entry_targets.append(target.entry_cpu_index)
+                    entry_globals.append(
+                        native2026_global_cpu_index(target.binding.metadata)
+                    )
+                return original_call(*args, **kwargs)
+
+            controller._control_call2026 = capture_entry
+            controller.runtime.call = capture_progress_scope
+            with engine.controller_execution(controller, 1):
+                session._bind_control_prelude2026(
+                    engine, controller, controller.runtime
+                )
+                engine.worker._control_count_scratch2026[0:3] = [2, 6, 9]
+                engine.worker._control_percent_scratch2026[0:3] = [37, 25, 11]
+                device = engine.engine_runtime_device()
+                device.open()
+                device.connect(6)
+                result = controller.execute(engine, session)
+                control = controller.native_control_context2026(engine)
+                scratch = (control.count_scratch, control.percentage_scratch)
+                published = (
+                    engine.dh_state._transferred_bytes,
+                    engine.dh_state._progress,
+                    engine.worker._previous_percentages2026,
+                )
+            return result, scratch, published
+
+        capture_result, _scratch, _published = execute(
+            capture_engine, capture_controller, capture_session
+        )
+        self.assertTrue(capture_result["native_return"])
+        self.assertEqual(
+            capture_session.trace.position, len(capture_session.trace.rows)
+        )
+        captured_actions = tuple(copy.deepcopy(capture_actions))
+        frozen_events = tuple(copy.deepcopy(capture_session.trace.rows))
+
+        engine, controller, session, _driver, _runtime, actions, _key = (
+            make_authentic_sbr_replay_fixture(
+                self,
+                data=b"DATA1234",
+                cpu_count=2,
+                events_override=frozen_events,
+                capture_progress=False,
+            )
+        )
+        result, scratch, published = execute(engine, controller, session)
+
+        self.assertEqual(actions, [])
+        self.assertTrue(result["native_return"])
+        self.assertEqual(session.trace.position, len(frozen_events))
+        self.assertEqual(
+            tuple(
+                event["request"]
+                for event in frozen_events
+                if event.get("request", {}).get("operation")
+                in ("notify_progress_count", "notify_progress_percent")
+            ),
+            captured_actions,
+        )
+        self.assertEqual(entry_targets, [0, 1, 0, 1])
+        self.assertEqual(entry_globals, [0, 1, 0, 1])
+        self.assertEqual(
+            scoped_callback_indices,
+            [
+                *((0, 0),) * 4,
+                *((0, 1),) * 4,
+                *((0, 0),) * 4,
+                *((0, 1),) * 4,
+            ],
+        )
+        self.assertEqual(actions, [])
+        writes = [
+            event["request"]["messages"][0]["data"]["value"]
+            for event in frozen_events
+            if event.get("request", {}).get("operation") == "passthru_write"
+            and event["request"]["messages"][0]["data"]["value"].startswith(
+                ("000007e036", "000007e136")
+            )
+        ]
+        self.assertEqual(
+            [value[:20] for value in writes],
+            [
+                "000007e0360100001000",
+                "000007e0360200001004",
+                "000007e1360100002000",
+                "000007e1360200002004",
+            ],
+        )
+        self.assertEqual(
+            tuple(
+                (
+                    action["operation"],
+                    action["cpu_index"],
+                    action.get("transferred_bytes", action.get("progress")),
+                )
+                for action in captured_actions
+            ),
+            (
+                ("notify_progress_count", 0, 2),
+                ("notify_progress_percent", 0, 50),
+                ("notify_progress_count", 0, 4),
+                ("notify_progress_percent", 0, 100),
+                ("notify_progress_count", 1, 6),
+                ("notify_progress_percent", 1, 50),
+                ("notify_progress_count", 1, 4),
+                ("notify_progress_percent", 1, 100),
+            ),
+        )
+        self.assertEqual(
+            scratch,
+            ((8, 8, 9) + (0,) * 13, (100, 100, 11) + (0,) * 13),
+        )
+        self.assertEqual(
+            published,
+            (
+                (8, 4, 9) + (0,) * 13,
+                (100, 100, 11) + (0,) * 13,
+                (100, 50, 11) + (0,) * 13,
+            ),
+        )
+
+        import csv
+        import io
+        from unittest.mock import patch
+
+        import tests.test_calibration_2026 as calibration_tests
+        import tests.test_programming_2026_common as common_tests
+        import tests.test_programming_replay as replay_tests
+        from scripts.calibration import decode_cuw_text
+        from tests.test_cuw_engine_worker import encoded_table
+
+        original_cuw = calibration_tests.cuw
+        original_factory = common_tests.make_raw_control_fixture2026
+        for loop_flag in (1, 0):
+            with self.subTest(future_cpu_loop_flag=loop_flag):
+                invalid_sources = []
+
+                def remember_invalid_cpu(
+                    text,
+                    records,
+                    *,
+                    _invalid_sources=invalid_sources,
+                    **kwargs,
+                ):
+                    if "[File2001]\nALFID=44" in text:
+                        _invalid_sources[:] = [
+                            original_cuw(
+                                text.replace(
+                                    "[File2001]\nALFID=44",
+                                    "[File2001]\nALFID=00",
+                                ),
+                                records,
+                                **kwargs,
+                            )
+                        ]
+                    return original_cuw(text, records, **kwargs)
+
+                def issue_invalid_future_source(
+                    *args,
+                    _invalid_sources=invalid_sources,
+                    _loop_flag=loop_flag,
+                    **kwargs,
+                ):
+                    self.assertTrue(_invalid_sources)
+                    kwargs["source"] = _invalid_sources[0]
+                    catalog = dict(kwargs["catalog"])
+                    for name, payload in catalog.items():
+                        rows = list(
+                            csv.reader(io.StringIO(decode_cuw_text(payload).decode()))
+                        )
+                        if "CpuLoopBetweenPrepareAndWriteFlag" not in rows[0]:
+                            continue
+                        column = rows[0].index("CpuLoopBetweenPrepareAndWriteFlag")
+                        for row in rows[1:]:
+                            row[column] = str(_loop_flag)
+                        catalog[name] = encoded_table(
+                            tuple(rows[0]), tuple(tuple(row) for row in rows[1:])
+                        )
+                    kwargs["catalog"] = catalog
+                    return original_factory(*args, **kwargs)
+
+                with (
+                    patch.object(calibration_tests, "cuw", remember_invalid_cpu),
+                    patch.object(
+                        common_tests,
+                        "make_raw_control_fixture2026",
+                        issue_invalid_future_source,
+                    ),
+                ):
+                    lazy_engine, lazy_controller, lazy_session, *_ = (
+                        replay_tests.make_authentic_sbr_replay_fixture(
+                            self, data=b"DATA1234", cpu_count=2
+                        )
+                    )
+                with lazy_engine.controller_execution(lazy_controller, 1):
+                    lazy_session._bind_control_prelude2026(
+                        lazy_engine, lazy_controller, lazy_controller.runtime
+                    )
+                    device = lazy_engine.engine_runtime_device()
+                    device.open()
+                    device.connect(6)
+                    if loop_flag:
+                        result = lazy_controller.execute(lazy_engine, lazy_session)
+                        self.assertTrue(result["native_return"])
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "SBR file requires explicit segment"
+                        ):
+                            lazy_controller.execute(lazy_engine, lazy_session)
+                    consumed = lazy_session.trace.rows[: lazy_session.trace.position]
+                block_writes = [
+                    event["request"]["messages"][0]["data"]["value"]
+                    for event in consumed
+                    if event["request"].get("operation") == "passthru_write"
+                    and event["request"]["messages"][0]["data"]["value"].startswith(
+                        "000007e036"
+                    )
+                ]
+                self.assertEqual(len(block_writes), 2)
+                self.assertTrue(all("0000100" in value for value in block_writes))
+
+    def test_actual_prepare_read_publishes_before_later_auth_fault(self):
+        for central, cpu_type, response, expected in (
+            (False, "282", b"\x62\xf1\0\xe0\xa2\0", 0xE0),
+            (True, "283", b"\x62\xf1\0\xe0\xa2\0", 0xA2),
+        ):
+            with self.subTest(central=central):
+                ctx = context(
+                    "TCUWCanSBRPrepareWriter.dll",
+                    cpu_type=cpu_type,
+                    FlagToCentralGateway="1" if central else "0",
+                )
+                replay = Replay((response,))
+                runtime = replay.runtime()
+
+                class Worker:
+                    def _bind_sbr_ssm_producer2026(self, utility, target):
+                        self.utility, self.target = utility, target
+                        self.published = []
+
+                    def publish_sbr_ssm2026(self, utility):
+                        if utility is not self.utility:
+                            raise AssertionError("Different SBR utility published")
+                        self.published.append(utility.ssm)
+
+                worker = Worker()
+                engine = SimpleNamespace(worker=worker)
+                target = object()
+                controller = SimpleNamespace(runtime=runtime)
+                runtime._device_calls.control_export = (engine, controller, target)
+                fault = OSError("later authorization fault")
+                replay.replies = iter((response, b"\x67\x01\x01" + bytes(3)))
+
+                def reject_key(*_args, failure=fault):
+                    raise failure
+
+                with (
+                    patch.object(SBRUtils2026, "extended_session"),
+                    patch.object(SBRUtils2026, "collate_gateway"),
+                    patch.object(SBRUtils2026, "central_gateway_routine"),
+                    patch.object(SBRUtils2026, "diagnostic_mask"),
+                    patch.object(SBRUtils2026, "stop_communication"),
+                    patch.object(SBRUtils2026, "wait_after"),
+                    self.assertRaisesRegex(OSError, "later authorization fault"),
+                ):
+                    prepare_sbr(
+                        ctx,
+                        runtime,
+                        key_provider=reject_key,
+                        gateway_key_provider=lambda _: bytes(256),
+                    )
+                self.assertEqual(worker.published, [expected])
+                self.assertIs(worker.utility.context, ctx)
+
+    def test_standalone_utility_keeps_ssm_local(self):
+        ctx = context("TCUWCanSBRPrepareWriter.dll")
+        replay = Replay((b"\x62\xf1\0\x12\x34\0",))
+        utility = SBRUtils2026(VendorCAN2026(replay.runtime(), ctx.addresses[0]))
+        utility.read_ssm()
+        self.assertEqual(utility.ssm, 0x12)
+        self.assertFalse(utility._control_ssm_issued)
 
 
 class SBRTests(unittest.TestCase):

@@ -2303,31 +2303,39 @@ class SuzukiIdentificationTests(unittest.TestCase):
             )
             from scripts.programming_2026_common import CommonResponseError
 
-            for error, expected in (
-                (CommonResponseError(0x22), {"native_primary_error": 0x22}),
-                (CommonResponseError(0x409), {"native_primary_error": 0x409}),
-                (CommonResponseError(0x19), {"native_primary_error": 0x19}),
-                (NativePassThruError2026(9), {"native_primary_error": 9}),
-                (
-                    NativeJ2534Error2026(5),
-                    {"native_primary_error": 1, "native_passthru_error": 5},
+            def caught_body_fault(row, remaining):
+                if row["operation"] == "control_io":
+                    raise NativeJ2534Error2026(5)
+                return cid_action(row, remaining)
+
+            ordinary_native_failure = execute_context(
+                bound,
+                NativeRuntime2026(
+                    caught_body_fault, native_cancelled=engine.native_cancelled
                 ),
+            )
+            self.assertEqual(ordinary_native_failure["state"], "failed")
+            self.assertFalse(ordinary_native_failure["native_success"])
+            self.assertEqual(ordinary_native_failure["identifiers"], [])
+            self.assertEqual(ordinary_native_failure["native_primary_error"], 1)
+            self.assertEqual(ordinary_native_failure["native_passthru_error"], 5)
+
+            for error in (
+                CommonResponseError(0x22),
+                CommonResponseError(0x409),
+                CommonResponseError(0x19),
+                NativePassThruError2026(9),
+                NativeJ2534Error2026(5),
             ):
-                with patch(
-                    "scripts.programming_2026_suzuki_fhi.get_suzuki_cid",
-                    side_effect=error,
+                with (
+                    patch(
+                        "scripts.programming_2026_suzuki_fhi.get_suzuki_cid",
+                        side_effect=error,
+                    ),
+                    self.assertRaises(type(error)) as raised,
                 ):
-                    failed = execute_context(bound, NativeRuntime2026(cid_action))
-                self.assertEqual(failed["state"], "failed")
-                self.assertIsNone(failed["native_return"])
-                for key, value in expected.items():
-                    self.assertEqual(failed[key], value)
-                self.assertEqual(
-                    failed["native_primary_error"], engine.suzuki_state.primary_error
-                )
-                self.assertEqual(
-                    failed["native_passthru_error"], engine.suzuki_state.passthru_error
-                )
+                    execute_context(bound, NativeRuntime2026(cid_action))
+                self.assertIs(raised.exception, error)
             with self.assertRaises(ValueError):
                 execute_context(
                     replace(bound, addresses=()),
@@ -2747,3 +2755,155 @@ class SuzukiIdentificationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SuzukiGetterBoundaryTests(unittest.TestCase):
+    """Authored providers for the getter's exact native/host catch boundaries."""
+
+    def setUp(self):
+        from scripts.programming_2026_common import NativeRuntime2026
+
+        self.runtime_type = NativeRuntime2026
+        self.getter = identify_native_module(
+            "b63abaebe764c6067ec5013c44c16f3c47cc6ebe6abfd84b0e93d3681c0b6315",
+            "TCUWCanSuzukiUDSSoftwareIDGetter.dll",
+        )
+        self.utility = identify_native_module(
+            "58db5e0494645ee4f665c714a0a59afa5e2765ce2f55c8505d31e5db76159283",
+            "TCUWCanSuzukiUDSUtils.dll",
+        )
+        self.request = bytes.fromhex("000007e0")
+        self.response = bytes.fromhex("000007e8")
+        self.cid = b"H" * 11 + b"_" + b"S" * 16 + b"_0123"
+
+    class _State:
+        def __init__(self):
+            self.error_kind = 7
+            self.primary_error = 44
+            self.passthru_error = 55
+
+        def record_native_error(self, kind, primary, passthru=None):
+            if kind is not None:
+                self.error_kind = kind
+            self.primary_error = primary
+            if passthru is not None:
+                self.passthru_error = passthru
+
+    def _invoke(
+        self, *, action_fault=None, exchange_fault=None, state=None, result=None
+    ):
+        from types import SimpleNamespace
+
+        actions = []
+        replies = {
+            bytes.fromhex("22f189"): bytes.fromhex("62f1890123"),
+            bytes.fromhex("22f188"): b"\x62\xf1\x88" + b"S" * 16,
+            bytes.fromhex("22f191"): b"\x62\xf1\x91" + b"H" * 11,
+        }
+
+        def action(row, _):
+            actions.append(row["operation"])
+            if action_fault is not None and row["operation"] == action_fault[0]:
+                raise action_fault[1]
+            if row["operation"] == "start_flow_control_filter":
+                return 11
+            return None
+
+        def exchange(_, payload):
+            if exchange_fault is not None:
+                raise exchange_fault
+            return replies[payload]
+
+        result = result or SuzukiUSBResult()
+        runtime = self.runtime_type(action)
+        context = SimpleNamespace(controller_state=state or self._State())
+        value = suzuki_get_identification(
+            self.getter,
+            self.utility,
+            runtime,
+            NativeProgrammingChannel(exchange, self.request.hex()),
+            self.request,
+            self.response,
+            baudrate_kbps=500,
+            receive_timeout_ms=1234,
+            address_context=context,
+            result=result,
+        )
+        return value, result, context.controller_state, actions, runtime
+
+    def test_success_returns_vector_and_sets_separate_saved_bool(self):
+        value, result, _, actions, _ = self._invoke()
+        self.assertEqual(value, self.cid)
+        self.assertTrue(result.success)
+        self.assertTrue(result.native_return_reached)
+        self.assertEqual(actions[-2:], ["stop_filter", "disconnect"])
+
+    def test_cj_native_body_fault_sets_primary_and_driver_fields(self):
+        from scripts.j2534_2026 import NativeJ2534Error2026
+
+        _, result, state, _, _ = self._invoke(
+            action_fault=("control_io", NativeJ2534Error2026(5))
+        )
+        self.assertFalse(result.success)
+        self.assertEqual((state.primary_error, state.passthru_error), (1, 5))
+
+    def test_cpassthru_native_body_fault_preserves_old_driver_field(self):
+        from scripts.j2534_2026 import NativePassThruError2026
+
+        state = self._State()
+        _, result, state, _, _ = self._invoke(
+            action_fault=("control_io", NativePassThruError2026(9)), state=state
+        )
+        self.assertFalse(result.success)
+        self.assertEqual((state.primary_error, state.passthru_error), (9, 55))
+
+    def test_explicit_native_catchall_preserves_both_old_error_fields(self):
+        from scripts.programming_2026_common import NativeException2026
+
+        state = self._State()
+        _, result, state, _, _ = self._invoke(
+            action_fault=("control_io", NativeException2026("native")), state=state
+        )
+        self.assertFalse(result.success)
+        self.assertEqual((state.primary_error, state.passthru_error), (44, 55))
+
+    def test_host_body_fault_propagates_same_object(self):
+        fault = RuntimeError("provider body fault")
+        with self.assertRaises(RuntimeError) as raised:
+            self._invoke(action_fault=("control_io", fault))
+        self.assertIs(raised.exception, fault)
+
+    def test_native_stop_filter_fault_suppresses_without_clearing_saved_bool(self):
+        from scripts.j2534_2026 import NativeJ2534Error2026
+
+        _, result, _, actions, runtime = self._invoke(
+            action_fault=("stop_filter", NativeJ2534Error2026(5))
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(result.suppressed_cleanup_errors, ["NativeJ2534Error2026"])
+        self.assertEqual(actions[-1], "disconnect")
+        self.assertFalse(runtime.owns_resource("stop_filter", identifier=11))
+
+    def test_host_stop_filter_fault_propagates_same_object(self):
+        fault = RuntimeError("provider cleanup fault")
+        with self.assertRaises(RuntimeError) as raised:
+            self._invoke(action_fault=("stop_filter", fault))
+        self.assertIs(raised.exception, fault)
+
+    def test_native_disconnect_fault_propagates_without_return_receipt(self):
+        from scripts.j2534_2026 import NativePassThruError2026
+
+        fault = NativePassThruError2026(9)
+        result = SuzukiUSBResult()
+        with self.assertRaises(NativePassThruError2026) as raised:
+            self._invoke(action_fault=("disconnect", fault), result=result)
+        self.assertIs(raised.exception, fault)
+        self.assertFalse(result.native_return_reached)
+
+    def test_host_disconnect_fault_propagates_same_object_without_receipt(self):
+        fault = RuntimeError("disconnect fault")
+        result = SuzukiUSBResult()
+        with self.assertRaises(RuntimeError) as raised:
+            self._invoke(action_fault=("disconnect", fault), result=result)
+        self.assertIs(raised.exception, fault)
+        self.assertFalse(result.native_return_reached)

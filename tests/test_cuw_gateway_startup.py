@@ -1173,8 +1173,13 @@ class GatewayStartupTests(unittest.TestCase):
         from scripts.programming_2026_common import bind_native_parameter2026
         from scripts.programming_replay import load_programming_replay
 
-        raw, container, original_selection, general = self.writer_inputs(module)
-        rows = json.loads(Path("analysis/evidence/no-car-134", recording).read_bytes())
+        raw, _, original_selection, general = self.writer_inputs(module)
+        rows = json.loads(
+            Path(
+                "analysis/evidence/no-car-134",
+                recording.replace(".json", "-caller-order.json"),
+            ).read_bytes()
+        )
         document = {
             "schema": "techstream-programming-replay-v1",
             "source": "recorded_unverified",
@@ -1222,6 +1227,7 @@ class GatewayStartupTests(unittest.TestCase):
         engine.load_cuw(raw)
         self.addCleanup(engine.close)
         self.addCleanup(runtime.close)
+        session.bind_runtime2026(runtime)
         controller = fixtures.make_controller(runtime)
         session.bind_controller2026(controller)
         session.bind_engine2026(engine)
@@ -1230,11 +1236,22 @@ class GatewayStartupTests(unittest.TestCase):
         assert pair is not None
         for view in (pair.engine, pair.control):
             view.set_driver(DriverMetadata2026("authored", "fixture.dll"))
+        with engine.controller_execution(controller, 0):
+            from scripts.programming_2026_common import (
+                _control_has_ordinary_getter_return2026,
+            )
+
+            held = controller.native_control_context2026(engine)
+            received = controller.execute(engine, session)
+            self.assertTrue(_control_has_ordinary_getter_return2026(held))
+            worker.import_control_getter_return2026(held)
+            self.assertEqual(received["identifiers"], (b"OLD_A", b"OLD_B"))
+            self.assertEqual(engine.received_identifiers, (b"OLD_A", b"OLD_B"))
+            self.assertTrue(worker.mark_cid_reception_complete())
+        self.assertFalse(pair.engine.opened)
+        self.assertFalse(pair.engine.connecting)
         pair.engine.open()
         pair.engine.connect(6)
-        with engine.controller_execution(controller, 0):
-            received = controller.receive_cids(engine, session)
-            self.assertEqual(received["identifiers"], (b"OLD_A", b"OLD_B"))
         engine.select_target(1, 1, controller=controller)
         with tempfile.TemporaryDirectory() as directory:
             persistence = CUWPersistence(
@@ -1244,7 +1261,20 @@ class GatewayStartupTests(unittest.TestCase):
                 ),
             )
             engine.bind_persistence(persistence)
+            prepare_document = dict(document)
+            prepare_document["operation"] = "prepare"
+            prepare_document["observations"] = dict(document["observations"])
+            prepare_document["observations"]["host"] = {"cpu_index": 1}
+            prepare_root = load_programming_replay(
+                raw,
+                json.dumps(prepare_document).encode(),
+                dict(original_selection.catalog_sources),
+                modules,
+            )
+            prepare_root.trace = trace
+            prepare_root.bind_runtime2026(runtime)
             with engine.controller_execution(controller, 1):
+                controller.bind_startup_session(engine, prepare_root)
                 startup = worker.run_gateway_startup()
                 assert startup is not None
                 self.assertTrue(startup.returned)
@@ -1252,14 +1282,14 @@ class GatewayStartupTests(unittest.TestCase):
                 self.assertEqual(startup.classification, 2)
             self.assertTrue(engine.native_initial_command_retry980)
             selection = bind_native_parameter2026(
-                container,
+                engine.native_metadata.source_container,
                 dict(original_selection.catalog_sources),
                 "write",
                 cpu_index=1,
                 metadata_state=engine.native_metadata,
             )
             context = bind_native_context(
-                container,
+                engine.native_metadata.source_container,
                 1,
                 (),
                 selection,

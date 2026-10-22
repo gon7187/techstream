@@ -75,6 +75,16 @@ def selected_profile(bus=0x12, *, version=18, flags=1, init_flags=3):
     )
 
 
+def stmin_profile(value=255, *, enabled=1, bus=0x12, version=18):
+    profile = selected_profile(bus, version=version)
+    table = profile.catalog.management.sections[14]
+    row = bytearray(table.payload)
+    struct.pack_into("<H", row, 18 if version == 12 else 20, value)
+    row[24 if version == 12 else 26] = enabled
+    profile.catalog.management.sections[14] = replace(table, payload=bytes(row))
+    return profile
+
+
 DRIVER = DriverProperties(0, b"04.04", "authored-version-reply")
 
 
@@ -919,14 +929,181 @@ class NativeFrameRuntimeTests(unittest.TestCase):
             backend = ConfigRead()
             ops = native_operations(backend, version=version, profile=profile)
             ops.adopt_channel(9)
+            self.assertEqual(ops.setup(), 0)
             ops.apply_temporary_config()
             ops.apply_temporary_config()
             ops.restore_temporary_config()
             ops.restore_temporary_config()
-            self.assertEqual([f["ioctl_id"] for n, f, _ in backend.calls], [1, 2, 2])
             self.assertEqual(
-                [f["input"][0].value for n, f, _ in backend.calls], [0, 255, 0x2345]
+                [f["ioctl_id"] for n, f, _ in backend.calls if n == "ioctl"],
+                [2, 10, 1, 2, 2],
             )
+            self.assertEqual(
+                [
+                    f["input"][0].value
+                    for n, f, _ in backend.calls
+                    if n == "ioctl"
+                    and isinstance(f["input"], tuple)
+                    and f["input"][0].parameter == 0x23
+                ],
+                [0, 255, 0x2345],
+            )
+
+    def test_native_stmin_cold_noop_and_metadata_survives_setup_failure(self):
+        from scripts.frame_transport import J2534Result
+
+        class TypedConfigDriver(DriverPrimitive):
+            def invoke(self, operation, fields, **options):
+                if operation == "ioctl" and fields["ioctl_id"] == 1:
+                    self.calls.append((operation, fields, options["deadline"]))
+                    return J2534Result(configs=(NativeConfig(0x23, 9),))
+                return super().invoke(operation, fields, **options)
+
+        profile = selected_profile()
+        table = profile.catalog.management.sections[14]
+        row = bytearray(table.payload)
+        struct.pack_into("<H", row, 20, 255)
+        row[26] = 1
+        profile.catalog.management.sections[14] = replace(table, payload=bytes(row))
+        backend = TypedConfigDriver()
+        ops = native_operations(backend, profile=profile)
+        ops.apply_temporary_config()
+        self.assertEqual(backend.calls, [])
+        self.assertEqual((ops._stmin_enabled, ops._stmin_value), (0, 0))
+
+        ops.adopt_channel(9)
+        backend.config_failures[:] = [7, 8]
+        self.assertEqual(ops.setup(), 0x91010008)
+        self.assertEqual((ops._stmin_enabled, ops._stmin_value), (1, 255))
+        ops.apply_temporary_config()
+        self.assertEqual(
+            [fields["ioctl_id"] for op, fields, _ in backend.calls], [2, 2, 1, 2]
+        )
+
+    def test_native_stmin_closed_initialized_handle_zero_restores_saved_word(self):
+        from scripts.frame_transport import J2534Result
+
+        class TypedConfigDriver(DriverPrimitive):
+            def invoke(self, operation, fields, **options):
+                if operation == "ioctl" and fields["ioctl_id"] == 1:
+                    self.calls.append((operation, fields, options["deadline"]))
+                    self.assert_typed(fields)
+                    return J2534Result(configs=(NativeConfig(0x23, 0x12345),))
+                return super().invoke(operation, fields, **options)
+
+            @staticmethod
+            def assert_typed(fields):
+                assert fields["channel_id"] == 0
+                assert fields["input"] == (NativeConfig(0x23, 0),)
+
+        backend = TypedConfigDriver()
+        ops = native_operations(backend, profile=stmin_profile())
+        self.assertEqual(ops.open(), 0)
+        self.assertEqual(ops.channel, 7)
+        self.assertEqual((ops._stmin_enabled, ops._stmin_value), (1, 255))
+        self.assertEqual(ops.close(), 0)
+        self.assertIsNone(ops.channel)
+        ops.apply_temporary_config()
+        self.assertEqual(ops._temporary_config, 0x2345)
+        ops.restore_temporary_config()
+        self.assertIsNone(ops._temporary_config)
+        stmin = [
+            (fields["ioctl_id"], fields["channel_id"], fields["input"])
+            for op, fields, _ in backend.calls
+            if op == "ioctl"
+            and fields["ioctl_id"] in (1, 2)
+            and fields["channel_id"] == 0
+        ]
+        self.assertEqual(
+            stmin,
+            [
+                (1, 0, (NativeConfig(0x23, 0),)),
+                (2, 0, (NativeConfig(0x23, 255),)),
+                (2, 0, (NativeConfig(0x23, 0x2345),)),
+            ],
+        )
+        calls = len(backend.calls)
+        ops.reset_released_runtime()
+        self.assertEqual((ops._stmin_enabled, ops._stmin_value), (0, 0))
+        ops.apply_temporary_config()
+        self.assertEqual(len(backend.calls), calls)
+
+    def test_native_stmin_negative_get_and_set_status_semantics(self):
+        from scripts.frame_transport import J2534Result
+
+        class StatusConfigDriver(DriverPrimitive):
+            def __init__(self, *, get_status=0, set_status=0):
+                super().__init__()
+                self.get_status, self.set_status = get_status, set_status
+
+            def invoke(self, operation, fields, **options):
+                result = super().invoke(operation, fields, **options)
+                if operation == "ioctl" and fields["ioctl_id"] == 1:
+                    return J2534Result(
+                        code=self.get_status,
+                        configs=() if self.get_status else (NativeConfig(0x23, 9),),
+                    )
+                if operation == "ioctl" and fields["ioctl_id"] == 2:
+                    return J2534Result(code=self.set_status)
+                return result
+
+        negative = StatusConfigDriver(get_status=7)
+        ops = native_operations(negative, profile=stmin_profile())
+        ops.adopt_channel(9)
+        self.assertEqual(ops.setup(), 0)
+        ops.apply_temporary_config()
+        self.assertIsNone(ops._temporary_config)
+        self.assertEqual(
+            [f["ioctl_id"] for op, f, _ in negative.calls if op == "ioctl"],
+            [2, 10, 1],
+        )
+
+        ignored = StatusConfigDriver(set_status=7)
+        ops = native_operations(ignored, profile=stmin_profile())
+        ops.adopt_channel(9)
+        ignored.set_status = 0
+        self.assertEqual(ops.setup(), 0)
+        ignored.set_status = 7
+        ops.apply_temporary_config()
+        self.assertEqual(ops._temporary_config, 9)
+        ops.restore_temporary_config()
+        self.assertIsNone(ops._temporary_config)
+
+    def test_native_stmin_host_faults_propagate_and_do_not_clear_saved_state(self):
+        from scripts.frame_transport import J2534Result
+
+        class FaultConfigDriver(DriverPrimitive):
+            def __init__(self):
+                super().__init__()
+                self.fault_id = 0
+
+            def invoke(self, operation, fields, **options):
+                if operation == "ioctl" and fields["ioctl_id"] == self.fault_id:
+                    self.calls.append((operation, fields, options["deadline"]))
+                    raise OSError("typed SDK host fault")
+                if operation == "ioctl" and fields["ioctl_id"] == 1:
+                    return J2534Result(configs=(NativeConfig(0x23, 9),))
+                return super().invoke(operation, fields, **options)
+
+        backend = FaultConfigDriver()
+        ops = native_operations(backend, profile=stmin_profile())
+        ops.adopt_channel(9)
+        self.assertEqual(ops.setup(), 0)
+        backend.fault_id = 1
+        with self.assertRaisesRegex(OSError, "typed SDK host fault"):
+            ops.apply_temporary_config()
+        self.assertTrue(ops.poisoned)
+        self.assertIsNone(ops._temporary_config)
+
+        backend = FaultConfigDriver()
+        ops = native_operations(backend, profile=stmin_profile())
+        ops.adopt_channel(9)
+        self.assertEqual(ops.setup(), 0)
+        backend.fault_id = 2
+        with self.assertRaisesRegex(OSError, "typed SDK host fault"):
+            ops.apply_temporary_config()
+        self.assertTrue(ops.poisoned)
+        self.assertIsNone(ops._temporary_config)
 
     def test_j1850_protocol_two_config_and_psa62_native_setup(self):
         profile = selected_profile(0x17)

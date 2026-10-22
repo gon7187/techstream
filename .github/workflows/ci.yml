@@ -47,6 +47,75 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 libusb-1.0-0 gir1.2-gdkpixbuf-2.0 librsvg2-common xvfb dbus-x11
+      - name: Create synthetic native vehicle replay inputs
+        env:
+          PYTHONPATH: tests:.
+        run: |
+          python3 - <<'PY'
+          import copy
+          import json
+          import os
+          from pathlib import Path
+
+          from scripts.drive_recorder import NativeTriggerInfo, NativeTriggerParameters
+          from scripts.monitor_replay import MonitorReplay
+          from tests.test_monitor_replay import (
+              AuthoredCapture,
+              NativeVehicleReplayTests,
+              write_native_vehicle_smoke_fixture,
+          )
+
+          directory = Path(os.environ["RUNNER_TEMP"]) / "native-vehicle"
+          recording, sources = write_native_vehicle_smoke_fixture(
+              directory,
+              trigger=NativeTriggerInfo((1, 0), 1, 1, 0),
+              parameters=NativeTriggerParameters((1, 0), 1, 0, (1, 0), (), (1, 0), ()),
+          )
+          close_case = NativeVehicleReplayTests()
+          try:
+              close_directory = Path(os.environ["RUNNER_TEMP"]) / "native-vehicle-close-retry"
+              close_sources, close_template = close_case.native_vehicle_document(close_directory)
+              cancel_recordings = {}
+              for stage in ("load", "selection"):
+                  document = copy.deepcopy(close_template)
+                  capture = AuthoredCapture(document)
+                  replay = MonitorReplay(capture, close_sources)
+                  replay.begin_native_vehicle(info_ids=(4,), text_encoding="cp1252")
+                  if stage == "load":
+                      replay.native_categories((), bus_judge=0)
+                  else:
+                      close_case.selection_path(replay, choose_categories=True)
+                  replay.close_native_vehicle()
+                  document["events"] = capture.captured
+                  cancel_recordings[stage] = close_directory / f"{stage}-cancel.json"
+                  cancel_recordings[stage].write_text(json.dumps(document), encoding="utf-8")
+                  if stage == "selection":
+                      close_case.append_disconnect_retry(document)
+                      close_recording = close_directory / "close-retry.json"
+                      close_recording.write_text(json.dumps(document), encoding="utf-8")
+          finally:
+              close_case.doCleanups()
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
+              output.writelines(
+                  f"TECHSTREAM_NATIVE_VEHICLE_SMOKE_{name}={value}\n"
+                  for name, value in (
+                      ("RECORDING", recording),
+                      ("DRS", directory / "expected-recording.drs"),
+                      ("SOURCE_ROOT", sources),
+                  )
+              )
+              output.writelines(
+                  f"TECHSTREAM_NATIVE_VEHICLE_CLOSE_RETRY_SMOKE_{name}={value}\n"
+                  for name, value in (
+                      ("RECORDING", close_recording),
+                      ("SOURCE_ROOT", close_sources),
+                  )
+              )
+              output.writelines(
+                  f"TECHSTREAM_NATIVE_VEHICLE_{stage.upper()}_CANCEL_SMOKE_RECORDING={path}\n"
+                  for stage, path in cancel_recordings.items()
+              )
+          PY
       - name: Render and exercise the synthetic demo
         run: sh scripts/desktop-smoke.sh normal
       - name: Render and exercise the synthetic demo in the compact layout

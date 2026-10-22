@@ -35,6 +35,15 @@ by its caller. Clocks, absolute deadlines, step count, queued observations and
 serialized packet bytes have explicit limits. The recorder byte budget includes
 the four-byte timestamp of every packet.
 
+Normal P4 BASE/Packet workers may receive the exact retained
+`NativeCommunication`. This admitted path reuses its outer controller and
+lower transport, does not open during worker start, and calls the existing
+temporary CAN config hook with the lower's native initialized state. A cold
+retained lower opens through its first real controller send. Worker exit
+restores the temporary configuration and scoped callbacks while leaving channel
+release to the parent communication owner. The ordinary fresh-worker path is
+unchanged; other retained worker families remain unsupported.
+
 The native controller class and communication event are distinct.
 `native_worker_class="base"` retains BASE scheduling, host timestamps, error
 dispatch and shutdown even with an A1/A2 packet event: variable monitor8610

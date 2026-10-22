@@ -188,6 +188,1257 @@ class MetadataRuntimeStateBindingTests(unittest.TestCase):
                 loaded.rebind_writer_metadata(forged)
 
 
+class NativeControlContextTests(unittest.TestCase):
+    @staticmethod
+    def engine_and_controller():
+        import struct
+        from pathlib import Path
+
+        from scripts.cuw_2026 import CUWEngine2026, identity_2026
+        from scripts.programming_2026_common import ControlCommPhase2026
+        from tests.test_calibration_2026 import cpu_text, cuw
+
+        folder = Path("runtime/no-car-21/recovered")
+        if not (folder / "CUW.dll").is_file():
+            raise unittest.SkipTest("Authenticated static CUW2026 image is absent")
+        identity = identity_2026(
+            (folder / "TCUWControlCommPhase.dll").read_bytes(),
+            "TCUWControlCommPhase.dll",
+        )
+        controller = ControlCommPhase2026(
+            identity, NativeRuntime2026(lambda _event, _remaining: None)
+        )
+        engine = CUWEngine2026((folder / "CUW.dll").read_bytes())
+        engine.configure(struct.pack("<IIddII", 2, 0, 0, 0, 0, 0))
+        engine.load_cuw(cuw(cpu_text()))
+        return engine, controller
+
+    def test_real_import_issues_held_context_and_phase_expiry_revokes_it(self):
+        from scripts.programming_2026_common import NativeControlContext2026
+
+        engine, controller = self.engine_and_controller()
+        self.addCleanup(engine.close)
+        with engine.controller_execution(controller, 0) as worker:
+            context = controller.native_control_context2026(engine)
+            capture = worker._control_file_capture
+            if capture is None:
+                self.fail("The actual 59ab0 import did not issue a FILE capture")
+            self.assertIs(type(context), NativeControlContext2026)
+            self.assertEqual(
+                context.metadata, context.metadata_for_cpu(context.cpu_index)
+            )
+            self.assertEqual(context.target_indices, capture.target_indices)
+            self.assertEqual(context.cpu_index, capture.control_cpu_start)
+            self.assertEqual(
+                context.native_index_for_source_cpu(0),
+                capture.native_order.index(0),
+            )
+            with self.assertRaises(AttributeError):
+                context._cpu_index = 1
+        with self.assertRaises(ValueError):
+            context.validate(engine, controller)
+        with self.assertRaises(ValueError):
+            controller.native_control_context2026(engine)
+
+    def test_context_is_unforgeable_foreign_and_thread_bound(self):
+        import copy
+
+        from scripts.programming_2026_common import NativeControlContext2026
+
+        engine, controller = self.engine_and_controller()
+        self.addCleanup(engine.close)
+        foreign = type(controller)(
+            controller.identity, NativeRuntime2026(lambda *_: None)
+        )
+        with engine.controller_execution(controller, 0):
+            context = controller.native_control_context2026(engine)
+            with self.assertRaises(TypeError):
+                NativeControlContext2026()
+            with self.assertRaises(TypeError):
+                copy.copy(context)
+            with self.assertRaises(ValueError):
+                context.validate(engine, foreign)
+            with self.assertRaises(ValueError):
+                foreign.native_control_context2026(engine)
+            errors = []
+
+            def validate_from_foreign_thread():
+                try:
+                    context.validate(engine, controller)
+                except ValueError as error:
+                    errors.append(error)
+
+            thread = threading.Thread(target=validate_from_foreign_thread)
+            thread.start()
+            thread.join()
+            self.assertEqual(len(errors), 1)
+            self.assertIs(type(errors[0]), ValueError)
+
+    def test_pooled_binding_uses_loaded_row_and_export_target_rejects_slot_reload(self):
+        from dataclasses import replace
+
+        from scripts.cuw_parameter_pool import ControlParameterPool2026
+        from scripts.programming_2026_common import NativeControlExportTarget2026
+
+        engine, controller = self.engine_and_controller()
+        self.addCleanup(engine.close)
+        pool = None
+        with engine.controller_execution(controller, 0):
+            pool = ControlParameterPool2026.issue(
+                engine,
+                controller,
+                {
+                    "149P5-Unified.ini": (
+                        b"ParamFileKeySystemProtocolMicon,DLLFileNameForGetCID\r\n"
+                        b"149P5-Unified,Authored.dll\r\n"
+                    )
+                },
+                encoded=False,
+            )
+            self.addCleanup(pool.close)
+            self.assertEqual(pool.load_for(engine, controller, "get_cid"), (0,))
+            binding = pool.selected_binding(engine, controller, 0, "get_cid")
+            self.assertEqual(binding.key, "149P5-Unified")
+            self.assertEqual(binding.value("DLLFileNameForGetCID"), "Authored.dll")
+            self.assertEqual(binding.parameter.row_index, 1)
+            self.assertIs(
+                binding.validate_against(
+                    binding.metadata.source_container, operation="get_cid"
+                ),
+                binding,
+            )
+            with self.assertRaises(ValueError):
+                replace(binding).validate_against(
+                    binding.metadata.source_container, operation="get_cid"
+                )
+            target = NativeControlExportTarget2026.issue(
+                engine, controller, pool, 0, "get_cid"
+            )
+            self.assertIs(target.binding.source_name, binding.source_name)
+            self.assertEqual(
+                target.target_index,
+                controller.native_control_context2026(engine).target_index,
+            )
+            pool.load_for(engine, controller, "get_cid")
+            with self.assertRaises(ValueError):
+                target.validate(engine, controller)
+
+
+def make_raw_control_fixture2026(
+    case, *, source, catalog, module_files, operation="prepare", events=(), paired=False
+):
+    """Authored FILE/recorded primitives with authenticated original module bytes."""
+    import hashlib
+    import json
+    import struct
+    from pathlib import Path
+
+    from scripts.cuw_2026 import CUWEngine2026, identity_2026
+    from scripts.programming_2026_common import ControlCommPhase2026
+    from scripts.programming_replay import load_programming_replay
+    from tests.private_evidence import read_private_bytes, require_private
+
+    images = Path("runtime/no-car-21/recovered")
+    require_private(images)
+    context = {
+        "schema": "techstream-programming-replay-v1",
+        "source": "recorded_unverified",
+        "calibration_sha256": hashlib.sha256(source).hexdigest(),
+        "operation": operation,
+        "node": 1,
+        "observations": {
+            "current_cids": [],
+            "tester_info_hex": bytes(32).hex(),
+            "system_time": [2026, 10, 22, 22, 1, 2, 3, 4],
+            "timeout_seconds": 30,
+            "cid_mode": 2,
+            "host": {},
+        },
+        "events": list(events),
+    }
+    if paired:
+        context["observations"]["host"]["driver_recording"] = "j2534_2026"
+        module_files = {
+            **module_files,
+            "TCUWJ2534DeviceIF.dll": read_private_bytes(
+                images / "TCUWJ2534DeviceIF.dll"
+            ),
+        }
+    session = load_programming_replay(
+        source, json.dumps(context).encode(), catalog, module_files
+    )
+    case.addCleanup(session.trace.close)
+    runtime = NativeRuntime2026(
+        session.trace.action,
+        clock=session.trace.clock,
+        cancelled=session.trace.cancelled,
+        local_seconds_of_day=session.trace.native_local_seconds_of_day,
+        local_milliseconds_of_day=session.trace.native_local_milliseconds_of_day,
+    )
+    from scripts.programming_2026_common import NativeGeneralParameters2026
+
+    general = (
+        NativeGeneralParameters2026.from_sources(catalog)
+        if "Parameter.ini" in catalog
+        else None
+    )
+    engine = CUWEngine2026(
+        read_private_bytes(images / "CUW.dll"), general_parameters=general
+    )
+    engine.configure(struct.pack("<IIddII", 16, 0, 1, 2, 0, 0))
+    engine.load_cuw(source)
+    controller = ControlCommPhase2026(
+        identity_2026(
+            read_private_bytes(images / "TCUWControlCommPhase.dll"),
+            "TCUWControlCommPhase.dll",
+        ),
+        runtime,
+    )
+    if paired:
+        session.bind_runtime2026(runtime)
+        from scripts.j2534_2026 import DriverMetadata2026
+
+        pair = session.trace.interface_pair
+        assert pair is not None
+        for view in (pair.engine, pair.control):
+            view.set_current_driver(DriverMetadata2026("Authored", "authored.dll"))
+        engine.bind_interface_pair(pair)
+    case.addCleanup(engine.close)
+    case.addCleanup(lambda: controller._close_control_pool2026(engine))
+    return engine, controller, session
+
+
+class RawControlStageMachineTests(unittest.TestCase):
+    """Actual held pool/lease/replay joins; family algorithms have separate oracles."""
+
+    @staticmethod
+    def event(operation, value=0, **values):
+        return {
+            "kind": "action",
+            "request": {"operation": operation, **values},
+            "result": {"type": "int", "value": value},
+            "elapsed_ms": max(1, values.get("milliseconds", 1)),
+        }
+
+    def fixture(
+        self,
+        *,
+        operation="prepare",
+        contact="SIL",
+        selector="",
+        versions="0\n0\n0\n0",
+        events=(),
+        gateway="",
+        alternate="",
+        cpus=1,
+        paired=False,
+        dependencies=(),
+        writer="TCUWSilFlashWriter.dll",
+        preparer="TCUWSilPrepareWriter.dll",
+        parameter_values=None,
+    ):
+        from pathlib import Path
+
+        from tests.private_evidence import read_private_bytes
+        from tests.test_calibration_2026 import cuw
+        from tests.test_cuw_engine_worker import encoded_table
+
+        modern = contact in ("P5-Unified", "Phase6", "Ethernet")
+        keys = (
+            ("1" + contact,)
+            if modern
+            else tuple("1" + contact + str(i + 1) for i in range(cpus))
+        )
+        names = (preparer, writer, "TCUWSilCIDGetter.dll")
+        parameter_values = parameter_values or {}
+        headers = (
+            "ParamFileKeySystemProtocolMicon",
+            "DLLFileNameForPrepareWrite",
+            "DLLFileNameForFlashWrite",
+            "DLLFileNameForGetCID",
+            "DLLFileNameForChangeToReprogGatewayMode",
+            "EnableDLLVersionInformation",
+            "GetCANIDFunctionNameForFlashWrite",
+            "AlternateDLLFileNamesForGetCID",
+            "EnableAlternateDLLVersionsInformationForGetCID",
+            *parameter_values,
+        )
+        catalog = {
+            key + ".ini": encoded_table(
+                headers,
+                (
+                    (
+                        key,
+                        *names,
+                        gateway,
+                        versions,
+                        selector,
+                        alternate,
+                        "0",
+                        *parameter_values.values(),
+                    ),
+                ),
+            )
+            for key in keys
+        }
+        catalog["Parameter.ini"] = encoded_table(
+            (
+                "ParamFileKeySystemProtocolMicon",
+                "M16CTypeFlag",
+                "FlagToChangeToReprogGWModeForCentralGW",
+                "FORESTTypeFlag",
+                "PasswordAddress",
+                "ByteOrder",
+                "FlagToDoIGOFFONAtCPUTypeChange",
+            ),
+            tuple((key, "0", "0", "0", "00", "1", "0") for key in keys),
+        )
+        if modern:
+            text = (
+                "[Format]\nVersion=105\n[Vehicle]\nKindOfECU=1\nContactType="
+                + contact
+                + f"\nNumberOfNode=1\n[Node01]\nRequiredSpecReproVer=02\nNumberOfCalibration={cpus}\n"
+            )
+        else:
+            text = (
+                f"[Format]\nVersion={8 if cpus > 1 else 6}\n[Vehicle]\nKindOfECU=1\nContactType="
+                + contact
+                + f"\nNumberOfCalibration={cpus}\n"
+            )
+        for i in range(cpus):
+            text += f"[CPU{(11 if modern else 1) + i:02}]\nCPUType={i + 1}\nCPUImageName=image{i}.vbf\n"
+        source = cuw(text, tuple(f"DATA{i}".encode() for i in range(cpus)))
+        images = Path("runtime/no-car-21/recovered")
+        return make_raw_control_fixture2026(
+            self,
+            source=source,
+            catalog=catalog,
+            module_files={
+                name: read_private_bytes(images / name)
+                for name in {*names, gateway, alternate, *dependencies}
+                if name
+            },
+            operation=operation,
+            paired=paired,
+            events=(
+                self.event("get_local_milliseconds_of_day", 1000),
+                *events,
+                self.event("get_local_milliseconds_of_day", 2000),
+            ),
+        )
+
+    def test_classic_prepare_gateway_empty_write_share_one_execute_and_cursor(self):
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        events = (
+            self.event("wait", milliseconds=11),
+            self.event("set_communication_log_mode", mode=2),
+            self.event("wait", milliseconds=22),
+            self.event("set_communication_log_mode", mode=0),
+        )
+        engine, control, session = self.fixture(events=events)
+        exports, runtimes, positions = ([], [], [])
+
+        def runner(stage, *_args):
+
+            def run():
+                target = stage._control_target2026
+                target.validate(engine, control)
+                exports.append(stage._control_export2026)
+                runtimes.append(stage._runtime2026)
+                positions.append(stage.trace.position)
+                stage._runtime2026.call(
+                    "wait", milliseconds=11 if stage.operation == "prepare" else 22
+                )
+                return {"native_return": True}
+
+            return run
+
+        with (
+            patch.object(ProgrammingReplay, "_runner", runner),
+            engine.controller_execution(control, 1),
+        ):
+            context = control.native_control_context2026(engine)
+            result = control.execute(engine, session)
+            self.assertTrue(result["native_return"])
+            self.assertEqual(context.cpu_index, 1)
+            self.assertEqual(engine.comm_phase, 2)
+            self.assertEqual(len(result["exports"]), 2)
+            self.assertIsNone(control._native_control_helper_entry2026)
+        self.assertEqual(exports, ["StartPrepareWrite", "StartFlashWrite"])
+        self.assertEqual(runtimes, [control.runtime, control.runtime])
+        self.assertEqual(positions, [1, 3])
+        self.assertEqual(session.trace.position, len(session.trace.rows))
+        self.assertTrue(session.used)
+
+    def test_primary_getter_vector_does_not_determine_raw_out_byte(self):
+        from unittest.mock import patch
+
+        from scripts.programming_2026_common import (
+            _control_getter_return_al2026,
+            _control_getter_return_values2026,
+        )
+        from scripts.programming_replay import ProgrammingReplay
+
+        for out in (False, True):
+            with self.subTest(out=out):
+                engine, control, session = self.fixture(operation="get_cid")
+                with (
+                    patch.object(
+                        ProgrammingReplay,
+                        "_runner",
+                        return_value=lambda out=out: {
+                            "native_success": out,
+                            "native_return": None,
+                            "identifiers": (b"CID",),
+                        },
+                    ),
+                    engine.controller_execution(control, 0),
+                ):
+                    result = control.execute(engine, session)
+                    context = control.native_control_context2026(engine)
+                    self.assertIs(result["native_return"], out)
+                    self.assertIs(_control_getter_return_al2026(context), out)
+                    self.assertEqual(
+                        _control_getter_return_values2026(context), (b"CID",)
+                    )
+                    self.assertEqual(engine.received_identifiers, ())
+
+    def test_post_prepare_cpass_retains_saved_true_and_native_outputs(self):
+        from unittest.mock import patch
+
+        from scripts.programming_2026_common import NativePassThruException2026
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture()
+        error = NativePassThruException2026(77, "source-test", 1)
+        with (
+            patch.object(
+                ProgrammingReplay,
+                "_runner",
+                return_value=lambda: {"native_return": True},
+            ),
+            engine.controller_execution(control, 1),
+        ):
+            engine.dh_state.record_native_error(6, 12, 34)
+            with patch.object(
+                engine.worker, "finish_classic_prepare", side_effect=error
+            ):
+                result = control.execute(engine, session)
+            self.assertTrue(result["native_return"])
+            self.assertTrue(engine.worker.control_state.fatal)
+            self.assertTrue(engine.worker.control_state.native_fatal_input)
+            self.assertEqual(engine.dh_state.primary_error, 77)
+            self.assertEqual(engine.dh_state.error_kind, 6)
+            self.assertEqual(engine.dh_state.passthru_error, 34)
+            self.assertFalse(engine.worker.control_state.failed)
+            self.assertEqual(len(result["exports"]), 1)
+
+    def test_host_fault_propagates_without_ordinary_return_or_second_stage(self):
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture()
+        error = RuntimeError("host primitive fault")
+        with (
+            patch.object(
+                ProgrammingReplay,
+                "_runner",
+                return_value=lambda: (_ for _ in ()).throw(error),
+            ),
+            self.assertRaises(RuntimeError) as caught,
+            engine.controller_execution(control, 1),
+            patch(
+                "scripts.programming_2026_common._record_control_return2026"
+            ) as ordinary,
+        ):
+            try:
+                control.execute(engine, session)
+            finally:
+                ordinary.assert_not_called()
+                self.assertIsNone(control._native_control_raw_execution2026)
+                self.assertIsNone(control._native_control_helper_entry2026)
+        self.assertIs(caught.exception, error)
+        self.assertFalse(session.used)
+
+    def test_modern_address_false_is_b9c_and_does_not_call_family(self):
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture(
+            operation="write",
+            contact="P5-Unified",
+            selector="GetCanIDsFromParamForGetCID",
+        )
+        with (
+            patch.object(ProgrammingReplay, "_runner") as runner,
+            engine.controller_execution(control, 2),
+        ):
+            result = control.execute(engine, session)
+            self.assertFalse(result["native_return"])
+            self.assertEqual(engine.dh_state.primary_error, 9999)
+            self.assertTrue(engine.worker.control_state.fatal)
+            runner.assert_not_called()
+
+    def test_classic_null_callback_does_not_gain_frontend_table_authority(self):
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture(
+            operation="write", selector="GetCanIDsFromCANIDTable"
+        )
+        with (
+            patch.object(ProgrammingReplay, "_runner") as runner,
+            engine.controller_execution(control, 2),
+        ):
+            result = control.execute(engine, session)
+            self.assertFalse(result["native_return"])
+            self.assertEqual(engine.dh_state.primary_error, 9999)
+            runner.assert_not_called()
+
+    def test_modern_two_cpu_rows_consume_distinct_archives_and_one_entry_module(self):
+        from unittest.mock import patch
+
+        from scripts.calibration_2026 import (
+            native2026_archive,
+            native2026_global_cpu_index,
+        )
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture(
+            operation="write", contact="P5-Unified", cpus=2
+        )
+        consumed, modules = [], []
+
+        def runner(stage, selection, *_args):
+            def run():
+                consumed.append(
+                    (
+                        native2026_global_cpu_index(selection.metadata),
+                        native2026_archive(selection.metadata).data,
+                    )
+                )
+                modules.append(stage._control_target2026.module_binding)
+                return {"native_return": True}
+
+            return run
+
+        with (
+            patch.object(ProgrammingReplay, "_runner", runner),
+            engine.controller_execution(control, 2),
+        ):
+            context = control.native_control_context2026(engine)
+            result = control.execute(engine, session)
+            self.assertTrue(result["native_return"])
+            self.assertEqual(context.cpu_index, 2)
+            self.assertEqual(consumed, [(0, b"DATA0"), (1, b"DATA1")])
+            self.assertIs(modules[0], modules[1])
+
+    def test_nonempty_gateway_out_flag_controls_same_execute_transition(self):
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        for flag, result_byte in ((False, False), (True, True)):
+            with self.subTest(flag=flag):
+                events = (
+                    self.event("set_communication_log_mode", mode=2),
+                    self.event("set_communication_log_mode", mode=0),
+                )
+                engine, control, session = self.fixture(
+                    gateway="TCUWP4CanBodyPrepareWriter.dll", events=events
+                )
+                exports = []
+
+                def runner(
+                    stage, *_args, flag=flag, result_byte=result_byte, exports=exports
+                ):
+                    def run():
+                        exports.append(stage._control_export2026)
+                        if stage.operation == "change_gateway":
+                            return {
+                                "native_return": result_byte,
+                                "gateway_mode_changed": flag,
+                            }
+                        return {"native_return": True}
+
+                    return run
+
+                with (
+                    patch.object(ProgrammingReplay, "_runner", runner),
+                    engine.controller_execution(control, 1),
+                ):
+                    result = control.execute(engine, session)
+                    self.assertTrue(result["native_return"])
+                    self.assertEqual(engine.comm_phase, 2)
+                    self.assertEqual(
+                        exports,
+                        [
+                            "StartPrepareWrite",
+                            "ChangeToReprogGatewayMode",
+                            "StartFlashWrite",
+                        ],
+                    )
+
+    def test_alternate_getter_reuses_loaded_slot_and_overwrites_actual_out_byte(self):
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture(
+            operation="get_cid", alternate="TCUWP5CanCIDGetter.dll"
+        )
+        slots = []
+
+        def runner(stage, *_args):
+            slots.append(stage._control_target2026.entry_slot)
+            if stage._control_target2026.binding.alternate_cid:
+                return lambda: {
+                    "native_return": None,
+                    "bool_out": False,
+                    "cids": (b"ALT",),
+                }
+            return lambda: {"native_return": None, "native_success": True, "cids": ()}
+
+        with (
+            patch.object(ProgrammingReplay, "_runner", runner),
+            engine.controller_execution(control, 0),
+        ):
+            result = control.execute(engine, session)
+            self.assertFalse(result["native_return"])
+            self.assertEqual(result["identifiers"], (b"ALT",))
+            self.assertTrue(control.alternate_cid_used)
+            self.assertIs(slots[0], slots[1])
+            self.assertTrue(engine.native_control_alternate_cache2026)
+
+    def test_ordinary_getter_exports_snapshot_and_only_outer_getter_imports(self):
+        from unittest.mock import patch
+
+        from scripts.programming_2026_common import (
+            _control_has_ordinary_getter_return2026,
+        )
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture(operation="get_cid", paired=True)
+        with (
+            patch.object(
+                ProgrammingReplay,
+                "_runner",
+                return_value=lambda: {
+                    "native_success": True,
+                    "identifiers": (b"second", b"first", b"second"),
+                },
+            ),
+            engine.controller_execution(control, 0),
+        ):
+            context = control.native_control_context2026(engine)
+            self.assertFalse(_control_has_ordinary_getter_return2026(context))
+            pair = engine.interface_pair
+            assert pair is not None
+            with patch.object(pair, "import_into", wraps=pair.import_into) as imports:
+                result = control.execute(engine, session)
+                self.assertTrue(_control_has_ordinary_getter_return2026(context))
+                self.assertIsNotNone(result["control_snapshot"])
+                self.assertEqual(
+                    [call.args[0] for call in imports.call_args_list], [pair.control]
+                )
+                self.assertEqual(engine.received_identifiers, ())
+                engine.worker.import_control_getter_return2026(context)
+                self.assertEqual(
+                    [call.args[0] for call in imports.call_args_list],
+                    [pair.control, pair.engine],
+                )
+                self.assertEqual(
+                    engine.received_identifiers, (b"second", b"first", b"second")
+                )
+                with self.assertRaises(ValueError):
+                    engine.worker.import_control_getter_return2026(context)
+
+    def test_actual_p5_getter_partial_vector_and_param7_share_raw_execute(self):
+        from pathlib import Path
+
+        from scripts.programming import NativeTransportError
+        from scripts.programming_2026_p5_getters import run_native_context
+        from scripts.programming_replay import _native_request
+        from tests.private_evidence import read_private_bytes
+        from tests.test_calibration_2026 import cuw
+        from tests.test_cuw_engine_worker import encoded_table
+        from tests.test_programming_2026_p5_getters import (
+            P5,
+            fixture,
+            p5,
+            primitive_runtime,
+        )
+
+        for code, expected in ((9, True), (16, False)):
+            with self.subTest(code=code):
+                native, container, binding = fixture(
+                    P5, "0100/0108\n0200/0208", allow="0200" if expected else ""
+                )
+                provider, _events = primitive_runtime(
+                    (p5(b"ONE"), NativeTransportError(code))
+                )
+                rows = []
+
+                def capture(event, remaining, provider=provider, rows=rows):
+                    try:
+                        value = provider.action(event, remaining)
+                    except NativeTransportError as error:
+                        result = {
+                            "type": "error",
+                            "value": {"domain": "native", "code": error.code},
+                        }
+                        rows.append(
+                            {
+                                "kind": "action",
+                                "request": _native_request(event),
+                                "result": result,
+                                "elapsed_ms": 1,
+                            }
+                        )
+                        raise
+                    kind = (
+                        "none"
+                        if value is None
+                        else "bytes"
+                        if type(value) is bytes
+                        else "bool"
+                        if type(value) is bool
+                        else "int"
+                    )
+                    result = {
+                        "type": kind,
+                        "value": value.hex() if type(value) is bytes else value,
+                    }
+                    rows.append(
+                        {
+                            "kind": "action",
+                            "request": _native_request(event),
+                            "result": result,
+                            "elapsed_ms": max(1, event.get("milliseconds", 1)),
+                        }
+                    )
+                    return value
+
+                direct = run_native_context(
+                    native, NativeRuntime2026(capture, native_cancelled=lambda: False)
+                )
+                self.assertIs(direct["bool_out"], expected)
+                self.assertEqual(direct["cids"], (b"ONE",))
+                values = {
+                    key: "\n".join(value)
+                    for key, value in binding.values.items()
+                    if key != "ParamFileKeySystemProtocolMicon"
+                }
+                values["EnableDLLVersionInformation"] = "0\n0\n0\n0"
+                catalog = {
+                    "8P5" + cpu + ".ini": encoded_table(
+                        ("ParamFileKeySystemProtocolMicon", *values),
+                        (("8P5" + cpu, *values.values()),),
+                    )
+                    for cpu in ("A", "B")
+                }
+                catalog["Parameter.ini"] = encoded_table(
+                    (
+                        "ParamFileKeySystemProtocolMicon",
+                        "M16CTypeFlag",
+                        "FlagToChangeToReprogGWModeForCentralGW",
+                        "FORESTTypeFlag",
+                        "PasswordAddress",
+                        "ByteOrder",
+                    ),
+                    tuple(
+                        ("8P5" + cpu, "0", "0", "0", "00", "1") for cpu in ("A", "B")
+                    ),
+                )
+                source = cuw(
+                    container.attached.data.decode("ascii"),
+                    tuple(record.data for record in container.records),
+                )
+                engine, control, session = make_raw_control_fixture2026(
+                    self,
+                    source=source,
+                    catalog=catalog,
+                    module_files={
+                        P5: read_private_bytes(Path("runtime/no-car-21/recovered") / P5)
+                    },
+                    operation="get_cid",
+                    events=(
+                        self.event("get_local_milliseconds_of_day", 1000),
+                        *rows,
+                        self.event("get_local_milliseconds_of_day", 2000),
+                    ),
+                )
+                with engine.controller_execution(control, 0):
+                    result = control.execute(engine, session)
+                    self.assertIs(result["native_return"], expected)
+                    self.assertEqual(result["identifiers"], (b"ONE",))
+                    self.assertEqual(result["exports"][0]["query_ids"], (b"\x01\0",))
+                self.assertEqual(session.trace.position, len(session.trace.rows))
+
+    def test_accepted_prepare_retry_clears_only_primary_status_and_preserves_failed(
+        self,
+    ):
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture(
+            operation="write",
+            writer="TCUWCanSBRFlashWriter.dll",
+            parameter_values={"IGOffRetriableFlag": "1", "PrepareRetryFlag": "1"},
+            events=(
+                self.event("set_communication_log_mode", mode=2),
+                self.event("set_communication_log_mode", mode=1),
+            ),
+        )
+        observed = []
+
+        def runner(stage, *_args):
+            def run():
+                if stage.operation == "write":
+                    engine.dh_state.record_native_error(6, 77, 88)
+                    engine.worker._failed = True
+                    engine._write_complete_output = True
+                    return {"native_return": False}
+                observed.append(
+                    (stage._control_export2026, engine.worker.control_state.failed)
+                )
+                return {"native_return": True}
+
+            return run
+
+        with (
+            patch.object(ProgrammingReplay, "_runner", runner),
+            engine.controller_execution(control, 2),
+            patch.object(control, "query_control_error"),
+        ):
+            result = control.execute(engine, session)
+            state = engine.worker.control_state
+            self.assertFalse(result["native_return"])
+            self.assertEqual(observed, [("PrepareRetry", True)])
+            self.assertEqual(
+                (state.error_kind, state.primary_error, state.passthru_error), (6, 0, 0)
+            )
+            self.assertTrue(state.failed)
+            self.assertTrue(state.native_context_964)
+            self.assertFalse(state.fatal)
+
+    def test_confirmation_tail_clears_failed_but_preserves_original_export_bool(self):
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        events = (
+            self.event("set_communication_log_mode", mode=2),
+            self.event("set_communication_log_mode", mode=1),
+            self.event("wait", milliseconds=5000),
+        )
+        engine, control, session = self.fixture(
+            operation="write",
+            writer="TCUWP4CanAirbagFlashWriter.dll",
+            parameter_values={
+                "IGOffRetriableFlag": "1",
+                "ConfirmAfterEndOfFlashingFlag": "1",
+            },
+            events=events,
+        )
+
+        def runner(stage, *_args):
+            def run():
+                if stage.operation == "write":
+                    engine.dh_state.record_native_error(6, 77, 88)
+                    engine.dh_state.set_flashing_ended(True)
+                    engine.worker._failed = True
+                    engine._write_complete_output = True
+                    return {"native_return": False}
+                return {"native_return": True}
+
+            return run
+
+        with (
+            patch.object(ProgrammingReplay, "_runner", runner),
+            engine.controller_execution(control, 2),
+            patch.object(control, "query_control_error"),
+        ):
+            result = control.execute(engine, session)
+            self.assertTrue(result["native_return"])
+            self.assertEqual(
+                [row["native_return"] for row in result["exports"]], [False, True]
+            )
+            self.assertFalse(engine.worker.control_state.failed)
+            self.assertEqual(
+                (engine.dh_state.primary_error, engine.dh_state.passthru_error),
+                (77, 88),
+            )
+            self.assertEqual(control.native_control_context2026(engine).cpu_index, 0)
+
+    def test_phase6_void_retry_keeps_exact_loaded_module_and_primary_bool(self):
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        for operation in ("prepare", "write"):
+            with self.subTest(operation=operation):
+                engine, control, session = self.fixture(
+                    operation=operation,
+                    contact="Phase6",
+                    writer="TCUWP6CanReprostdFlashWriter.dll",
+                    preparer="TCUWP6CanReprostdPrepareWriter.dll",
+                    parameter_values={"IGOffRetriableFlag": "1"},
+                )
+                observed = []
+
+                def runner(stage, selection, *_args, observed=observed, engine=engine):
+                    def run():
+                        observed.append(
+                            (
+                                stage._control_export2026,
+                                stage._control_target2026.module_binding,
+                                selection,
+                            )
+                        )
+                        engine.worker._failed = True
+                        engine._write_complete_output = True
+                        return {
+                            "native_return": None
+                            if stage._control_export2026
+                            == "ProcessBeforeIGOffOnAtRetry"
+                            else False
+                        }
+
+                    return run
+
+                with (
+                    patch.object(ProgrammingReplay, "_runner", runner),
+                    engine.controller_execution(
+                        control, 1 if operation == "prepare" else 2
+                    ),
+                    patch.object(control, "query_control_error"),
+                ):
+                    result = control.execute(engine, session)
+                    self.assertFalse(result["native_return"])
+                    self.assertEqual(observed[-1][0], "ProcessBeforeIGOffOnAtRetry")
+                    self.assertIs(observed[0][1], observed[1][1])
+                    self.assertIs(observed[0][2], observed[1][2])
+                    self.assertEqual(
+                        control.native_control_context2026(engine).cpu_index, 0
+                    )
+
+    def test_final_dh_catch_is_limited_to_actual_virtual_call_native_fault(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from scripts.programming_2026_common import (
+            NativeException2026,
+            NativeSecurityComposer2026,
+        )
+        from scripts.programming_2026_dh import DHGateway2026
+        from scripts.programming_replay import ProgrammingReplay
+        from tests.private_evidence import read_private_bytes
+
+        for error in (NativeException2026("native"), RuntimeError("host")):
+            with self.subTest(error=type(error).__name__):
+                events = (
+                    self.event("set_communication_log_mode", mode=2),
+                    self.event("set_communication_log_mode", mode=0),
+                )
+                engine, control, session = self.fixture(
+                    events=events, dependencies=("TCUWDHUtils.dll",)
+                )
+                images = Path("runtime/no-car-21/recovered")
+                control.runtime.bind_security_composer(
+                    NativeSecurityComposer2026.from_native_modules(
+                        read_private_bytes(images / "SecretInfo.dll"),
+                        read_private_bytes(images / "CUW.dll"),
+                    )
+                )
+                control.dh_mode_could_be_changed = True
+                with (
+                    patch.object(
+                        ProgrammingReplay,
+                        "_runner",
+                        return_value=lambda: {"native_return": True},
+                    ),
+                    patch.object(
+                        DHGateway2026, "end_reprogramming_mode", side_effect=error
+                    ) as tail,
+                ):
+                    if isinstance(error, RuntimeError):
+                        with (
+                            self.assertRaises(RuntimeError) as caught,
+                            engine.controller_execution(control, 1),
+                            patch(
+                                "scripts.programming_2026_common._record_control_return2026"
+                            ) as ordinary,
+                        ):
+                            try:
+                                control.execute(engine, session)
+                            finally:
+                                ordinary.assert_not_called()
+                        self.assertIs(caught.exception, error)
+                        self.assertTrue(control.dh_mode_could_be_changed)
+                    else:
+                        with engine.controller_execution(control, 1):
+                            result = control.execute(engine, session)
+                            self.assertTrue(result["native_return"])
+                            self.assertFalse(control.dh_mode_could_be_changed)
+                    tail.assert_called_once_with(0x3FC)
+
+    def test_getter_typed_postreturn_fault_preserves_out_byte_before_vector_copy(self):
+        from unittest.mock import patch
+
+        from scripts.programming_2026_common import NativePassThruException2026
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture(operation="get_cid")
+        error = NativePassThruException2026(55, "post-return", 1)
+
+        def runner(_stage, *_args):
+            def run():
+                original = control.runtime.check
+                raised = False
+
+                def check():
+                    nonlocal raised
+                    if not raised:
+                        raised = True
+                        raise error
+                    return original()
+
+                control.runtime.check = check
+                return {"native_success": True, "identifiers": (b"NOT-COPIED",)}
+
+            return run
+
+        with (
+            patch.object(ProgrammingReplay, "_runner", runner),
+            engine.controller_execution(control, 0),
+        ):
+            result = control.execute(engine, session)
+            self.assertTrue(result["native_return"])
+            self.assertEqual(result["identifiers"], ())
+            self.assertTrue(engine.worker.control_state.fatal)
+            self.assertEqual(engine.dh_state.primary_error, 55)
+
+    def test_classic_incremental_preflight_fault_leaves_next_slot_constructor_empty(
+        self,
+    ):
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture(operation="write", cpus=2, versions="0")
+        with (
+            patch.object(ProgrammingReplay, "_runner") as runner,
+            engine.controller_execution(control, 2),
+        ):
+            result = control.execute(engine, session)
+            self.assertFalse(result["native_return"])
+            pool = control._control_parameter_pool2026
+            assert pool is not None
+            self.assertTrue(pool.slot(0).loaded)
+            self.assertFalse(pool.slot(1).loaded)
+            self.assertEqual(pool.slot(1).parameter.row_index, 0)
+            self.assertTrue(engine.worker.control_state.fatal)
+            runner.assert_not_called()
+
+    def test_startup_prelude_retains_real_constructor_array_without_family_dispatch(
+        self,
+    ):
+        from unittest.mock import patch
+
+        engine, control, session = self.fixture(
+            parameter_values={"IGOffRetriableFlag": "1"},
+            dependencies=(
+                "TCUWControlCommPhase.dll",
+                "CUW.dll",
+                "SecretInfo.dll",
+                "TCUWDHUtils.dll",
+            ),
+        )
+        with (
+            engine.controller_execution(control, 1),
+            patch.object(
+                session,
+                "selected_identity",
+                side_effect=AssertionError("eager family dispatch"),
+            ),
+        ):
+            control.bind_startup_session(engine, session)
+            pool = control._control_parameter_pool2026
+            assert pool is not None
+            self.assertFalse(pool.slot(0).loaded)
+            self.assertIsNotNone(control.runtime._security_composer)
+            empty = control.empty_control_parameter(engine)
+            base = control._control_base_parameter2026(engine)
+            self.assertIsNone(base.parameter.boolean("IGOffRetriableFlag"))
+            pool.load_for(engine, control, "prepare")
+            revision = pool.slot(0).revision
+            self.assertTrue(base.parameter.boolean("IGOffRetriableFlag"))
+            with self.assertRaises(ValueError):
+                empty.validate(engine)
+            with self.assertRaises(ValueError):
+                control.empty_control_parameter(engine)
+            control.bind_startup_session(engine, session)
+            self.assertIs(control._control_parameter_pool2026, pool)
+            self.assertEqual(pool.slot(0).revision, revision)
+            self.assertTrue(base.parameter.boolean("IGOffRetriableFlag"))
+        with self.assertRaises(ValueError):
+            base.validate(engine)
+
+    def test_combined_3b90_accepted_retry_reaches_confirmation_with_failed_still_true(
+        self,
+    ):
+        """Generic3b90 flow only: known2026 writers have no combined export pair."""
+        from unittest.mock import patch
+
+        from scripts.cuw_parameter_pool import ControlParameterPool2026
+
+        engine, control, session = self.fixture(
+            operation="write",
+            writer="TCUWCanSBRFlashWriter.dll",
+            parameter_values={
+                "IGOffRetriableFlag": "1",
+                "PrepareRetryFlag": "1",
+                "ConfirmAfterEndOfFlashingFlag": "1",
+            },
+            events=(self.event("wait", milliseconds=5000),),
+        )
+        calls = []
+
+        def auxiliary(_engine, _session, _target, export, _helper, reports):
+            calls.append(export)
+            if export == "IsFinishReprogramming":
+                state = engine.worker.control_state
+                self.assertTrue(state.failed)
+                self.assertEqual((state.primary_error, state.passthru_error), (0, 0))
+                self.assertEqual(state.error_kind, 6)
+                self.assertTrue(state.native_context_964)
+            report = {"native_return": True}
+            reports.append(report)
+            return report
+
+        with (
+            engine.controller_execution(control, 2),
+            patch.object(control, "query_control_error"),
+            patch.object(control, "_control_call2026", side_effect=auxiliary),
+        ):
+            token = control._begin_native_control_raw_execution2026(engine)
+            entry = control._begin_native_control_helper_entry2026(
+                engine, helper="4c10"
+            )
+            try:
+                session._bind_control_root2026(engine, control, control.runtime)
+                pool = ControlParameterPool2026.issue(
+                    engine, control, session._catalog_sources
+                )
+                control._control_parameter_pool2026 = pool
+                pool.load_for(engine, control, "write")
+                target = control._control_target2026(engine, 0, "write")
+                engine.dh_state.record_native_error(6, 77, 88)
+                engine.dh_state.set_flashing_ended(True)
+                engine.worker._failed = True
+                engine._write_complete_output = True
+                reports = []
+                control._retry_control2026(engine, session, target, "4c10", reports)
+                self.assertEqual(calls, ["PrepareRetry", "IsFinishReprogramming"])
+                self.assertEqual(len(reports), 2)
+                self.assertFalse(engine.worker.control_state.failed)
+                self.assertEqual(
+                    (engine.dh_state.primary_error, engine.dh_state.passthru_error),
+                    (0, 0),
+                )
+            finally:
+                control._end_native_control_helper_entry2026(engine, lease=entry)
+                control._end_native_control_raw_execution2026(engine, token)
+
+    def test_actual_raw_combined_flags_reject_missing_finish_export_before_writing(
+        self,
+    ):
+        from unittest.mock import patch
+
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture(
+            operation="write",
+            writer="TCUWCanSBRFlashWriter.dll",
+            parameter_values={
+                "IGOffRetriableFlag": "1",
+                "PrepareRetryFlag": "1",
+                "ConfirmAfterEndOfFlashingFlag": "1",
+            },
+        )
+        with (
+            patch.object(ProgrammingReplay, "_runner") as runner,
+            engine.controller_execution(control, 2),
+        ):
+            faults = []
+            publish = engine.worker._record_control_helper_cpass2026
+
+            def record(context, error, lease):
+                faults.append(error)
+                return publish(context, error, lease)
+
+            with patch.object(
+                engine.worker, "_record_control_helper_cpass2026", side_effect=record
+            ):
+                result = control.execute(engine, session)
+            runner.assert_not_called()
+            self.assertFalse(result["native_return"])
+            self.assertEqual(len(faults), 1)
+            self.assertEqual(faults[0].line, 0x2D0)
+            self.assertTrue(engine.worker.control_state.fatal)
+
+
+class RawControlExecuteTests(unittest.TestCase):
+    def test_worker_entry_lookup_rejects_context_without_actual_helper_entry(self):
+        from scripts.programming_2026_common import _control_helper_entry2026
+
+        engine, controller = NativeControlContextTests.engine_and_controller()
+        self.addCleanup(engine.close)
+        with engine.controller_execution(controller, 0):
+            context = controller.native_control_context2026(engine)
+            with self.assertRaisesRegex(ValueError, "No active source-issued"):
+                _control_helper_entry2026(context)
+
+    def test_getter_outer_values_require_an_actual_raw_helper_result(self):
+        from scripts.programming_2026_common import (
+            _control_getter_return_al2026,
+            _control_getter_return_values2026,
+        )
+
+        engine, controller = NativeControlContextTests.engine_and_controller()
+        self.addCleanup(engine.close)
+        with engine.controller_execution(controller, 0):
+            context = controller.native_control_context2026(engine)
+            with self.assertRaisesRegex(
+                ValueError, "Actual ordinary CONTROL getter result"
+            ):
+                _control_getter_return_values2026(context)
+            with self.assertRaisesRegex(
+                ValueError, "Actual ordinary CONTROL getter return byte"
+            ):
+                _control_getter_return_al2026(context)
+
+    def test_saved_native_helper_result_requires_its_live_entry_lease(self):
+        from scripts.programming_2026_common import (
+            _control_saved_family_return2026,
+        )
+
+        engine, controller = NativeControlContextTests.engine_and_controller()
+        self.addCleanup(engine.close)
+        with engine.controller_execution(controller, 0):
+            context = controller.native_control_context2026(engine)
+            with self.assertRaisesRegex(ValueError, "Active source-issued saved"):
+                _control_saved_family_return2026(context, object())
+
+
 class NativeParameterRowTests(unittest.TestCase):
     def test_multi_value_key_lookup_keeps_selected_row_and_reports_total(self):
         from scripts.programming_2026_common import NativeParameter2026
@@ -529,7 +1780,7 @@ class ControllerBoundaryTests(unittest.TestCase):
         # Type validation precedes all state/provider use, including on a forged shell.
         controller = object.__new__(ControlCommPhase2026)
         with self.assertRaises(TypeError):
-            controller.run_bound_export(lambda: True, lambda: {"native_return": True})
+            controller.execute(lambda: True, lambda: {"native_return": True})
 
 
 class BlockIndexTests(unittest.TestCase):
@@ -2428,486 +3679,6 @@ class CommonDefinitionAndBudgetTests(unittest.TestCase):
             SecretInfoClient.from_native_modules(
                 b"authored SecretInfo", b"authored CUW"
             )
-
-
-class ControllerCIDFallbackTests(unittest.TestCase):
-    def test_empty_primary_vector_uses_actual_alternate_even_when_bool_true(self):
-        from unittest.mock import Mock, patch
-
-        from scripts.cuw_2026 import CUWEngine2026
-        from scripts.programming_2026_common import ControlCommPhase2026
-        from scripts.programming_replay import ProgrammingReplay
-
-        engine = object.__new__(CUWEngine2026)
-        engine._active = False
-        primary = object.__new__(ProgrammingReplay)
-        primary.context = {"operation": "get_cid"}
-        alternate = object.__new__(ProgrammingReplay)
-        alternate.context = {"operation": "get_cid"}
-        alternate.selected_binding2026 = Mock()
-        controller = object.__new__(ControlCommPhase2026)
-        primary.bind_controller2026 = Mock()
-        primary.bind_engine2026 = Mock()
-        primary.selected_binding2026 = Mock()
-        reports = [
-            {"identifiers": (), "native_return": True},
-            {"identifiers": (b"authoredCID",), "native_return": False},
-        ]
-        with (
-            patch.object(controller, "run_bound_export", side_effect=reports) as invoke,
-            patch.object(
-                primary, "next_alternate_getter2026", return_value=alternate
-            ) as following,
-            patch.object(engine, "commit_received_identifiers") as commit,
-        ):
-            report = controller.receive_cids(engine, primary)
-        self.assertEqual(invoke.call_count, 2)
-        following.assert_called_once_with(primary.selected_binding2026.return_value)
-        commit.assert_called_once_with((b"authoredCID",), controller=controller)
-        self.assertTrue(controller.alternate_cid_used)
-        self.assertFalse(report["native_return"])
-
-    def test_nonempty_primary_skips_alternate_and_commits_exact_order(self):
-        from unittest.mock import Mock, patch
-
-        from scripts.cuw_2026 import CUWEngine2026
-        from scripts.programming_2026_common import ControlCommPhase2026
-        from scripts.programming_replay import ProgrammingReplay
-
-        engine = object.__new__(CUWEngine2026)
-        engine._active = False
-        primary = object.__new__(ProgrammingReplay)
-        primary.context = {"operation": "get_cid"}
-        controller = object.__new__(ControlCommPhase2026)
-        primary.bind_controller2026 = Mock()
-        primary.bind_engine2026 = Mock()
-        primary.selected_binding2026 = Mock()
-        values = (b"second", b"first", b"second")
-        with (
-            patch.object(
-                controller,
-                "run_bound_export",
-                return_value={"cids": values, "native_return": False},
-            ),
-            patch.object(primary, "next_alternate_getter2026") as following,
-            patch.object(engine, "commit_received_identifiers") as commit,
-        ):
-            controller.receive_cids(engine, primary)
-        following.assert_not_called()
-        commit.assert_called_once_with(values, controller=controller)
-        self.assertFalse(controller.alternate_cid_used)
-
-
-class RetryStatePreservationTests(unittest.TestCase):
-    def test_successful_prepare_retry_preserves_failure_and_runs_finish_tail(self):
-        from types import SimpleNamespace
-        from typing import Any, cast
-        from unittest.mock import Mock, patch
-
-        from scripts.programming_2026_common import (
-            NativeParameterBinding2026,
-        )
-
-        engine, controller, session = cast(
-            tuple[Any, Any, Any], ControllerExecuteTests().shell("write")
-        )
-        controller.address_history = ()
-        worker = engine._worker
-        engine._received_identifiers = ()
-        worker.control_state = SimpleNamespace(
-            failed=True,
-            initial_command_retry=False,
-            source_mode=0,
-            native_context_970=True,
-        )
-        errors = Mock()
-        errors.comm_phase = 2
-        engine._dh_state = errors
-        engine.bind_retry_controller = Mock(return_value=Mock())
-        engine._metadata = SimpleNamespace(vehicle={"kindofecu": ""}, cpu_index=0)
-
-        parameter = Mock()
-        parameter.boolean.side_effect = lambda name: {
-            "IGOffRetriableFlag": True,
-            "PrepareRetryFlag": True,
-            "ConfirmAfterEndOfFlashingFlag": True,
-            "ReceiveTimeoutBeforePrepareRetry": 0,
-        }.get(name, False)
-        parameter.long.return_value = 0
-        parameter.parameters.return_value = (("",) * 4, 4)
-        binding = Mock(spec=NativeParameterBinding2026)
-        binding.operation = "write"
-        binding.parameter = parameter
-        binding.metadata = SimpleNamespace(source_container=object())
-        binding.rebind_writer_metadata = Mock()
-        binding.require_control_versions = Mock()
-        session.executed_binding2026 = Mock(return_value=binding)
-        session.next_retry2026 = Mock(return_value=session)
-        session.next_finish2026 = Mock(return_value=session)
-        resolver = Mock()
-        resolver.resolve.return_value = (True, ())
-
-        with (
-            patch.object(controller, "query_control_error"),
-            patch.object(
-                controller,
-                "run_bound_export",
-                side_effect=(
-                    {"native_return": True, "state": "prepare_retry_completed"},
-                    {"native_return": True, "state": "finish_completed"},
-                ),
-            ) as run_export,
-            patch(
-                "scripts.j2534_2026.communication_addresses_from_parameter",
-                return_value=resolver,
-            ),
-        ):
-            result = controller.retry_failed_write(engine, session)
-
-        self.assertEqual(
-            [item["state"] for item in result["exports"]],
-            ["prepare_retry_completed", "finish_completed"],
-        )
-        self.assertTrue(result["retry_decision"])
-        self.assertEqual(run_export.call_count, 2)
-        worker.clear_post_write_state.assert_not_called()
-        worker.finish_recovery_probe.assert_called_once_with(controller)
-        errors.record_native_error.assert_any_call(None, 0, 0)
-
-
-class ControllerExecuteTests(unittest.TestCase):
-    def shell(self, operation, *, contact="CAN", worker_phase=None):
-        from types import SimpleNamespace
-        from unittest.mock import Mock
-
-        from scripts.cuw_2026 import CUWEngine2026
-        from scripts.programming_2026_common import ControlCommPhase2026
-        from scripts.programming_replay import ProgrammingReplay
-
-        phase = {
-            "get_cid": 0,
-            "prepare": 1,
-            "write": 2,
-            "recovery": 2,
-            "probe": 2,
-            "change_gateway": 3,
-        }[operation]
-        controller = object.__new__(ControlCommPhase2026)
-        controller._retained_parameter_pool = ()
-        controller._parameter_session = None
-        controller.alternate_cid_used = False
-        controller.runtime = Mock()
-        session = object.__new__(ProgrammingReplay)
-        session.context = {"operation": operation}
-        session.used = False
-        session.bind_controller2026 = Mock()
-        session.bind_engine2026 = Mock()
-        session.selected_binding2026 = Mock()
-        engine = object.__new__(CUWEngine2026)
-        engine._active = True
-        engine._phase_thread = threading.get_ident()
-        engine._worker_phase = 1 if phase == 3 else phase
-        if worker_phase is not None:
-            engine._worker_phase = worker_phase
-        engine._controller_execution = controller
-        engine._metadata = SimpleNamespace(
-            vehicle={"contacttype": contact}, node=1, cpu_index=0
-        )
-        engine._worker = Mock()
-        engine._worker.controller = controller
-        engine._worker.validate_source = Mock()
-        engine._interface_pair = None
-        return engine, controller, session
-
-    def test_prepare_dispatches_classic_transition_and_modern_does_not(self):
-        from unittest.mock import Mock, patch
-
-        from scripts.programming_2026_common import NativeParameterBinding2026
-
-        for contact, expected in (("CAN", 1), ("P5-Unified", 0)):
-            with self.subTest(contact=contact):
-                engine, controller, session = self.shell("prepare", contact=contact)
-                binding = Mock(spec=NativeParameterBinding2026)
-                binding.operation = "prepare"
-                binding.require_control_versions = Mock()
-                session.selected_binding2026.return_value = binding
-                session.executed_binding2026 = Mock(return_value=binding)
-                report = {"native_return": True, "state": "prepare_completed"}
-                with (
-                    patch.object(controller, "run_bound_export", return_value=report),
-                    patch.object(
-                        controller, "_load_parameter_pool", return_value=binding
-                    ),
-                ):
-                    result = controller.execute(engine, session)
-                self.assertEqual(result["native_phase"], 1)
-                self.assertFalse(result["programming_completed"])
-                self.assertEqual(result["exports"], (report,))
-                self.assertEqual(
-                    engine._worker.finish_classic_prepare.call_count, expected
-                )
-
-    def test_write_success_clears_and_failed_export_uses_retry_loop(self):
-        from unittest.mock import Mock, patch
-
-        from scripts.programming_2026_common import NativeParameterBinding2026
-
-        engine, controller, session = self.shell("write")
-        binding = Mock(spec=NativeParameterBinding2026)
-        binding.operation = "write"
-        binding.require_control_versions = Mock()
-        session.selected_binding2026.return_value = binding
-        session.executed_binding2026 = Mock(return_value=binding)
-        with (
-            patch.object(
-                controller,
-                "run_bound_export",
-                return_value={"native_return": True, "state": "write_completed"},
-            ),
-            patch.object(controller, "_load_parameter_pool", return_value=binding),
-        ):
-            controller.execute(engine, session)
-        engine._worker.clear_post_write_state.assert_called_once_with()
-
-        engine, controller, session = self.shell("write")
-        session.selected_binding2026.return_value = binding
-        session.executed_binding2026 = Mock(return_value=binding)
-        retry = {"native_return": True, "state": "prepare_retry_completed"}
-        with (
-            patch.object(
-                controller,
-                "run_bound_export",
-                return_value={"native_return": False, "state": "write_failed"},
-            ),
-            patch.object(controller, "_load_parameter_pool", return_value=binding),
-            patch.object(
-                controller,
-                "retry_failed_write",
-                return_value={"exports": (retry,), "retry_decision": False},
-            ) as retry_call,
-        ):
-            result = controller.execute(engine, session)
-        retry_call.assert_called_once_with(engine, session)
-        self.assertEqual(
-            result["exports"],
-            ({"native_return": False, "state": "write_failed"}, retry),
-        )
-        self.assertEqual(result["retry_decision"], False)
-        engine._worker.clear_post_write_state.assert_not_called()
-
-    def test_recovery_and_probe_use_their_post_write_consumers(self):
-        from unittest.mock import Mock, patch
-
-        from scripts.programming_2026_common import NativeParameterBinding2026
-
-        engine, controller, session = self.shell("recovery")
-        binding = Mock(spec=NativeParameterBinding2026)
-        binding.operation = "write"
-        binding.require_control_versions = Mock()
-        session.selected_binding2026.return_value = binding
-        session.executed_binding2026 = Mock(return_value=binding)
-        with (
-            patch.object(
-                controller,
-                "run_bound_export",
-                return_value={
-                    "native_return": True,
-                    "state": "prepare_retry_completed",
-                },
-            ),
-            patch.object(controller, "_load_parameter_pool", return_value=binding),
-        ):
-            controller.execute(engine, session)
-        engine._worker.clear_post_write_state.assert_called_once_with()
-
-        engine, controller, session = self.shell("probe")
-        session.selected_binding2026.return_value = binding
-        session.executed_binding2026 = Mock(return_value=binding)
-        with (
-            patch.object(
-                controller,
-                "run_bound_export",
-                return_value={"native_return": True, "state": "probe_completed"},
-            ),
-            patch.object(controller, "_load_parameter_pool", return_value=binding),
-        ):
-            controller.execute(engine, session)
-        engine._worker.finish_recovery_probe.assert_called_once_with(controller)
-
-    def test_get_cid_and_gateway_dispatch_without_writer_hooks(self):
-        from unittest.mock import Mock, patch
-
-        engine, controller, session = self.shell("get_cid")
-        getter = {"native_return": True, "identifiers": (b"authored",)}
-        with (
-            patch.object(controller, "receive_cids", return_value=getter) as receive,
-            patch.object(controller, "_load_parameter_pool") as load,
-        ):
-            result = controller.execute(engine, session)
-        receive.assert_called_once_with(engine, session)
-        load.assert_not_called()
-        self.assertEqual(result["native_phase"], 0)
-        self.assertEqual(result["exports"], (getter,))
-
-        engine, controller, session = self.shell("change_gateway")
-        from scripts.programming_2026_common import NativeParameterBinding2026
-
-        binding = Mock(spec=NativeParameterBinding2026)
-        binding.operation = "change_gateway"
-        binding.require_control_versions = Mock()
-        session.selected_binding2026.return_value = binding
-        session.executed_binding2026 = Mock(return_value=binding)
-        gateway = {"native_return": True, "state": "gateway_completed"}
-        with (
-            patch.object(controller, "run_bound_export", return_value=gateway),
-            patch.object(controller, "_load_parameter_pool", return_value=binding),
-        ):
-            result = controller.execute(engine, session)
-        self.assertEqual(result["native_phase"], 3)
-        engine._worker.clear_post_write_state.assert_not_called()
-        engine._worker.finish_classic_prepare.assert_not_called()
-
-    def test_execute_rejects_foreign_or_inactive_context_before_dispatch(self):
-        from unittest.mock import patch
-
-        engine, controller, session = self.shell("prepare")
-        with patch.object(controller, "_load_parameter_pool") as load:
-            engine._worker.controller = object()
-            with self.assertRaises(ValueError):
-                controller.execute(engine, session)
-            load.assert_not_called()
-
-        engine, controller, session = self.shell("prepare")
-        engine._controller_execution = None
-        with self.assertRaises(ValueError):
-            controller.execute(engine, session)
-
-        engine, controller, session = self.shell("prepare", worker_phase=2)
-        with self.assertRaises(ValueError):
-            controller.execute(engine, session)
-
-        engine, controller, session = self.shell("prepare")
-        session.used = True
-        with self.assertRaises(ValueError):
-            controller.execute(engine, session)
-
-        with self.assertRaises(TypeError):
-            controller.execute(object(), session)
-        with self.assertRaises(TypeError):
-            controller.execute(engine, object())
-
-    def test_execute_rejects_a_different_executed_parameter_row(self):
-        from unittest.mock import Mock, patch
-
-        from scripts.programming_2026_common import NativeParameterBinding2026
-
-        engine, controller, session = self.shell("prepare")
-        binding = Mock(spec=NativeParameterBinding2026)
-        binding.operation = "prepare"
-        binding.require_control_versions = Mock()
-        session.selected_binding2026.return_value = binding
-        session.executed_binding2026 = Mock(return_value=object())
-        with (
-            patch.object(
-                controller,
-                "run_bound_export",
-                return_value={"native_return": True},
-            ),
-            patch.object(controller, "_load_parameter_pool", return_value=binding),
-            self.assertRaises(ValueError),
-        ):
-            controller.execute(engine, session)
-
-    def test_parameter_pool_rejects_a_non_binding_selection(self):
-        from unittest.mock import Mock
-
-        engine, controller, session = self.shell("prepare")
-        session.selected_binding2026.return_value = Mock()
-        with self.assertRaises(TypeError):
-            controller._load_parameter_pool(engine, session)
-
-    def test_parameter_pool_replaces_the_loaded_row_and_rejects_wrong_stage(self):
-        from unittest.mock import Mock
-
-        from scripts.programming_2026_common import NativeParameterBinding2026
-
-        engine, controller, session = self.shell("prepare")
-        prepare = Mock(spec=NativeParameterBinding2026)
-        prepare.operation = "prepare"
-        prepare.require_control_versions = Mock()
-        session.selected_binding2026.return_value = prepare
-        self.assertIs(controller._load_parameter_pool(engine, session), prepare)
-        self.assertEqual(controller._retained_parameter_pool, (prepare,))
-        self.assertIs(controller._parameter_session, session)
-        prepare.require_control_versions.assert_called_once_with()
-
-        write_session = object.__new__(type(session))
-        write_session.context = {"operation": "write"}
-        write_session.used = False
-        write_session.bind_controller2026 = Mock()
-        write_session.bind_engine2026 = Mock()
-        write = Mock(spec=NativeParameterBinding2026)
-        write.operation = "write"
-        write.require_control_versions = Mock()
-        write_session.selected_binding2026 = Mock(return_value=write)
-        controller._load_parameter_pool(engine, write_session)
-        self.assertEqual(controller._retained_parameter_pool, (write,))
-        self.assertIs(controller._parameter_session, write_session)
-
-        recovery = object.__new__(type(session))
-        recovery.context = {"operation": "recovery"}
-        recovery.used = False
-        recovery.bind_controller2026 = Mock()
-        recovery.bind_engine2026 = Mock()
-        recovery.selected_binding2026 = Mock(return_value=write)
-        controller._load_parameter_pool(engine, recovery)
-        self.assertEqual(controller._retained_parameter_pool, (write,))
-
-        wrong = Mock(spec=NativeParameterBinding2026)
-        wrong.operation = "prepare"
-        write_session.selected_binding2026 = Mock(return_value=wrong)
-        with self.assertRaises(ValueError):
-            controller._load_parameter_pool(engine, write_session)
-
-    def test_execute_imports_the_engine_view_and_exports_the_control_snapshot(self):
-        from unittest.mock import Mock, patch
-
-        from scripts.j2534_2026 import (
-            DriverMetadata2026,
-            J2534Device2026,
-            J2534InterfacePair2026,
-        )
-        from scripts.programming_2026_common import NativeParameterBinding2026
-        from tests.test_j2534_2026 import Provider
-
-        provider = Provider()
-        engine_view = J2534Device2026(provider, background_workers=False)
-        control_view = J2534Device2026(provider, background_workers=False)
-        pair = J2534InterfacePair2026(engine_view, control_view)
-        for view in (engine_view, control_view):
-            view.set_driver(DriverMetadata2026("authored", "fixture.dll"))
-        engine, controller, session = self.shell("prepare")
-        from scripts.programming_2026_common import NativeRuntime2026
-
-        controller.runtime = NativeRuntime2026(control_view.primitive)
-        engine._interface_pair = pair
-        binding = Mock(spec=NativeParameterBinding2026)
-        binding.operation = "prepare"
-        binding.require_control_versions = Mock()
-        session.selected_binding2026.return_value = binding
-        session.executed_binding2026 = Mock(return_value=binding)
-
-        def export(_engine, _session):
-            control_view.timeout = 321
-            return {"native_return": True, "state": "prepare_completed"}
-
-        with (
-            patch.object(controller, "_load_parameter_pool", return_value=binding),
-            patch.object(controller, "run_bound_export", side_effect=export),
-        ):
-            controller.execute(engine, session)
-        self.assertEqual(control_view.timeout, 321)
-        self.assertEqual(engine_view.timeout, 321)
 
 
 class OnlineSourceBindingTests(unittest.TestCase):

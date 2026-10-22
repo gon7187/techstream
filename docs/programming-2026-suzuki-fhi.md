@@ -29,7 +29,12 @@ Implemented paths include:
   `34 0F45`, bounded `36` blocks with wrapping counters, `37`, reset and
   functional post-program session. Transfer send timeouts are computed and restored.
 - Suzuki getter: `22 F189/F188/F191`, native fixed2/16/11-byte extraction,
-  NUL-terminated field behavior and the native composite CID.
+  NUL-terminated field behavior and the native composite CID. Its ordinary
+  return preserves the separate source BOOL: a caught native body fault returns
+  an empty vector with `native_success=false`; native StopFilter faults are
+  suppressed without clearing a previously true BOOL. Host body/cleanup faults
+  and every Disconnect fault propagate, so the getCID dispatcher issues no
+  ordinary result for them.
 - USB write: actual enable/poll/routine requests, four-attempt native retries,
   deadline/regression errors, progress, notification cleanup and persisted
   state0/1/2. Nonzero persisted state returns through the native early branch;

@@ -264,6 +264,13 @@ the native combined read path. Four additional original12JP/18NA pair/packet
 checks serialize and reopen both the data and instrument captures. Build12 NA
 has no selected OSC system, so that check uses its actual JP catalog throughout.
 
+The factory accepts an optional concrete retained `NativeCommunication` only
+for selected normal P4/P5 plans. It checks the exact controller/lower identity,
+bound profile, build, bus, plan and connection source before forwarding that same
+owner through the normal polling constructor. A8, Dual/MultiMon, Variable,
+Century and oscillator combinations remain outside this retained worker seam;
+they fail before a worker starts.
+
 `selected_variable_monitor_runtime` joins the concrete retained communication
 Check targets, native CheckStart allocation, controller-category child selection,
 actual selected connections and per-slot metadata into `VariableMonitorRuntime`.

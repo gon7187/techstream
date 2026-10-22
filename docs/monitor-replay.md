@@ -20,6 +20,56 @@ if "oscilloscope" in session.outputs:
     session.save_dm("oscilloscope.dm", stream="oscilloscope")
 ```
 
+The same `MonitorReplay` owner exposes the admitted source18 normal/device8
+MULTI48/7D selection path. `begin_native_vehicle(info_ids=..., text_encoding=...,
+division=...)` creates one native session over the recording cursor;
+`native_categories(ordered_pairs, bus_judge=...)`, `native_select()` and
+`native_answer(index, select_id)` return the existing native DTOs with their raw
+WORD IDs and source order. `native_vehicle_systems()` reports associations for
+the actual terminal selection, and `bind_native_vehicle_system(category)` only
+accepts the category already pinned by the monitor recording. It uses the
+retained communication owner and source-authorized context switch. The UI must
+provide actual typed `NativeTriggerInfo` and `NativeTriggerParameters` from
+existing DRS table5/table6 settings before native `run(trigger=..., parameters=...)`;
+trigger type7 is rejected until its real Check Mode/session groups are admitted.
+Native run retains both outputs: `monitor` (`dm`) and `recording` (`drs`).
+`close_native_vehicle()` is serialized, idempotent and returns the native DWORD
+close status. A nonzero status or close exception retires native business while
+retaining pending cleanup on the same owner; callers can inspect the readonly
+`native_vehicle_cleanup_pending` property and retry close. Once release succeeds,
+later closes return zero without rechecking sources or issuing more device calls.
+Calling `run()` again on a used recording raises the single-use error without
+attempting cleanup; pending owner release remains an explicit close operation.
+UI dwell does not advance the recording clock or cursor.
+
+For the public authored native-run smoke fixture, call
+`write_native_vehicle_smoke_fixture(directory, trigger=..., parameters=...)`
+from `tests.test_monitor_replay` with the typed objects imported from DRS tables
+5 and 6. It returns `(recording_json_path, source_root)` and persists only
+authored Toyota/M_English/ECU databases, the actual MULTI48/7D plus monitor
+primitive event stream, and expected DM/DRS bytes. The helper strictly replays
+the JSON from cursor zero and checks both outputs byte-for-byte:
+
+```python
+from pathlib import Path
+from test_monitor_replay import write_native_vehicle_smoke_fixture
+
+recording_path, source_root = write_native_vehicle_smoke_fixture(
+    Path("/tmp/native-smoke"), trigger=trigger, parameters=parameters
+)
+```
+
+The fixture does not supply business defaults for trigger settings; provide the
+actual typed values selected by the caller.
+
+`NativeVehicleReplayTests.test_native_phase4_formatter_acquisition_replays_with_artifacts`
+is a separate authored source variant. It adds distinct phase4 `0x21` requests
+and literal `0x61` replies for formatter functions 40–57, then repeats selection,
+retained monitor execution and artifact checks from a fresh strict recording.
+The terminal DTO follows native display filtering: IDs 1, 2, 3 and 4 are
+exported, while the function16/17 acquisition requests remain consumed by the
+actual formatter path.
+
 A session is single-use. `session.sources` lists all recording/database inputs
 for export protection. SHA pins are checked when loading, before execution,
 after execution and before export; input aliases and hard links cannot be

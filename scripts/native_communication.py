@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from scripts.database_resources import DdrPacketLog
+    from scripts.drive_recorder import NativeVehicleSelection, NativeVehicleSession
 
 from scripts.frame_transport import (
     DriverProperties,
@@ -29,7 +30,7 @@ from scripts.monitor_support import (
     SupportReceive,
     SupportSend,
 )
-from scripts.profiles import ProtocolProfile, SelectedFrame
+from scripts.profiles import ProtocolProfile, SelectedFrame, VehicleProfile
 from scripts.support import (
     ConnectionCacheEntry,
     ProtocolCandidate,
@@ -912,6 +913,23 @@ class NativeCommunication:
         self._comm_log: DdrPacketLog | None = None
         self._shared_controller = False
         self._context_first_request: bytes | None = None
+        self._selected_vehicle_binding: tuple[object, ...] | None = None
+        self._selected_vehicle_context: NativeCommunication | None = None
+        self._native_backend = (
+            operations.operations.backend
+            if isinstance(operations, NativeFrameController)
+            else None
+        )
+        self._native_driver = (
+            operations.operations.driver
+            if isinstance(operations, NativeFrameController)
+            else None
+        )
+        self._native_device_kind = (
+            operations.operations.device_kind
+            if isinstance(operations, NativeFrameController)
+            else None
+        )
 
     def bind_comm_log(self, logger: DdrPacketLog) -> None:
         """Bind the concrete native file owner to this retained controller."""
@@ -970,6 +988,133 @@ class NativeCommunication:
         sibling.cache.share_discovery_cache(self.cache)
         self._shared_controller = sibling._shared_controller = True
         sibling._context_first_request = first_request
+        return sibling
+
+    def bind_selected_vehicle(
+        self,
+        session: NativeVehicleSession,
+        selection: NativeVehicleSelection,
+        profile: VehicleProfile,
+        ecu: str,
+        *,
+        bus_id: int,
+        first_request: bytes,
+    ) -> NativeCommunication:
+        """Bind a selector-proved terminal model to this retained outer controller."""
+        from scripts.drive_recorder import NativeVehicleSelection, NativeVehicleSession
+        from scripts.frame_transport import runtime_frame_plan
+
+        self._check()
+        if type(self.operations) is not NativeFrameController:
+            raise TypeError("Selected vehicle binding requires its concrete controller")
+        if (
+            type(session) is not NativeVehicleSession
+            or session.communication is not self
+        ):
+            raise ValueError("Selected vehicle binding requires its original session")
+        session._check()
+        lower = self.operations.operations
+        if (
+            type(selection) is not NativeVehicleSelection
+            or type(profile) is not VehicleProfile
+            or type(ecu) is not str
+            or not ecu
+            or "\0" in ecu
+            or type(bus_id) is not int
+            or not 0 <= bus_id <= 65535
+            or type(first_request) is not bytes
+            or len(first_request) > 65535
+        ):
+            raise ValueError("Invalid selected vehicle binding inputs")
+        if (
+            type(selection.trailing_words) is not tuple
+            or len(selection.trailing_words) != 2
+            or any(type(value) is not int for value in selection.trailing_words)
+        ):
+            raise ValueError("Native vehicle selection has malformed terminal words")
+        model = selection.trailing_words[1]
+        if (
+            selection.trailing_words[0] != 0
+            or type(model) is not int
+            or not 1 <= model <= 0xFFFE
+            or session.current_model != model
+            or not session.model_list
+            or session.model_list[0] != model
+        ):
+            raise ValueError("A matching terminal native vehicle selection is required")
+        if (
+            self.closed
+            or lower.poisoned
+            or self.operations._context_failed
+            or self._context_first_request is None
+            or self.source_build != lower.native_build
+            or lower.backend is not self._native_backend
+            or lower.driver is not self._native_driver
+            or lower.device_kind != self._native_device_kind
+            or self.operations.profile is not lower.profile
+            or lower.profile.catalog is not self.profile.catalog
+            or lower.profile.catalog.management.sha256
+            != self.profile.catalog.management.sha256
+            or tuple(lower.profile.exception_ids) != tuple(self.profile.exception_ids)
+            or profile.catalog is not self.profile.catalog
+            or profile.catalog.management.sha256
+            != self.profile.catalog.management.sha256
+            or tuple(profile.exception_ids) != tuple(self.profile.exception_ids)
+            or profile.vehicle_name_key != model
+            or ecu != self.ecu
+        ):
+            raise ValueError("Selected vehicle source or retained controller changed")
+        systems = profile.catalog.vehicle_systems(model, tuple(profile.exception_ids))
+        if not any(
+            item["category"] == profile.category and item["file"] == profile.filename
+            for item in systems
+        ):
+            raise ValueError("Selected ECU is not associated with the terminal vehicle")
+        if type(self.operations.operations.driver) is not DriverProperties:
+            raise ValueError("Selected native driver properties are not validated")
+        target_variant = (
+            ("psa_wwh" if self.source_build == 18 and profile.mode_wwh() else "psa")
+            if bus_id & 15 == 2 and profile.category_record[72] & 0x1F in (0x14, 0x15)
+            else "normal"
+        )
+        runtime_frame_plan(
+            profile,
+            first_request,
+            native_build=self.source_build,
+            native_variant=target_variant,
+            bus_id=bus_id,
+            driver=lower.driver,
+            diagnostic_mode=lower.diagnostic_mode,
+        )
+        binding = (session, model, profile, ecu, bus_id, first_request)
+        if self._selected_vehicle_binding is not None:
+            if (
+                self._selected_vehicle_binding == binding
+                and self._selected_vehicle_context is not None
+            ):
+                return self._selected_vehicle_context
+            raise ValueError("This retained owner is already bound to another vehicle")
+
+        sibling = NativeCommunication(
+            profile,
+            self.operations,
+            ecu,
+            bus_id=bus_id,
+            source_build=self.source_build,
+            limits=self.limits,
+            cancelled=self.cancelled,
+            clock=self.clock,
+        )
+        protocol_profile = profile.catalog.build_protocol_profile(
+            profile.category, exception_ids=tuple(profile.exception_ids)
+        )
+        sibling.cache._bind_selected_vehicle_storage(
+            self.cache, protocol_profile=protocol_profile
+        )
+        self._shared_controller = sibling._shared_controller = True
+        sibling._context_first_request = first_request
+        self._selected_vehicle_binding = binding
+        self._selected_vehicle_context = sibling
         return sibling
 
     def _active_context(self) -> bool:
