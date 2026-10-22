@@ -7,6 +7,8 @@ import struct
 import sys
 from pathlib import Path
 
+from scripts.local_files import read_regular
+
 DEFAULT_ROOT = (
     Path(__file__).resolve().parents[1]
     / "artifacts/extracted/techstream-18-application/Techstream_Data_NA/PIDGroup"
@@ -114,8 +116,7 @@ def list_groups(root: Path) -> list[str]:
 
 def show_group(root: Path, group: str) -> dict:
     path = group_path(root, group)
-    with path.open("rb") as source:
-        data = source.read(MAX_FILE_SIZE + 1)
+    data = read_regular(path, limit=MAX_FILE_SIZE)
     return {
         "group": path.relative_to(root.resolve()).as_posix(),
         "format": "techstream-ct-v2-52",

@@ -13,10 +13,11 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.local_files import read_regular
 from scripts.signal_conversion import signal_metadata
 
 MAX_SIZE = 64 * 1024 * 1024
-VERSIONS = {0x01000137, 0x01000225, 0x0100032F}
+VERSIONS = {0x01000137, 0x01000225, 0x0100030C, 0x0100032F}
 
 
 def decode_lzss(payload: bytes) -> bytes:
@@ -235,7 +236,7 @@ def parse_database(data: bytes, cache: dict[str, bytes] | None = None) -> Databa
         raise ValueError("DDB sections do not start after the directory")
     fmt = "<BBHI" if version == 0x01000137 else "<BBII"
     section_size = struct.calcsize(fmt)
-    sections = {}
+    pending, total_decoded = [], 0
     for i, (slot, offset) in enumerate(present):
         end = present[i + 1][1] if i + 1 < len(present) else len(data)
         if not header_size <= offset <= end - section_size <= len(data) - section_size:
@@ -244,6 +245,15 @@ def parse_database(data: bytes, cache: dict[str, bytes] | None = None) -> Databa
         if sid != slot or flags not in (0, 1) or length != end - offset - section_size:
             raise ValueError("DDB section identity, flags or length mismatch")
         payload = data[offset + section_size : end]
+        if flags and len(payload) < 5:
+            raise ValueError("Truncated compressed DDB header")
+        wanted = struct.unpack_from("<I", payload)[0] if flags else len(payload)
+        total_decoded += wanted
+        if total_decoded > MAX_SIZE:
+            raise ValueError("DDB aggregate decoded size exceeds the file limit")
+        pending.append((slot, offset, count, flags, payload, wanted))
+    sections = {}
+    for slot, offset, count, flags, payload, wanted in pending:
         if flags:
             digest = hashlib.sha256(payload).hexdigest()
             decoded = cache.get(digest) if cache is not None else None
@@ -251,14 +261,15 @@ def parse_database(data: bytes, cache: dict[str, bytes] | None = None) -> Databa
                 decoded = decode_lzss(payload)
                 if cache is not None:
                     cache[digest] = decoded
+            if not isinstance(decoded, bytes) or len(decoded) != wanted:
+                raise ValueError("DDB cached decoded length mismatch")
             payload = decoded
         sections[slot] = Section(slot, offset, count, bool(flags), payload)
     return Database(kind, version, hashlib.sha256(data).hexdigest(), sections)
 
 
 def read_database(path: Path, cache: dict[str, bytes] | None = None) -> Database:
-    with path.open("rb") as source:
-        return parse_database(source.read(MAX_SIZE + 1), cache)
+    return parse_database(read_regular(path, limit=MAX_SIZE), cache)
 
 
 class Language:

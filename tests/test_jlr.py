@@ -3,8 +3,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.jlr import JLRClient, StreamDecoder, discover_jlr, request, response
-from scripts.mongoose_protocol import decode_frames, encode_frame
+from scripts.jlr import (
+    MAX_PAYLOAD,
+    JLRClient,
+    StreamDecoder,
+    discover_jlr,
+    encode_frame,
+    request,
+    response,
+)
+from scripts.mongoose_protocol import MAX_PAYLOAD as TOYOTA_MAX_PAYLOAD
+from scripts.mongoose_protocol import decode_frames
 
 
 class ReplayTransport:
@@ -36,6 +45,39 @@ class ReplayTransport:
 
 
 class JLRTests(unittest.TestCase):
+    def test_large_firmware_frame_has_jlr_scoped_framing(self):
+        firmware = bytes(range(256)) * 32
+        body = struct.pack("<4I", 2, 1, 108, len(firmware)) + firmware
+        wire = request(1, 0x10A, 1, body)
+        length, check = struct.unpack_from("<HH", wire)
+        self.assertEqual(length, 8192 + 28)
+        self.assertEqual(length ^ check, 0x51E6)
+        decoder = StreamDecoder()
+        decoded = []
+        for offset in range(0, len(wire), 127):
+            decoded.extend(decoder.feed(wire[offset : offset + 127]))
+        self.assertEqual(decoded, [wire[4:]])
+        self.assertEqual(decoder.pending, b"")
+        self.assertEqual(TOYOTA_MAX_PAYLOAD, 6144)
+        with self.assertRaises(ValueError):
+            decode_frames(wire)
+
+    def test_jlr_uint16_format_bound_and_pending_buffer(self):
+        self.assertEqual(MAX_PAYLOAD, 65535)
+        payload = b"x" * MAX_PAYLOAD
+        wire = encode_frame(payload)
+        self.assertEqual(StreamDecoder().feed(wire), [payload])
+        decoder = StreamDecoder()
+        self.assertEqual(decoder.feed(wire[:-1]), [])
+        self.assertLessEqual(len(decoder.pending), MAX_PAYLOAD + 3)
+        self.assertEqual(decoder.feed(wire[-1:]), [payload])
+        with self.assertRaises(ValueError):
+            encode_frame(bytes(65536))
+        with self.assertRaises(ValueError):
+            request(1, 3, 1, bytes(65524))
+        with self.assertRaises(ValueError):
+            StreamDecoder().feed(bytes(65540))
+
     def test_frame_stream_reassembly_and_resynchronization(self):
         first, second = encode_frame(b"abc"), encode_frame(b"xy")
         for stop in range(len(first)):

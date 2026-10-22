@@ -17,7 +17,18 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.mongoose_protocol import MAGIC, MAX_PAYLOAD, encode_frame
+from scripts.mongoose_protocol import MAGIC
+
+HEADER = struct.Struct("<HH")
+# This is the uint16 wire-format bound, not a proven device buffer capacity.
+MAX_PAYLOAD = 0xFFFF
+
+
+def encode_frame(payload: bytes) -> bytes:
+    """JLR SLP frame; Toyota's separate 6144-byte host policy is not applied."""
+    if not isinstance(payload, bytes) or not 1 <= len(payload) <= MAX_PAYLOAD:
+        raise ValueError(f"JLR payload must be immutable bytes within1..{MAX_PAYLOAD}")
+    return HEADER.pack(len(payload), len(payload) ^ MAGIC) + payload
 
 
 class StreamDecoder:
@@ -25,19 +36,19 @@ class StreamDecoder:
         self.pending = b""
 
     def feed(self, data: bytes) -> list[bytes]:
-        if len(data) > 65536:
-            raise ValueError("USB chunk exceeds 64 KiB")
+        if not isinstance(data, bytes) or len(data) > MAX_PAYLOAD + HEADER.size:
+            raise ValueError("JLR input chunk exceeds one maximum wire frame")
         buffer = self.pending + data
         frames, cursor = [], 0
-        while len(buffer) - cursor >= 4:
-            size, check = struct.unpack_from("<HH", buffer, cursor)
+        while len(buffer) - cursor >= HEADER.size:
+            size, check = HEADER.unpack_from(buffer, cursor)
             if not 1 <= size <= MAX_PAYLOAD or size ^ check != MAGIC:
                 cursor += 1
                 continue
-            if len(buffer) - cursor < size + 4:
+            if len(buffer) - cursor < size + HEADER.size:
                 break
-            frames.append(buffer[cursor + 4 : cursor + 4 + size])
-            cursor += size + 4
+            frames.append(buffer[cursor + HEADER.size : cursor + HEADER.size + size])
+            cursor += size + HEADER.size
         self.pending = buffer[cursor:]
         return frames
 

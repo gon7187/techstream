@@ -182,6 +182,18 @@ The text adapter resolves the selected/common U/RSD resources with per-entry
 provenance. This establishes the selected execution event only; the other
 44 receiver methods and their surrounding workflows remain open.
 
+The public desktop smoke drives the same recovered controllers through the real
+GTK utility dialog over an authored synthetic provider
+(`scripts/utility_authored.py`): the DCM45 business stage completes with the
+source result 0 and the retained receiver output, the native warning 2005
+renders its own `0x948c`/`0x9492` screen and closes on acknowledge, cancellation
+joins the owned worker instead of faking termination, and BSM27 renders the
+common error screen for its source probe rejection 99. That authored fixture
+deliberately bypasses the source-issued caller/engine pair check and never
+serves a production procedure replay; `open_native_utility` keeps the check
+intact. The CGW security prelude, the raw SDK chronology and physical ECU
+behavior stay outside this public evidence.
+
 For Door, `open(0x1381d)` presents the actual initial conditions resource `0x94b8`
 without starting native work. Its source navigation key uses caption `0x102f`
 (TY2 `0x2b600`) and invokes the screen's actual Next callback `0x38150`.

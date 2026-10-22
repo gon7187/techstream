@@ -191,10 +191,14 @@ The separate108 original-context P6 facade checks now cover both Plus images
 and physical6/8012 through the shared four-slot pool and cancellation cleanup.
 
 The background fixed/SIS/selected-P5 loops now invoke the individual host
-`native_sleep(120)` primitive. Deterministic step calls do not sleep. A host
-fixture running real worker threads must provide blocking or synchronized
-Sleep; virtual clock-only Sleep is suitable for deterministic step checks.
-Foreign Sleep failures remain observable and retain lower ownership for close.
+`native_sleep(120)` primitive. Deterministic step calls do not sleep. Background
+loops use `_paced_native_sleep`: if host Sleep returns before 120 ms of monotonic
+time, the worker waits on its stop event for the remainder. This preserves the
+literal cadence and prevents a virtual-clock replay host from spinning the DCM,
+selected-P5 or SIS worker. A host fixture that asserts deterministic step timing
+should still provide blocking or synchronized Sleep; virtual clock-only Sleep is
+suitable for direct `worker_step` checks. Foreign Sleep failures remain observable
+and retain lower ownership for close.
 
 At this review freeze, ordinary broadcast support is admitted only for the
 two18 images. Other six ordinary broadcast source branches remain open. P6
@@ -203,3 +207,29 @@ branch raises an explicit source error until implemented. The83 public P5
 worker wrappers remain TY18-only despite the all8 component source port.
 Public PlusSIS/P6 initialization exports and exhaustive actual business joins
 remain separate gates. This freeze requests independent review, not completion.
+
+## Lifecycle hardening after the handoff
+
+The reviewed checkpoint left three owner/cancellation defects open. The public
+implementation now keeps these invariants, with authored regression checks that
+do not require an original image:
+
+- A selected P5 worker whose `Thread.start()` fails clears `active`, drops the
+  unstarted `Thread` and leaves `stop()` usable. A later retry does not inherit
+  an owner that can never be joined.
+- Every manager lifecycle, CAN/P6 pool, direct driver, selected lower, support
+  cache, driver arbitration, manager mutex and shared field set is published
+  once per context key. Concurrent aliases receive the same owner and the same
+  lock instead of constructing a second owner. Publication is serialized
+  separately from native I/O.
+- A cancelled selected CMN worker does not overwrite a newer shared timer
+  status with its entry snapshot. A terminal CMN error still publishes its own
+  result. The previously reported status-15 overwrite hypothesis stays
+  refuted; the regression publishes 15 from the timer path and requires it to
+  survive CMN cancellation.
+
+These checks are `tests.test_utility_ex_lifecycle.LifecycleHardeningTests` and
+`tests.test_utility_ex_comm.PublicationOwnerTests`. They establish the Python
+owner contract only. The original-image twelve-check oracle and independent
+source review were not run for this change, so leaf153/108 acceptance remains
+open.

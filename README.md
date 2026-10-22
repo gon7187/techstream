@@ -8,9 +8,9 @@ An independent native Linux diagnostic workbench for Toyota/Lexus research, writ
 
 **This is an early implementation, not a complete replacement for Toyota Techstream. All physical vehicle communication remains `PHYSICAL_UNCONFIRMED`.** The desktop interface is currently in Russian.
 
-## Development checkpoint — 21 October 2026
+## Development checkpoint — 22 October 2026
 
-The no-car port is **work in progress** and feature development is paused for handoff. The current checkpoint is on [`offline-completion-20261020`](https://github.com/gon7187/techstream/tree/offline-completion-20261020). Implemented components, independently checked cases, known failures and missing integrations are documented separately; the final software gate remains open.
+The no-car port is **work in progress**. [PR #1](https://github.com/gon7187/techstream/pull/1) records the reviewed incremental checkpoint and integration status. Implemented components, independently checked cases, known failures and missing integrations are documented separately; the final software gate remains open.
 
 - [Current status, known defects and ordered roadmap](docs/development-handoff.md)
 - [Roadmap: implemented, missing and next](docs/ROADMAP.md)

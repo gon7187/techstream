@@ -186,5 +186,141 @@ class ReplayTests(unittest.TestCase):
         )
 
 
+class ExtendedReplayTests(unittest.TestCase):
+    def test_monitor_session_record_and_replay_round_trip(self):
+        rows = [
+            ("0600", "460080000001"),
+            ("0620", "462000000010"),
+            ("0601", "46018001000a00000014"),
+            ("063c", "463c80fefffcfff80004"),
+        ]
+        source = iter(rows)
+
+        def exchange(ecu, request):
+            expected, response = next(source)
+            self.assertEqual(request.hex(), expected)
+            return bytes.fromhex(response)
+
+        recorder = Recorder(exchange)
+        report = Session(recorder.exchange).monitors("engine")
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual([r["value"] for r in report["results"]], [10, -1])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "monitors.json"
+            recorder.save(path)
+            replay = Replay.load(path)
+            self.assertEqual(Session(replay.exchange).monitors("engine"), report)
+            replay.assert_complete()
+
+    def test_compound_and_information_replay_semantic_validation(self):
+        for request, response in (
+            ("0124", "412480002000"),
+            ("023400", "42340080008000"),
+            ("050501", "450501010002"),
+            ("0908", "490810" + "0000" * 16),
+            ("090a", "490a0145434d002d" + b"EngineControl".ljust(15, b"\x00").hex()),
+        ):
+            doc = document()
+            doc["transactions"][0].update(request=request, response=response)
+            replay = Replay(doc)
+            self.assertEqual(
+                replay.exchange("engine", bytes.fromhex(request)),
+                bytes.fromhex(response),
+            )
+            replay.assert_complete()
+
+    def test_monitor_negative_and_malformed_corpus(self):
+        bad = (
+            ("0600", "46000000"),
+            ("0601", "460180010001000000"),
+            ("0601", "46028001000100000002"),
+            ("0601", "46018001000100000002018001000100000002"),
+            ("0601", "46018001000100020000"),
+            ("0601", "7f0512"),
+            ("0601", "7f061200"),
+            ("050101", "45010201"),
+            ("050101", "450101010001"),
+            ("050501", "45050101"),
+            ("0908", "490810" + "0000" * 15),
+            ("0132", "4132000000"),
+            ("0124", "4124800020"),
+            ("090a", "490a0145434d003a" + "00" * 15),
+        )
+        for request, response in bad:
+            with self.subTest(request=request, response=response):
+                doc = document()
+                doc["transactions"][0].update(request=request, response=response)
+                with self.assertRaises(ReplayError):
+                    Replay(doc)
+        for request, response in (("0601", "7f0678"), ("050101", "7f0512")):
+            doc = document()
+            doc["transactions"][0].update(request=request, response=response)
+            replay = Replay(doc)
+            self.assertEqual(
+                replay.exchange("engine", bytes.fromhex(request)),
+                bytes.fromhex(response),
+            )
+
+    def test_unknown_scaling_is_evidence_not_success(self):
+        doc = document()
+        doc["transactions"] = [
+            {"ecu": "engine", "request": "0600", "response": "460080000000"},
+            {"ecu": "engine", "request": "0601", "response": "46018080000100000002"},
+        ]
+        replay = Replay(doc)
+        report = Session(replay.exchange).monitors("engine")
+        self.assertEqual(report["status"], "partial")
+        self.assertNotIn("value", report["results"][0])
+        replay.assert_complete()
+
+    def test_bad_extended_recording_never_appends(self):
+        recorder = Recorder(lambda e, r: bytes.fromhex("46028001000100000002"))
+        with self.assertRaises(ReplayError):
+            recorder.exchange("engine", b"\x06\x01")
+        self.assertEqual(recorder.transactions, [])
+        for request in (b"\x04", b"\x08\x01", b"\x05\x01\x03", b"\x06\x01\x00"):
+            with self.assertRaises(DiagnosticError):
+                recorder.exchange("engine", request)
+
+
+class LatePIDReplayTests(unittest.TestCase):
+    def test_support_gated_diesel_compound_session(self):
+        from scripts.diagnostics import supported_pids
+
+        doc = document()
+        doc["transactions"] = [
+            {"ecu": "engine", "request": "0100", "response": "410000000001"},
+            {"ecu": "engine", "request": "0120", "response": "412000000001"},
+            {"ecu": "engine", "request": "0140", "response": "414000000001"},
+            {"ecu": "engine", "request": "0160", "response": "416000800000"},
+            {"ecu": "engine", "request": "0169", "response": "41693fff8080ff0080"},
+        ]
+        self.assertEqual(supported_pids(bytes.fromhex("00800000"), 0x60), [0x69])
+        replay = Replay(doc)
+        result = Session(replay.exchange).parameters("engine", [0x69])
+        self.assertEqual(result["values"][0]["fields"][0]["value"], 100)
+        replay.assert_complete()
+        doc["transactions"][-1]["response"] = "41693fff8080ff00"
+        with self.assertRaises(ReplayError):
+            Replay(doc)
+
+    def test_every_late_structured_length_is_enforced_by_replay(self):
+        from scripts.diagnostics import PID_SIZES
+
+        for pid in range(0x69, 0x88):
+            size = PID_SIZES[pid]
+            for actual in (size - 1, size, size + 1):
+                with self.subTest(pid=pid, actual=actual):
+                    doc = document()
+                    doc["transactions"][0].update(
+                        request=f"01{pid:02x}", response=f"41{pid:02x}" + "00" * actual
+                    )
+                    if actual == size:
+                        Replay(doc)
+                    else:
+                        with self.assertRaises(ReplayError):
+                            Replay(doc)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,20 @@
 set -eu
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+variant=${1:-normal}
+case "$variant" in
+normal)
+  screen="-screen 0 1600x1200x24"
+  ;;
+compact)
+  screen="-screen 0 1024x768x24"
+  ;;
+*)
+  echo "usage: desktop-smoke.sh [normal|compact]" >&2
+  exit 2
+  ;;
+esac
+
 smoke_dir=$(mktemp -d "${TMPDIR:-/tmp}/techstream-desktop-XXXXXX")
 trap 'rm -rf -- "$smoke_dir"' EXIT
 trap 'exit 130' INT
@@ -20,4 +34,9 @@ unset DBUS_STARTER_ADDRESS DBUS_STARTER_BUS_TYPE
 export XDG_SESSION_TYPE=x11 GDK_BACKEND=x11
 export GSK_RENDERER=cairo GTK_A11Y=none GIO_USE_VFS=local
 
-xvfb-run -a dbus-run-session -- python3 "$root/techstream.py" --demo --smoke-test
+set -- --demo --smoke-test
+if [ "$variant" = compact ]; then
+  set -- "$@" --smoke-compact
+fi
+
+xvfb-run -a -s "$screen" dbus-run-session -- python3 "$root/techstream.py" "$@"
