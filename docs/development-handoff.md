@@ -1,20 +1,14 @@
-# Передача разработки — 2026-10-21
+# Передача разработки — 2026-10-22
 
 ## Состояние проекта
 
-Публичная часть чекпоинта 2026-10-21 закрыта и опубликована: ветка `offline-completion-20261020` @ `22ae986` собрана, проверена и запушена; PR #1 остаётся **draft**, потому что приватные source-гейты ещё не закрыты. Полная цель «без автомобиля» **не достигнута**: листовые пропуски 6/14/25/41/143 и все приватные гейты остаются открытыми. Работа оборудования и автомобиля не подтверждена и имеет статус **`PHYSICAL_UNCONFIRMED`**.
+Контрольная точка 22 октября 2026 — проверенный инкрементальный порт, развиваемый в [PR #1](https://github.com/gon7187/techstream/pull/1). Канонический репозиторий — [`gon7187/techstream`](https://github.com/gon7187/techstream), основная ветка `main`. Точный статус интеграции, SHA и CI следует сверять в PR и истории GitHub. Полная цель «всё без автомобиля» **не достигнута**: незавершённые source/consumer-гейты перечислены ниже. Работа оборудования и автомобиля остаётся **`PHYSICAL_UNCONFIRMED`**.
 
-Публичный канонический репозиторий — [`gon7187/techstream`](https://github.com/gon7187/techstream), remote `origin`. `main` получает только документацию и граф; исходники публикуются в рабочей ветке и в draft PR с явно указанными блокерами. Это снимок незавершённой разработки, а не полный выпуск. Точные SHA и результаты CI следует проверять в истории GitHub и в связанном pull request этой ветки; локальный корневой handoff хранит точные ссылки доставки.
+Полный повторный прогон с доступным локальным корпусом: **6 277 тестов, 0 failures, 0 errors, 0 skips** на коде `05b7249`; source-only регрессии — 17 PASS. Полный публичный CI и точный опубликованный SHA сверяются в PR #1.
 
-| Ссылка | Значение |
-| --- | --- |
-| Рабочая ветка | `offline-completion-20261020` @ `22ae986e017c5b08def9d372a7dd121dd643b433` |
-| Draft PR | [#1 `WIP: native offline port checkpoint and handoff`](https://github.com/gon7187/techstream/pull/1), base `main`, state open / draft |
-| CI | `39578961837` (push) и `39578971424` (PR) на `22ae986`: `static`, `desktop`, `core (3.11)`, `core (3.13)`, `public checkout and root gate` — все PASS |
-| Измеренный публичный прогон | 6 253 теста, 0 failures, 0 errors, 626 skipped; все 626 skip — явные private-evidence причины, не замаскированные сбои |
-| Локальные проверки | Ruff, format (294 файла), ShellCheck, offline workflows, `desktop-smoke.sh normal`, `desktop-smoke.sh compact` — PASS |
+Повторное ревью выявило два реальных сбоя с доступным частным корпусом, несмотря на зелёный публичный CI: преждевременный сброс состояния после `PrepareRetry` и отсутствие публикации callback24 в канонический ED0C gateway-кэш. Дополнительно исправлены пересекающиеся владельцы авторской utility-фикстуры и слишком широкий private-only skip guard. Проверки и границы этого исправления приведены в [verification](verification.md#контрольная-точка-22-октября-2026).
 
-Исходный план находится локально в `.unlazy/no-car-final-20261020/PLAN.md`, revision 48: **153 листа и шесть открытых корневых гейтов G1–G6**. Этот локальный план и материалы `analysis/`, `runtime/`, `.unlazy/` — частные исследовательские данные, не часть публичного руководства. Листовые handoff-файлы в `analysis/evidence/no-car-*/HANDOFF-20261021.md` также **локальные частные свидетельства**, а не публичные документы проекта. Использовать их можно только как необязательные локальные указатели при продолжении; публичная сборка и тесты не должны от них зависеть. В текущей среде `.unlazy/`, `analysis/` и `runtime/` **отсутствуют**, поэтому листовые handoff-файлы недоступны: точный список файлов по листьям 6/14/25/41/143 ниже — публичная оценка по карте реализации, а не подтверждённый приватный план. При расхождении опираться на самый свежий точный снимок и явно оставлять конфликт на сверку.
+Исходный локальный план `.unlazy/no-car-final-20261020/PLAN.md` содержит **153 листа и шесть открытых корневых гейтов G1–G6**. Он и материалы `analysis/`, `runtime/`, `.unlazy/` — частные исследовательские данные, отсутствующие в публичном checkout. Доступный локальный корпус использован для проверки этой контрольной точки, но не публикуется и не требуется для публичной сборки. Зелёный частный прогон не закрывает непроверенные native-семейства или целиком старый план.
 
 ## Что подтверждено, а что нет
 
@@ -38,7 +32,7 @@
 - **Явные private-evidence skip** — `tests/private_evidence.py` вместо `FileNotFoundError`; приватный путь даёт `SkipTest` с точной причиной, публичный путь отвергается.
 - **DCM free-spin листа 3** — `_paced_native_sleep` добирает реальные 120 мс через stop-event; регрессия ограничивает шаги на virtual-clock host.
 - **normal/compact GTK** — `scripts/desktop-smoke.sh normal|compact` и `techstream.py --smoke-compact`; оба варианта в CI.
-- **DCM45/BSM27 в настоящем GTK-диалоге** — успех, native-предупреждение 2005, отмена с присоединением рабочего потока, повтор и отказ зонда BSM27; фикстура `scripts/utility_authored.py` с доказательством `tests/test_utility_authored.py`.
+- **DCM45/BSM27 в настоящем GTK-диалоге** — успех, native-предупреждение 2005, отмена с присоединением рабочего потока, новый запуск с отдельной фикстурой и отказ зонда BSM27; фикстура `scripts/utility_authored.py` с доказательством `tests/test_utility_authored.py`.
 - **CI-гейт `public-root`** — свежий checkout под root без приватного корпуса, запрет публикации приватных путей, полный suite и offline workflows.
 
 ## Как проверить с чистого checkout
@@ -46,22 +40,25 @@
 ```sh
 git clone https://github.com/gon7187/techstream.git
 cd techstream
-git checkout offline-completion-20261020
-python3 -m unittest discover -s tests          # 6253 tests, 0 failures, 0 errors, 626 skipped
+git checkout main
+python3 -m unittest discover -s tests
 python3 -m scripts.offline_verify workflows     # OFFLINE_WORKFLOWS_PASSED
 sh scripts/desktop-smoke.sh normal              # GTK smoke, широкий layout
 sh scripts/desktop-smoke.sh compact             # GTK smoke, свёрнутый layout
 ```
 
-Приватный корпус не нужен: тесты, которым он необходим, дают явный `SkipTest` с точным путём. Полные CI-прогоны: https://github.com/gon7187/techstream/actions/runs/39578961837
+Приватный корпус не нужен: тесты, которым он необходим, дают явный `SkipTest` с точным путём. Helper разрешает только канонические частные корни внутри checkout, а публичные пути и выходы через symlink отвергает. Точные результаты текущего снимка — в [verification](verification.md#контрольная-точка-22-октября-2026).
 
 ## Известные красные и открытые места
 
-Красных публичных тестов сейчас нет: **6 253 теста, 0 failures, 0 errors**, Ruff и ShellCheck чистые, оба GTK-варианта и offline workflows проходят. Исторический снимок на паузе (6 232 теста, 8 failures, 35 errors, шесть B023) относится к состоянию до возобновления работы и приведён в [результатах проверки](verification.md#измеренный-локальный-снимок-21-октября-2026) как история, а не как текущий дефект. Актуальные handoff фиксируют следующие ограничения:
+Исправленные дефекты и открытая полнота разделены:
 
-- **Лист 153:** независимо воспроизведены три дефекта жизненного цикла: ошибка `Thread.start()` у выбранного P5 worker оставляет активного владельца с незапущенным потоком; конкурентные алиасы могут создать двух владельцев и две блокировки для одного native manager в кэше листа 108; отмена CMN может затереть более новый общий статус таймера устаревшим снимком при входе. Итоговый oracle из 12 проверок целиком не запускался; две последние проверки написаны, но не выполнены. Гипотеза о статусе 15 явно отозвана — не возвращать её в список дефектов.
-- **Лист 134:** публичная фикстура создавала producer через частный issuer, а guard ED0C требует экземпляр, выданный самим engine. Фикстура исправлена на `engine.bind_gateway_startup()`; без приватного `CUW.dll` её 55 тестов локально пропускаются, поэтому приватный повтор и независимое принятие остаются открытыми.
-- **Листы 114, 31, 151:** канонический кэш ED0C и состояние callback/reissue не сведены. Публичный `ControlCommPhase2026.execute` и связка пула с getter/fallback реализованы; полный source-issued execute/context oracle, native multi-row cardinality и независимый consumer review остаются открытыми.
+- **Retry:** успешный `PrepareRetry` очищает primary/passthru ошибки, сохраняя failed/context/error-kind/notifications для confirmation/IsFinish; успешный finish очищает своё состояние отдельно. Исходный результат writer не повышается до успеха.
+- **Gateway:** callback24 публикует проверенное значение в принадлежащий engine канонический ED0C-кэш; callback25 читает его. Кэш переживает смену worker, а локальные callback-поля остаются локальными. Это узкое соединение, не полное принятие листов 114/31/151.
+- **Authored fixture:** второй активный владелец отвергается до изменения общих реестров; исключение конструктора и повторный close восстанавливают предыдущие значения.
+- **Листы 153/108:** lifecycle/publication-регрессии исправлены; полный исходный oracle и независимое принятие всего семейства остаются отдельными гейтами. Отозванная гипотеза про статус 15 не возвращается в дефекты.
+- **Лист 134:** producer создаётся через `engine.bind_gateway_startup()`; узкий callback24/25 join исправлен, но это не принятие всей startup/reissue хронологии.
+- **Листы 31/151:** публичный one-phase Execute и выбранный pool/getter/fallback реализованы. Полный source-issued execute/context, native multi-row cardinality и поведение ImportData/ExportData при исключении пока не приняты.
 - **Лист 51:** финальная обычная retry-ветка имеет узкое независимое принятие. Публичный мост 145→51 существует: `execute` вызывает `retry_failed_write`, `query_control_error` публикует `dispatch_retry_callback`, а `_run_outer` выполняет `callback3` под `thread_callback_execution`. Добавлен публичный компонентный `EngineThreadRetryBridgeTests`: он прогоняет реальный `_run_outer`, проверяет успешный callback на outer-потоке, возврат ошибки в child и отказ не-child publisher. Независимое thread-job-level принятие на приватном контракте остаётся отдельным приоритетом.
 - **Лист 49:** проверки владельца для native12 есть. Независимый reviewer оставил одну ошибку harness в ожидании числа обменов с общим кэшем; итоговый путь листа 105 после исправления отдельно не перепроверен. Независимое принятие остаётся открытым.
 - **Лист 83:** scoped SIS/JSON/P6 и ограниченные dispatcher-когорты проверены, но сохранённый итоговый verdict предшествует обновлённому SMRT55 receipt и имеет статус HOLD. Нужна сверка с текущим receipt. Это не закрывает всё семейство UtilityEx.
@@ -77,7 +74,7 @@ sh scripts/desktop-smoke.sh compact             # GTK smoke, свёрнутый 
 | --- | --- | --- | --- | --- |
 | 31/151 | source-issued execute/context oracle, native multi-row cardinality, независимый consumer review | `scripts/programming_2026_common.py`, `scripts/cuw_engine_threads.py`, `scripts/cuw_2026.py` | `tests/test_programming_2026_common.py`, `tests/test_cuw_engine_threads.py`, `tests/test_cuw_2026.py` | приватный `analysis/evidence/no-car-*`, `artifacts/extracted/*` |
 | 145→51 | thread-job-level принятие моста | `scripts/cuw_engine_threads.py`, `scripts/programming_2026_common.py` | `tests/test_cuw_engine_threads.py` | зафиксированный приватный контракт |
-| 114/134 | ED0C join и приватный повтор 55 gateway-тестов | `scripts/cuw_gateway_startup.py`, `scripts/cuw_2026.py` | `tests/test_cuw_gateway_startup.py` | приватный `runtime/no-car-21/recovered/CUW.dll` |
+| 114/134 | полное source/consumer-принятие startup/reissue; callback24→ED0C→callback25 исправлен | `scripts/cuw_gateway_startup.py`, `scripts/cuw_2026.py` | `tests/test_cuw_gateway_startup.py` | приватный `runtime/no-car-21/recovered/CUW.dll` |
 | Consolidated bridge | подключить `ConsolidatedExecute2026` к worker/runtime, сохранить владельцев, scratch buffers и порядок callback | `scripts/programming_2026_consolidated.py`, `scripts/cuw_engine_threads.py`, `scripts/cuw_engine_worker.py`, `scripts/cuw_2026.py` | `tests/test_programming_2026_consolidated.py` | source-issued ownership/container contract для `TCUWLegacyCIDGettersAndFlashWriters.dll` |
 | 153/108 | original-image oracle и независимый review | `scripts/utility_ex_lifecycle.py`, `scripts/cuw_2026.py` | `tests/test_utility_ex_lifecycle.py`, `tests/test_cuw_2026.py` | приватные OEM-образы и отдельный reviewer |
 | 49/105/83 | DDR/native12 и SMRT55 receipt | `scripts/database_resources.py`, `scripts/toyota_saved_ffd.py`, `scripts/utility_ex_comm.py`, `scripts/utility_ex_lifecycle.py` | `tests/test_database_resources.py`, `tests/test_toyota_saved_ffd.py`, `tests/test_utility_ex_comm.py`, `tests/test_utility_ex_lifecycle.py` | актуальный приватный снимок/receipt и независимая перепроверка |
@@ -97,7 +94,7 @@ sh scripts/desktop-smoke.sh compact             # GTK smoke, свёрнутый 
 ## Порядок продолжения
 
 1. Прочитать этот документ и `graphify-out/GRAPH_REPORT.md`, затем локальный `.unlazy/no-car-final-20261020/HANDOFF.md`, `PLAN.md`, `CONTACTS.md`, `GATES.md`, `JVM.md` и нужные листовые handoff. Граф помогает навигации, но не подтверждает эквивалентность native-поведению. Если приватные каталоги отсутствуют, продолжать можно только по публичной части: всё приватно-зависимое честно остаётся открытым.
-2. Выполнить свежий Git-аудит: fetch/prune канонического remote, проверить ветку, upstream, статус, worktree и расхождение с `origin/main`. Ориентир текущей точки — `offline-completion-20261020` @ `22ae986`, PR #1 draft, CI `39578961837`/`39578971424` PASS. До правок определить владельцев всех изменённых и новых файлов.
+2. Выполнить свежий Git-аудит: fetch/prune канонического remote, проверить ветку, upstream, статус, worktree и расхождение с `origin/main`. Точные SHA, статус PR #1 и CI брать из свежего GitHub/Git-снимка; статусы draft и старые CI из истории ниже не являются текущими. До правок определить владельцев всех изменённых и новых файлов.
 3. Сверить актуальные leases, исходники и тесты с их точными pins; не обновлять хеши пакетом.
 4. **Закрыто.** Разобраны три независимых дефекта листа 153 и исправлена публикация владельца/кэша листа 108; отозванная гипотеза про статус 15 сохранена как опровергнутая.
 5. Довести полный execute/context листа 31 и параметрический пул 151 до реального source-issued контекста и фактического потребителя. Публичный one-phase execute/context и pool consumer уже реализованы; остаются source-issued oracle, native multi-row cardinality и независимый review.
@@ -113,7 +110,7 @@ sh scripts/desktop-smoke.sh compact             # GTK smoke, свёрнутый 
 
 Для установки и запуска см. [Начало работы](getting-started.md). Границы архитектуры и доказательств описаны в [Архитектуре](architecture.md) и [Матрице реализации](full-port.md).
 
-## Продолжение 2026-10-21
+## История: продолжение 2026-10-21
 
 Работа возобновлена с публичного снимка ветки `offline-completion-20261020` после слияния PR #3. Закрыт первый пункт порядка продолжения — три lifecycle-дефекта и публикация владельца/кэша:
 
@@ -145,11 +142,11 @@ sh scripts/desktop-smoke.sh compact             # GTK smoke, свёрнутый 
 
 - `scripts/desktop-smoke.sh` получил варианты `normal|compact`. `normal` поднимает Xvfb 1600×1200 и рендерит широкий layout; `compact` — 1024×768 и выполняет тот же поток в свёрнутом layout, дополнительно проверяя сработавший breakpoint, свёрнутый split и кнопку меню. Неизвестный вариант отвергается кодом 2 до касания рабочего стола; `tests/test_desktop_smoke.py` фиксирует оба набора аргументов и отказ по usage.
 - `techstream.py --smoke-compact` (только вместе с `--smoke-test`) задаёт окно 900×700; обычный запуск сохраняет прежние 1340×820.
-- Новый публичный модуль `scripts/utility_authored.py` собирает настоящие `NativeUtilityRuntime`, `NativeDCM45Runtime` и `NativeBSMRuntime` по авторским байтам и внедрённому провайдеру. Фикстура намеренно обходит проверку source-issued пары caller/engine, поэтому `scripts.utility.open_native_utility` сохраняет эту проверку, а `tests/test_utility_authored.py` отдельно доказывает, что авторская пара не проходит production-путь. Прежняя фикстура `tests/test_utility.py` теперь делегирует общему модулю, чтобы логика жила в одном месте.
+- Новый публичный модуль `scripts/utility_authored.py` собирает `NativeUtilityRuntime` по авторским байтам и внедрённому провайдеру. Для зонда BSM27 smoke в `techstream.py` создаёт `NativeBSMRuntime` поверх библиотек этой фикстуры. Фикстура намеренно обходит проверку source-issued пары caller/engine, поэтому `scripts.utility.open_native_utility` сохраняет эту проверку, а `tests/test_utility_authored.py` отдельно доказывает, что авторская пара не проходит production-путь. Прежняя фикстура `tests/test_utility.py` теперь делегирует общему модулю, чтобы логика жила в одном месте.
 - `scripts/text_resources.create_utility_group_text_examples` публикует авторские подписи выбранной native-группы и общей группы 20000; `create_utility_text_examples` сохранён без изменения поведения.
-- Smoke прогоняет через настоящий GTK-диалог: успешный бизнес-этап DCM45 (исходный результат 0, блок 0x13724, вывод получателя), native-предупреждение 2005 (экран 0x948c/0x9492), отмену с присоединением рабочего потока, повтор того же контроллера и отказ зонда BSM27 (исходный результат 99, общий экран ошибки).
+- Smoke прогоняет через настоящий GTK-диалог: успешный бизнес-этап DCM45 (исходный результат 0, блок 0x13724, вывод получателя), native-предупреждение 2005 (экран 0x948c/0x9492), отмену с присоединением рабочего потока, отдельный повторный запуск с новой фикстурой и отказ зонда BSM27 (исходный результат 99, общий экран ошибки).
 - CI получил job `public-root`: свежий checkout в контейнере `python:3.12-slim` под root без приватного корпуса, запрет публикации `analysis/`, `artifacts/`, `.unlazy/` и `runtime/no-car-*`, полный прогон тестов и offline workflows. Job `desktop` теперь запускает и `normal`, и `compact`.
 
 Проверка: **6 253 теста, 0 failures, 0 errors, 626 skipped**; Ruff, format (294 файла), ShellCheck, offline workflows, `desktop-smoke.sh normal` и `desktop-smoke.sh compact` — PASS локально на Python 3.14.8. CI `39578033940` на `ec9db8d`: `static`, `desktop`, `core (3.11)`, `core (3.13)` и `public checkout and root gate` — PASS; оба core-прогона — 6 252 теста, 0 failures, 0 errors, 626 skipped (последующий коммит добавляет один авторский тест фикстуры). Первый вариант job `public-root` на контейнере `ubuntu:24.04` падал на `actions/checkout@v4` из-за отсутствующего CA-хранилища; контейнер заменён на `python:3.12-slim` с установленным `ca-certificates`, и гейт проходит.
 
-Границы: это публичный контракт — настоящий диалог, настоящий контроллер, настоящий рабочий поток и авторский провайдер. CGW-prelude DCM45, raw-SDK хронология, полный цикл записи BSM27, исходный oracle листов 31/151/153/108, route-gates 58/68/69/71 и все листовые сценарии 6/14/25/41/143 остаются открытыми: им нужен приватный корпус или точная leaf-спецификация, которой в этой среде нет. Локальные `.unlazy/`, `analysis/` и `runtime/` по-прежнему отсутствуют, поэтому листовые handoff-файлы недоступны и точный список файлов для листов 6/14/25/41/143 остаётся публичной оценкой, а не подтверждённым планом.
+Границы: это публичный контракт — настоящий диалог, настоящий контроллер, настоящий рабочий поток и авторский провайдер. Выделенный `NativeDCM45Runtime`/CGW-prelude, повтор в том же контексте контроллера, raw-SDK хронология, полный цикл записи BSM27, исходный oracle листов 31/151/153/108, route-gates 58/68/69/71 и все листовые сценарии 6/14/25/41/143 остаются открытыми: им требуются точная leaf-спецификация и отдельное source/consumer-принятие. В публичном checkout нет локальных `.unlazy/`, `analysis/` и `runtime/`; для восстановления оставшегося объёма нужны точная листовая спецификация и отдельное source/consumer-принятие.
