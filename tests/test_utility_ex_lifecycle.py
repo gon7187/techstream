@@ -2235,5 +2235,102 @@ class LifecycleHardeningTests(unittest.TestCase):
         self.assertEqual(context.state[f"native_global:{worker.native_result:x}"], 0)
 
 
+class ResumedLifecycleRegressionTests(unittest.TestCase):
+    def test_cmn_cancel_does_not_republish_status_snapshot(self):
+        for source in (SHA_12_NK, SHA_18_NK, SHA_DS4_NK, SHA_PLUS_NK):
+            for custom in (False, True):
+                with self.subTest(source=source[:12], custom=custom):
+                    fixture = LifecycleTest()
+                    _manager, context, _calls = fixture.fixture(
+                        [b"\x61\x00"], source=source, address=_FIXED_OBJECTS[source]
+                    )
+                    comm = fixture.selected_facade(context)
+                    self.assertEqual(comm.initialize(), 0)
+                    timer = UtilityExSelectedTimerKeepalive(context, comm)
+                    status_key = f"native_global:{timer.layout['status']:x}"
+                    timer.native_status = 77
+
+                    class InterleavedState(dict):
+                        def __init__(self, values, key, owner):
+                            super().__init__(values)
+                            self.key = key
+                            self.owner = owner
+                            self.publication_writes = []
+                            self.status_reads = 0
+
+                        def get(self, key, default=None):
+                            value = super().get(key, default)
+                            if key == self.key:
+                                self.status_reads += 1
+                                if self.status_reads == 2:
+                                    # The old exit read races with this real timer
+                                    # publication and then writes its stale value.
+                                    self.owner.native_status = 88
+                            return value
+
+                        def __setitem__(self, key, value):
+                            if key == self.key:
+                                self.publication_writes.append(value)
+                            super().__setitem__(key, value)
+
+                    state = InterleavedState(context.state, status_key, timer)
+                    context.state = state
+                    exchange = comm.exchange
+
+                    def exchange_then_cancel(
+                        request, exchange=exchange, context=context
+                    ):
+                        result = exchange(request)
+                        context.cancelled = True
+                        return result
+
+                    comm.exchange = exchange_then_cancel
+                    worker = UtilityExSelectedCMNWorker(context, comm)
+                    if custom:
+                        result = worker.run(
+                            UtilityExSelectedCMNFields(0, b"\x21\x00", 2)
+                        )
+                    else:
+                        result = worker.run(0)
+                    if dict.get(state, status_key) != 88:
+                        timer.native_status = 88
+                    self.assertEqual(result, 0)
+                    self.assertEqual(dict.get(state, status_key), 88)
+                    self.assertEqual(state.publication_writes, [88])
+                    comm.finalize()
+
+    def test_cmn_stop_on_error_publishes_error_equal_to_entry_status(self):
+        for source in (SHA_12_NK, SHA_18_NK, SHA_DS4_NK, SHA_PLUS_NK):
+            for custom in (False, True):
+                with self.subTest(source=source[:12], custom=custom):
+                    fixture = LifecycleTest()
+                    _manager, context, _calls = fixture.fixture(
+                        [b"\x61\xff"], source=source, address=_FIXED_OBJECTS[source]
+                    )
+                    comm = fixture.selected_facade(context)
+                    self.assertEqual(comm.initialize(), 0)
+                    timer = UtilityExSelectedTimerKeepalive(context, comm)
+                    status_key = f"native_global:{timer.layout['status']:x}"
+                    timer.native_status = 3
+                    exchange = comm.exchange
+
+                    def exchange_then_publish(request, exchange=exchange, timer=timer):
+                        result = exchange(request)
+                        timer.native_status = 88
+                        return result
+
+                    comm.exchange = exchange_then_publish
+                    worker = UtilityExSelectedCMNWorker(context, comm)
+                    if custom:
+                        result = worker.run(
+                            UtilityExSelectedCMNFields(0, b"\x21\x00", 2, 0, 1)
+                        )
+                    else:
+                        result = worker.run(0, stop_on_error=True)
+                    self.assertEqual(result, 3)
+                    self.assertEqual(context.state[status_key], 3)
+                    comm.finalize()
+
+
 if __name__ == "__main__":
     unittest.main()

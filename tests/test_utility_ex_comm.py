@@ -3722,5 +3722,138 @@ class PublicationOwnerTests(unittest.TestCase):
             )
 
 
+class ResumedLifecycleOwnershipTests(unittest.TestCase):
+    def aliases(self):
+        from tests.test_utility_ex_lifecycle import LifecycleTest
+
+        fixture = LifecycleTest()
+        manager, context, _ = fixture.fixture(source=SHA_18_NK, address=0x1014F5E0)
+        self.addCleanup(fixture.doCleanups)
+        context.module_bytes = b"synthetic source identity for lifecycle ownership"
+        with patch(
+            "scripts.utility_ex_comm.hashlib.sha256",
+            return_value=SimpleNamespace(hexdigest=lambda: SHA_18_NK),
+        ):
+            first = UtilityExComm(context, "native:1014f5e0")
+            second = UtilityExComm(context, "native:1014f5e0")
+        return manager, context, first, second
+
+    def test_concurrent_aliases_publish_one_lifecycle_and_share_fields(self):
+        from scripts import utility_ex_comm as comm_module
+        from scripts.utility_ex_lifecycle import UtilityExFixedLifecycle
+
+        _, context, first, second = self.aliases()
+        entered = threading.Event()
+        contender_observed = threading.Event()
+        release = threading.Event()
+        start_barrier = threading.Barrier(3)
+        original_init = UtilityExFixedLifecycle.__init__
+        constructions = []
+        contender_path = []
+
+        class ObservedRLock:
+            def __init__(self):
+                self.lock = threading.RLock()
+
+            def __enter__(self):
+                if threading.current_thread().name == "alias-two":
+                    contender_path.append("publication lock")
+                    contender_observed.set()
+                self.lock.acquire()
+                return self
+
+            def __exit__(self, *exc):
+                self.lock.release()
+
+        def paused_init(instance, *args, **kwargs):
+            constructions.append(instance)
+            if len(constructions) > 1:
+                contender_path.append("second constructor")
+                contender_observed.set()
+            entered.set()
+            self.assertTrue(release.wait(2))
+            original_init(instance, *args, **kwargs)
+
+        outcomes = []
+
+        def initialize(alias):
+            start_barrier.wait()
+            if alias is second:
+                self.assertTrue(entered.wait(2))
+            outcomes.append(alias.initialize())
+
+        with (
+            patch.object(UtilityExFixedLifecycle, "__init__", paused_init),
+            patch.object(comm_module, "_PUBLICATION_LOCK", ObservedRLock()),
+        ):
+            threads = [
+                threading.Thread(target=initialize, args=(first,), name="alias-one"),
+                threading.Thread(target=initialize, args=(second,), name="alias-two"),
+            ]
+            for thread in threads:
+                thread.start()
+            start_barrier.wait()
+            self.assertTrue(entered.wait(2))
+            self.assertTrue(contender_observed.wait(2))
+            release.set()
+            for thread in threads:
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+
+        self.assertEqual(outcomes, [0, 0])
+        self.assertEqual(contender_path, ["publication lock"])
+        self.assertEqual(len(constructions), 1)
+        first_owner = first._fixed_lifecycle()
+        second_owner = second._fixed_lifecycle()
+        self.assertIs(first_owner, second_owner)
+        self.assertIs(first_owner.fields, second_owner.fields)
+        self.assertIs(first_owner.fields, first._fields)
+        self.assertIs(first_owner.fields, second._fields)
+        self.assertIs(
+            context.state[f"utility_ex:fixed_lifecycle:{SHA_18_NK}:1014f5e0"],
+            first_owner,
+        )
+
+    def test_prepublished_owner_is_reused_by_alias(self):
+        _, _, first, second = self.aliases()
+        self.assertEqual(first.initialize(), 0)
+        owner = first._fixed_lifecycle()
+        self.assertEqual(second.initialize(), 0)
+        self.assertIs(second._fixed_lifecycle(), owner)
+
+    def test_foreign_context_owner_is_rejected_and_retained(self):
+        _, context, first, _ = self.aliases()
+        key = f"utility_ex:fixed_lifecycle:{SHA_18_NK}:1014f5e0"
+        foreign = cast(CommContext, SimpleNamespace())
+        from scripts.utility_ex_lifecycle import UtilityExFixedLifecycle
+
+        owner = object.__new__(UtilityExFixedLifecycle)
+        owner.context = foreign
+        context.state[key] = owner
+        with self.assertRaises(UtilityExSourceError):
+            first._fixed_lifecycle(create=True)
+        self.assertIs(context.state[key], owner)
+
+    def test_constructor_failure_preserves_identity_and_allows_retry(self):
+        from scripts.utility_ex_lifecycle import UtilityExFixedLifecycle
+
+        _, context, first, second = self.aliases()
+        fault = RuntimeError("lifecycle constructor fault")
+
+        def fail_once(instance, *args, **kwargs):
+            raise fault
+
+        with (
+            patch.object(UtilityExFixedLifecycle, "__init__", fail_once),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            first.initialize()
+        self.assertIs(caught.exception, fault)
+        key = f"utility_ex:fixed_lifecycle:{SHA_18_NK}:1014f5e0"
+        self.assertNotIn(key, context.state)
+        self.assertEqual(second.initialize(), 0)
+        self.assertIs(context.state[key], second._fixed_lifecycle())
+
+
 if __name__ == "__main__":
     unittest.main()

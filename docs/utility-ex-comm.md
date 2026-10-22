@@ -67,6 +67,10 @@ Implemented components in `scripts/utility_ex_comm.py`:
   Actual original-context traces verify7df transmission and7e8 reception across
   all eight HS/MS paths. Plus MS filters preserve literal+8 while HS uses+16 in
   mode74; source12 packers preserve literal1020.
+- Fixed manager lifecycle construction and publication share the same context
+  publication lock as pool creation. Concurrent aliases of one source/address
+  receive one lifecycle owner and its shared fields; foreign-context entries are
+  rejected, and a constructor exception leaves the key available for retry.
 - Plus P6 managers101c6da0/1013e7d0 use separate fields, shifted DRIVER
   bindings, one shared four-slot pool across independent6/8012 factories, a
   CAN29/CANFD lower and owner132's separate outer/worker lifecycle. Actual

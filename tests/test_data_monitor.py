@@ -3360,5 +3360,809 @@ class SelectedLegacyRuntimeTests(unittest.TestCase):
             self.assertEqual(backend.calls, [])
 
 
+def run_selected_variable_single(
+    *,
+    failure=False,
+    cancel=False,
+    connected_device=8,
+    build=18,
+    duplicate=False,
+    null_controller=False,
+):
+    import struct
+    import tempfile
+    from dataclasses import replace
+    from pathlib import Path
+
+    from scripts.data_monitor import (
+        MonitorError,
+        SelectedMonitorSession,
+        selected_legacy_check_target,
+        selected_variable_monitor_runtime,
+    )
+    from scripts.diagnostic_db import Section
+    from scripts.drive_recorder import (
+        DMCI_WIRE_COMMANDS,
+        NativeCoreBuffer,
+        NativeDmciCommand,
+        NativeDmciList,
+        NativeMonitorReply,
+        NativeVimClient,
+        NativeVimReply,
+        RecorderCancelled,
+        decode_vim_command,
+    )
+    from scripts.frame_transport import DriverProperties, J2534Result, NativeMessage
+    from scripts.monitor_j2534 import DirectJ2534Worker
+    from scripts.native_communication import NativeCommunication, NativeFrameController
+    from scripts.profiles import ProtocolProfile
+    from scripts.snapshot import (
+        MonitorBuffer,
+        decode_monitor_buffer,
+        encode_monitor_buffer,
+        monitor_samples,
+    )
+    from scripts.toyota import VariableTable
+    from scripts.toyota_session import Cancelled, Limits
+    from tests.test_monitor_variable import authored_profile
+
+    with tempfile.TemporaryDirectory() as directory:
+        profile = authored_profile(Path(directory) / "selected")
+        database = profile.catalog.management
+        table = VariableTable(database.sections[0].payload, database.sections[0].count)
+        values = [table.get(i) for i in (1, 2)] + [b"\x10\x01", b"\x3e"]
+        offset, directory_bytes = 0, b""
+        for value in values:
+            directory_bytes += struct.pack("<IH", offset, len(value))
+            offset += len(value)
+        sections = dict(database.sections)
+        sections[0] = Section(0, 0, 4, False, directory_bytes + b"".join(values))
+        sections[17] = replace(
+            sections[17],
+            count=4,
+            payload=sections[17].payload + struct.pack("<8H", 11, 3, 0, 0, 12, 4, 0, 0),
+        )
+        sections[18] = replace(
+            sections[18],
+            count=3,
+            payload=sections[18].payload
+            + struct.pack(
+                "<16H", 1, 0x67, 0, 11, 0, 0, 0, 0, 1, 0x7F, 0, 12, 0, 0, 0, 0
+            ),
+        )
+        if build == 12:
+            protocol = sections[13].payload
+            sections[13] = replace(
+                sections[13], payload=protocol[:22] + bytes((protocol[24], 0))
+            )
+        if null_controller:
+            for slot, width, key_offset in (
+                (13, 24 if build == 12 else 28, 0),
+                (16, 76, 68),
+                (18, 16, 0),
+            ):
+                original = sections[slot]
+                appended = []
+                for offset in range(0, len(original.payload), width):
+                    row = bytearray(original.payload[offset : offset + width])
+                    struct.pack_into("<H", row, key_offset, 2)
+                    appended.append(bytes(row))
+                sections[slot] = replace(
+                    original,
+                    count=original.count * 2,
+                    payload=original.payload + b"".join(appended),
+                )
+        profile.catalog.management = replace(
+            database,
+            sections=sections,
+            version=0x0100030C if build == 12 else 0x0100032F,
+        )
+
+        class Backend:
+            def __init__(self):
+                self.request = b""
+                self.reads = 0
+                self.calls = []
+
+            def invoke(self, operation, fields, *, deadline, cancelled):
+                self.calls.append(operation)
+                if operation == "connect":
+                    return J2534Result(handle=7)
+                if operation == "start_message_filter":
+                    return J2534Result(handle=100 + len(self.calls))
+                if operation == "write_messages":
+                    self.request = fields["messages"][0].data[4:]
+                    self.reads = 0
+                    return J2534Result(count=1)
+                if operation == "read_messages":
+                    self.reads += 1
+                    if self.request == b"\x13":
+                        if self.reads > 1:
+                            return J2534Result(code=9)
+                        payload = b"\x53\0\11\2\x80\x80"
+                    elif self.request == b"\x21\x09":
+                        if failure:
+                            return J2534Result(code=7)
+                        payload = b"\x61\x09AB"
+                    else:
+                        payload = bytes((self.request[0] | 0x40,)) + self.request[1:]
+                    return J2534Result(
+                        count=1,
+                        messages=(
+                            NativeMessage(
+                                6, 0, 0, 1234000, 0, b"\x00\x00\x07\xe8" + payload
+                            ),
+                        ),
+                    )
+                return J2534Result()
+
+        backend = Backend()
+        cancelled_state = [False]
+        communication = NativeCommunication.from_backend(
+            profile,
+            backend,
+            "variable",
+            first_request=b"\x13",
+            driver=DriverProperties(0, b"04.04", "authored"),
+            device_kind=connected_device,
+            bus_id=0x12,
+            source_build=build,
+            clock=lambda: 0,
+            cancelled=lambda: cancelled_state[0],
+        )
+        assert isinstance(communication.operations, NativeFrameController)
+        lower = communication.operations.operations
+        observed = {
+            key: key == 12 for key in (22, 10, 8, 9, 12, 25, 11, 26, 29, 27, 28, 35)
+        }
+        target = selected_legacy_check_target(communication, (4,), observed)
+        controller_communication = None
+        if null_controller:
+            category = bytearray(profile.category_record)
+            struct.pack_into("<H", category, 68, 2)
+            controller_profile = ProtocolProfile(
+                profile.catalog,
+                bytes(category),
+                profile.exception_ids,
+                profile.vehicle_name_key,
+            )
+            assert controller_profile.ecu_database_sha256 is None
+            controller_communication = NativeCommunication.from_backend(
+                controller_profile,
+                backend,
+                "controller",
+                first_request=b"\x13",
+                driver=lower.driver,
+                device_kind=connected_device,
+                bus_id=0x12,
+                source_build=build,
+                clock=lambda: 0,
+            )
+        session = SelectedMonitorSession(
+            profile, source_build=build, shared_interface=0
+        )
+        wire_calls = []
+
+        def dmci_exchange(request, *, deadline, cancelled):
+            wire, body = decode_vim_command(request)
+            wire_calls.append(wire)
+            if wire == DMCI_WIRE_COMMANDS[0x10D]:
+                assert (
+                    body
+                    == NativeDmciCommand(
+                        0x10D, (NativeDmciList((1, 0), ((profile.category,),)),)
+                    ).encode()
+                )
+                empty = NativeCoreBuffer((1, 0), b"")
+                payload = NativeMonitorReply(
+                    0,
+                    NativeDmciList(
+                        (1, 0),
+                        (
+                            (
+                                profile.category,
+                                NativeCoreBuffer((1, 0), struct.pack("<I", 9) + b"AB"),
+                            ),
+                        ),
+                    ),
+                    (
+                        empty,
+                        NativeCoreBuffer(
+                            (1, 0), struct.pack("<IIIB", 0x7E0, 0x123, 0xE0000103, 0)
+                        )
+                        if failure
+                        else empty,
+                        empty,
+                        empty,
+                        empty,
+                    ),
+                    0,
+                ).encode()
+            else:
+                payload = bytes(4)
+            return NativeVimReply(wire | 0x80, 6, payload).encode()
+
+        client = NativeVimClient(
+            dmci_exchange,
+            capabilities=frozenset({"denso-vim-control", "denso-vim-dmci"}),
+        )
+        try:
+            runtime = selected_variable_monitor_runtime(
+                (target, target) if duplicate else (target,),
+                client if connected_device == 4 else lower,
+                connected_device=connected_device,
+                command_kind=0x42 if duplicate or null_controller else 7,
+                command_ecu=2 if null_controller else 1,
+                controller_communication=controller_communication,
+                allocation=4096,
+                standard_values=((), ()) if duplicate else ((),),
+                names=(b"overwritten", b"variable") if duplicate else (b"variable",),
+                text_encoding="utf-8",
+                phase=0,
+                clock=lambda: 0,
+                ticks=lambda: 1234,
+                limits=Limits(exchanges=256),
+                cancelled=lambda: cancelled_state[0],
+                monitor_session=session,
+            )
+        except MonitorError as error:
+            assert null_controller and connected_device == 8
+            assert error.code == 0xE0000102
+            assert controller_communication is not None
+            assert communication.closed and controller_communication.closed
+            assert lower.channel is None
+            return {
+                "build": build,
+                "connected_device": connected_device,
+                "boundary": "native-null-controller-no-event",
+                "code": error.code,
+            }
+        if null_controller:
+            assert controller_communication is not None
+            assert runtime.native_slot_categories == (2, 1)
+            assert runtime.get_fault(0) == 0
+            assert controller_communication.closed
+        if connected_device == 8:
+            assert isinstance(runtime.worker, DirectJ2534Worker)
+            assert runtime.worker.disable_packet_ecu == session.disable_packet_ecu
+        assert len(runtime.targets) == 1
+        assert runtime.targets[0].buffer.name.data.rstrip(b"\0") == b"variable"
+        assert communication.closed and lower.channel is None
+        cancelled_state[0] = cancel
+        try:
+            try:
+                captures = runtime.run((1,))
+            finally:
+                runtime.close()
+        except (MonitorError, RecorderCancelled, Cancelled) as error:
+            assert failure or cancel
+            assert lower.channel is None
+            assert session.disabled_packet_ecus == ()  # Variable8610 constructs BASE.
+            if cancel:
+                assert isinstance(error, (RecorderCancelled, Cancelled))
+                assert runtime.faults == [0]
+            else:
+                assert isinstance(error, MonitorError) and any(runtime.faults)
+            return {
+                "build": build,
+                "connected_device": connected_device,
+                "boundary": "cancel" if cancel else "native-read-fault",
+                "error": type(error).__name__,
+                "faults": runtime.faults,
+                "calls": backend.calls,
+            }
+        assert not failure and not cancel
+        assert len(captures) == 1 and captures[0].packets[0].payload == b"AB"
+        expected_channels = 1 if connected_device == 4 else 2
+        assert (
+            backend.calls.count("connect")
+            == backend.calls.count("disconnect")
+            == expected_channels
+        )
+        if connected_device == 4:
+            assert DMCI_WIRE_COMMANDS[0x10D] in wire_calls
+            assert DMCI_WIRE_COMMANDS[0x104] in wire_calls
+        metadata = MonitorBuffer(
+            b"variable", bytes(16), b"", b"", b"", b"", 0, (), (4,), b"", ()
+        )
+        saved = captures[0].monitor_buffer(
+            runtime.targets[0].buffer, metadata, phase=0, block_packets=1
+        )
+        saved = decode_monitor_buffer(encode_monitor_buffer(saved))
+        samples = monitor_samples(saved, encoding="utf-8")
+        assert len(samples) == 1
+        return {
+            "build": build,
+            "connected_device": connected_device,
+            "duplicate_registration": duplicate,
+            "calls": backend.calls,
+            "wire_calls": wire_calls,
+            "samples": samples,
+            "physical": "PHYSICAL_UNCONFIRMED",
+        }
+
+
+def run_selected_variable_multi(
+    *,
+    build=18,
+    foreign_context=False,
+    source_changed=False,
+    live_source_channel=False,
+    cancel=False,
+    host_failure=False,
+    native_fault=False,
+    with_voltage=False,
+):
+    """Build authored selected profiles and exercise the real joined factory."""
+    import struct
+    import tempfile
+    from copy import copy
+    from dataclasses import replace
+    from pathlib import Path
+
+    from scripts.data_monitor import (
+        MonitorError,
+        selected_legacy_check_target,
+        selected_variable_monitor_runtime,
+    )
+    from scripts.diagnostic_db import Section
+    from scripts.drive_recorder import (
+        RecorderCancelled,
+    )
+    from scripts.frame_transport import (
+        DriverProperties,
+        J2534Result,
+        NativeFrameOperations,
+        NativeMessage,
+    )
+    from scripts.native_communication import NativeCommunication, NativeFrameController
+    from scripts.snapshot import (
+        MonitorBuffer,
+        decode_monitor_buffer,
+        encode_monitor_buffer,
+        monitor_samples,
+    )
+    from scripts.toyota_session import Cancelled, Limits
+    from tests.test_monitor_variable import authored_profile
+
+    with tempfile.TemporaryDirectory() as directory:
+        base = authored_profile(Path(directory) / "selected")
+        database = base.catalog.management
+        sections = dict(database.sections)
+        values = [b"\2\12\0", b"\x13", b"\x10\x01", b"\x3e"]
+        offset, entries = 0, []
+        for value in values:
+            entries.append(struct.pack("<IH", offset, len(value)))
+            offset += len(value)
+        sections[0] = Section(0, 0, 4, False, b"".join(entries + values))
+        sections[17] = Section(
+            17,
+            0,
+            4,
+            False,
+            struct.pack("<16H", 9, 1, 0, 0, 10, 2, 0, 0, 11, 3, 0, 0, 12, 4, 0, 0),
+        )
+        sections[18] = Section(
+            18,
+            0,
+            3,
+            False,
+            struct.pack("<8H", 1, 0x13, 1, 10, 0, 1, 0, 0)
+            + struct.pack("<8H", 1, 0x67, 1, 11, 0, 0, 0, 0)
+            + struct.pack("<8H", 1, 0x7F, 1, 12, 0, 0, 0, 0),
+        )
+        if build == 12:
+            protocol = sections[13].payload
+            sections[13] = replace(
+                sections[13], payload=protocol[:22] + bytes((protocol[24], 0))
+            )
+        manager = replace(
+            database,
+            sections=sections,
+            version=0x0100030C if build == 12 else 0x0100032F,
+        )
+
+        profiles = []
+        category_ids = (42, 43, 0x68) if with_voltage else (42, 43)
+        for category_id in category_ids:
+            selected_sections = dict(manager.sections)
+            for slot, width, key_offset in (
+                (13, 24 if build == 12 else 28, 0),
+                (16, 76, 68),
+                (18, 16, 0),
+            ):
+                section = selected_sections[slot]
+                payload = bytearray(section.payload)
+                for row_offset in range(0, len(payload), width):
+                    struct.pack_into(
+                        "<H", payload, row_offset + key_offset, category_id
+                    )
+                selected_sections[slot] = replace(section, payload=bytes(payload))
+            catalog = copy(base.catalog)
+            catalog.management = replace(manager, sections=selected_sections)
+            record = bytearray(base.category_record)
+            struct.pack_into("<H", record, 68, category_id)
+            if category_id == 43:
+                record[72] = 6
+            profiles.append(
+                replace(base, catalog=catalog, category_record=bytes(record))
+            )
+
+        class Backend:
+            def __init__(self):
+                self.request = b""
+                self.reads = 0
+                self.calls = []
+                self.events = []
+                self.host_fault = TimeoutError("Injected MultiMon host read timeout")
+
+            def invoke(self, operation, fields, *, deadline, cancelled):
+                self.calls.append(operation)
+                self.events.append((operation, fields))
+                if operation == "connect":
+                    return J2534Result(handle=7)
+                if operation == "start_message_filter":
+                    return J2534Result(handle=100 + len(self.calls))
+                if operation == "write_messages":
+                    self.request = fields["messages"][0].data[4:]
+                    self.reads = 0
+                    return J2534Result(count=1)
+                if operation == "read_messages":
+                    self.reads += 1
+                    if host_failure and self.request == b"\x21\x09":
+                        raise self.host_fault
+                    if native_fault and self.request == b"\x21\x09":
+                        return J2534Result(code=7)
+                    if self.request == b"\x13":
+                        if self.reads > 1:
+                            return J2534Result(code=9)
+                        payload = b"\x53\0\11\2\x80\x80"
+                    elif self.request == b"\x21\x09":
+                        payload = b"\x61\x09AB"
+                    else:
+                        payload = bytes((self.request[0] | 0x40,)) + self.request[1:]
+                    return J2534Result(
+                        count=1,
+                        messages=(
+                            NativeMessage(
+                                6, 0, 0, 1234000, 0, b"\x00\x00\x07\xe8" + payload
+                            ),
+                        ),
+                    )
+                return J2534Result()
+
+        backend = Backend()
+        driver = DriverProperties(0, b"04.04", "authored")
+        communications = tuple(
+            NativeCommunication.from_backend(
+                profile,
+                backend,
+                f"engine{profile.category}",
+                first_request=b"\x13",
+                driver=driver,
+                device_kind=8,
+                bus_id=0x12,
+                source_build=build,
+                clock=lambda: 0,
+            )
+            for profile in profiles
+        )
+        observed = {
+            key: key == 12 for key in (22, 10, 8, 9, 12, 25, 11, 26, 29, 27, 28, 35)
+        }
+        check_targets = tuple(
+            selected_legacy_check_target(communication, (4,), observed)
+            for communication in communications
+        )
+        primary = communications[0]
+        assert isinstance(primary.operations, NativeFrameController)
+        operations = primary.operations.operations
+        cancellation = [False]
+        selected_operations = operations
+        foreign_backend = None
+        live_operations = None
+        if live_source_channel:
+            live_operations = NativeFrameOperations(
+                primary.profile,
+                operations.plan,
+                backend,
+                native_build=cast(Literal[12, 18], build),
+                bus_id=operations.bus_id,
+                driver=operations.driver,
+                device_kind=8,
+                diagnostic_mode=operations.diagnostic_mode,
+                clock=lambda: 0,
+            )
+            assert live_operations.open(deadline=10, setup=False) == 0
+            selected_operations = live_operations
+        elif foreign_context or source_changed:
+            selected_operations = copy(operations)
+        if foreign_context:
+            foreign_backend = Backend()
+            selected_operations.backend = foreign_backend
+        if source_changed:
+            setattr(selected_operations, "native_build", 12)  # noqa: B010 - inject invalid observed build
+        try:
+            runtime = selected_variable_monitor_runtime(
+                check_targets,
+                selected_operations,
+                connected_device=8,
+                command_kind=0x42,
+                command_ecu=42,
+                allocation=4096,
+                standard_values=tuple(() for _ in check_targets),
+                names=tuple(
+                    f"engine{target.profile.category}\0".encode()
+                    for target in check_targets
+                ),
+                text_encoding="utf-8",
+                phase=0,
+                clock=lambda: 0,
+                ticks=lambda: 1234,
+                limits=Limits(exchanges=256),
+                cancelled=lambda: cancellation[0],
+                voltage_state=(
+                    __import__(
+                        "scripts.monitor_dlc12", fromlist=["DLC12VoltageState"]
+                    ).DLC12VoltageState(0)
+                    if with_voltage
+                    else None
+                ),
+            )
+        except MonitorError as error:
+            if live_source_channel:
+                assert "fresh device8 source context" in str(error)
+                assert all(communication.closed for communication in communications)
+                assert live_operations is not None and live_operations.channel == 7
+                assert live_operations.owns_channel
+                assert backend.calls.count("disconnect") == len(communications)
+                assert live_operations.close(deadline=10) == 0
+                return {
+                    "build": build,
+                    "boundary": "live-source-channel-retained",
+                    "channels_closed": True,
+                }
+            assert (foreign_context or source_changed) and "contexts differ" in str(
+                error
+            )
+            assert all(communication.closed for communication in communications)
+            assert operations.channel is None
+            assert foreign_backend is None or foreign_backend.calls == []
+            return {
+                "build": build,
+                "boundary": (
+                    "foreign-backend-rejected"
+                    if foreign_context
+                    else "changed-source-rejected"
+                ),
+                "support_channels_closed": True,
+                "foreign_backend_calls": []
+                if foreign_backend is None
+                else foreign_backend.calls,
+            }
+        from scripts.monitor_poll import MultiMonitorPollingWorker
+
+        assert isinstance(runtime.worker, MultiMonitorPollingWorker)
+        assert tuple(target.cache.profile.category for target in runtime.targets) == (
+            (42, 43, 0x68) if with_voltage else (42, 43)
+        )
+        assert tuple(
+            item.category_flags for item in runtime.worker.operations.targets
+        ) == (
+            4,
+            6,
+        )
+        assert all(communication.closed for communication in communications)
+        assert operations.channel is None
+        if with_voltage:
+            try:
+                runtime.run((1, 1, 1))
+            except MonitorError as error:
+                runtime.close()
+                assert "GetError=0xffffffff" in str(error)
+                assert all(communication.closed for communication in communications)
+                assert operations.channel is None
+                return {
+                    "build": build,
+                    "boundary": "mixed-voltage-source-failure",
+                    "route": type(runtime.worker).__name__,
+                    "targets": [
+                        target.cache.profile.category for target in runtime.targets
+                    ],
+                    "lower_targets": [
+                        item.command_id for item in runtime.worker.operations.targets
+                    ],
+                    "code": error.code,
+                    "captures": 0,
+                }
+            raise AssertionError("Mixed voltage path must retain its source failure")
+        multi_lower = runtime.worker.operations
+        native_lower = multi_lower.operations
+        original_send = native_lower.send
+        initialization_modes = []
+        entry_calls = []
+        original_entry = multi_lower.entry_comm_system_info
+
+        def observe_entry(category, bus, entry, *, deadline):
+            entry_calls.append((category, bus, entry))
+            return original_entry(category, bus, entry, deadline=deadline)
+
+        multi_lower.entry_comm_system_info = observe_entry
+
+        def observe_send(request, **kwargs):
+            initialization_modes.append(kwargs.get("initialization_mode"))
+            return original_send(request, **kwargs)
+
+        native_lower.send = observe_send
+        cancellation[0] = cancel
+        try:
+            captures = runtime.run((1, 1))
+        except TimeoutError as error:
+            assert host_failure and error is backend.host_fault
+            runtime.close()
+            assert native_lower.channel is None
+            assert backend.calls.count("connect") == backend.calls.count("disconnect")
+            return {
+                "build": build,
+                "boundary": "host-exception",
+                "error_identity_preserved": error is backend.host_fault,
+                "channels_closed": True,
+            }
+        except MonitorError as error:
+            assert native_fault and error.code == 0xE0000108
+            runtime.close()
+            assert native_lower.channel is None
+            assert backend.calls.count("connect") == backend.calls.count("disconnect")
+            return {
+                "build": build,
+                "boundary": "native-read-fault",
+                "code": error.code,
+                "primitive_read_code": 7,
+                "error_type": type(error).__name__,
+                "host_exception_conversion": False,
+                "channels_closed": True,
+            }
+        except (RecorderCancelled, Cancelled) as error:
+            assert cancel
+            runtime.close()
+            assert native_lower.channel is None
+            assert backend.calls.count("connect") == backend.calls.count("disconnect")
+            return {
+                "build": build,
+                "boundary": "cancelled",
+                "error": type(error).__name__,
+                "channels_closed": True,
+            }
+        finally:
+            native_lower.send = original_send
+        runtime.close()
+        assert len(captures) == 2
+        assert all(capture.packets[0].payload == b"AB" for capture in captures)
+        assert backend.calls.count("connect") == backend.calls.count("disconnect") == 3
+        samples = []
+        for target, capture in zip(runtime.targets, captures):
+            metadata = MonitorBuffer(
+                target.buffer.name.data,
+                bytes(16),
+                b"",
+                b"",
+                b"",
+                b"",
+                0,
+                (),
+                (4,),
+                b"",
+                (),
+            )
+            saved = capture.monitor_buffer(
+                target.buffer, metadata, phase=0, block_packets=1
+            )
+            samples.append(
+                monitor_samples(
+                    decode_monitor_buffer(encode_monitor_buffer(saved)),
+                    encoding="utf-8",
+                )
+            )
+        return {
+            "build": build,
+            "route": type(runtime.worker).__name__,
+            "targets": [target.cache.profile.category for target in runtime.targets],
+            "target_flags": [
+                item.category_flags for item in runtime.worker.operations.targets
+            ],
+            "controller_flags": primary.profile.category_record[72],
+            "backend_calls": backend.calls,
+            "connect_arguments": [
+                dict(fields)
+                for operation, fields in backend.events
+                if operation == "connect"
+            ],
+            "multi_entry_calls": entry_calls,
+            "multi_control_events": [
+                operation for operation, _ in multi_lower.control.observations
+            ],
+            "multi_refresh_ioctls": [
+                fields.get("ioctl_id")
+                for operation, fields in backend.events
+                if operation == "ioctl"
+            ],
+            "multi_send_modes": initialization_modes,
+            "samples": samples,
+            "physical": "PHYSICAL_UNCONFIRMED",
+        }
+
+
+class DeferredVariableMultiMonTests(unittest.TestCase):
+    def test_real_selected_support_factory_reaches_multi_and_reparsed_samples(self):
+        for build in (12, 18):
+            with self.subTest(build=build):
+                result = run_selected_variable_multi(build=build)
+                self.assertEqual(result["route"], "MultiMonitorPollingWorker")
+                self.assertEqual(result["targets"], [42, 43])
+                self.assertEqual(result["controller_flags"], 4)
+                self.assertEqual(result["target_flags"], [4, 6])
+                self.assertEqual(
+                    result["connect_arguments"][-1],
+                    {"protocol_id": 6, "flags": 0, "baud_rate": 0},
+                )
+                self.assertEqual(
+                    [entry[0] for entry in result["multi_entry_calls"]], [42, 43]
+                )
+                self.assertGreaterEqual(
+                    result["multi_control_events"].count("set_config"), 1
+                )
+                self.assertTrue(result["multi_send_modes"])
+                self.assertTrue(all(mode == 2 for mode in result["multi_send_modes"]))
+                self.assertEqual(len(result["samples"]), 2)
+                self.assertEqual(
+                    [sample[0]["values"][0]["display"] for sample in result["samples"]],
+                    ["4176", "4176"],
+                )
+
+    def test_joined_factory_rejects_foreign_backend_and_keeps_null_outcome(self):
+        foreign = run_selected_variable_multi(foreign_context=True)
+        self.assertEqual(foreign["boundary"], "foreign-backend-rejected")
+        self.assertTrue(foreign["support_channels_closed"])
+        self.assertEqual(foreign["foreign_backend_calls"], [])
+        changed_source = run_selected_variable_multi(source_changed=True)
+        self.assertEqual(changed_source["boundary"], "changed-source-rejected")
+        self.assertTrue(changed_source["support_channels_closed"])
+        null_result = run_selected_variable_single(
+            build=18, connected_device=8, null_controller=True
+        )
+        self.assertEqual(null_result["boundary"], "native-null-controller-no-event")
+        self.assertEqual(null_result["code"], 0xE0000102)
+        voltage = run_selected_variable_multi(with_voltage=True)
+        self.assertEqual(voltage["boundary"], "mixed-voltage-source-failure")
+        self.assertEqual(voltage["captures"], 0)
+
+    def test_joined_factory_cancellation_closes_multi_channel(self):
+        result = run_selected_variable_multi(build=18, cancel=True)
+        self.assertEqual(result["boundary"], "cancelled")
+        self.assertTrue(result["channels_closed"])
+
+    def test_joined_factory_preserves_multi_host_exception_identity(self):
+        result = run_selected_variable_multi(build=18, host_failure=True)
+        self.assertEqual(result["boundary"], "host-exception")
+        self.assertTrue(result["error_identity_preserved"])
+        self.assertTrue(result["channels_closed"])
+
+    def test_joined_factory_preserves_native_read_fault_and_closes_channel(self):
+        for build in (12, 18):
+            with self.subTest(build=build):
+                result = run_selected_variable_multi(build=build, native_fault=True)
+                self.assertEqual(result["boundary"], "native-read-fault")
+                self.assertEqual(result["code"], 0xE0000108)
+                self.assertEqual(result["primitive_read_code"], 7)
+                self.assertEqual(result["error_type"], "MonitorError")
+                self.assertFalse(result["host_exception_conversion"])
+                self.assertTrue(result["channels_closed"])
+
+    def test_joined_factory_retains_separately_owned_live_input_channel(self):
+        result = run_selected_variable_multi(live_source_channel=True)
+        self.assertEqual(result["boundary"], "live-source-channel-retained")
+        self.assertTrue(result["channels_closed"])
+
+
 if __name__ == "__main__":
     unittest.main()

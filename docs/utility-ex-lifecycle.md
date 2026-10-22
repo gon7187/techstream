@@ -222,11 +222,12 @@ do not require an original image:
   once per context key. Concurrent aliases receive the same owner and the same
   lock instead of constructing a second owner. Publication is serialized
   separately from native I/O.
-- A cancelled selected CMN worker does not overwrite a newer shared timer
-  status with its entry snapshot. A terminal CMN error still publishes its own
-  result. The previously reported status-15 overwrite hypothesis stays
-  refuted; the regression publishes 15 from the timer path and requires it to
-  survive CMN cancellation.
+- A selected CMN worker does not read or write the shared timer status on
+  cancellation or success. Its explicit `stop_on_error` branch publishes its
+  own error before cleanup, even when that value equals the entry status and a
+  timer published a different value during the exchange. The regression covers
+  plain and custom requests across all four NK images; the separate status-15
+  overwrite hypothesis remains refuted.
 
 These checks are `tests.test_utility_ex_lifecycle.LifecycleHardeningTests` and
 `tests.test_utility_ex_comm.PublicationOwnerTests`. They establish the Python
