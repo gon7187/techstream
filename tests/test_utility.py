@@ -366,15 +366,15 @@ class NativeUtilityTests(unittest.TestCase):
 
     def test_bsm_exact_source_mode_rejects_other_mode_without_worker_or_transport(self):
         from scripts.utility import NativeBSMRuntime
+        from scripts.utility_authored import AuthoredNativeUtility
 
         for function, group in ((0x137B8, 0x134A), (0x137EA, 0x134B)):
-            with self.subTest(function=function):
-                base, events, _ = self.native()
-                runtime = NativeBSMRuntime(base.libraries)
+            with self.subTest(function=function), AuthoredNativeUtility() as fixture:
+                runtime = NativeBSMRuntime(fixture.runtime.libraries)
                 screen = runtime.open(function)
                 self.assertEqual((screen["status"], runtime.result), ("error", 99))
                 self.assertEqual(runtime.utility_group, group)
-                self.assertEqual(events, [])
+                self.assertEqual(fixture.events, [])
                 self.assertIsNone(runtime.libraries.engine.worker._thread)
                 with self.assertRaises(ValueError):
                     runtime.key("next", {"invented": 1})
@@ -449,9 +449,14 @@ class NativeUtilityTests(unittest.TestCase):
         self.assertEqual(events[-1], "finalize")
 
     def test_dcm_controller_retains_output_and_dispatches_stored_native_result(self):
+        from scripts.utility_authored import AuthoredNativeUtility
+
         for value in (0, 7):
-            with self.subTest(value=value):
-                runtime, events, _ = self.native(dcm_value=value)
+            with (
+                self.subTest(value=value),
+                AuthoredNativeUtility(dcm_value=value) as fixture,
+            ):
+                runtime = fixture.runtime
                 screen = runtime.start(0x13723)
                 self.assertEqual(
                     (screen["title_id"], screen["message_id"]), (0x948B, 0x9490)
@@ -460,7 +465,7 @@ class NativeUtilityTests(unittest.TestCase):
                 self.assertEqual(runtime.receiver, bytes([value, 0, 0, 0]))
                 self.assertEqual(runtime.result, 2005 if value else 0)
                 self.assertEqual(runtime.utility_group, 0x1352)
-                self.assertEqual(events[-1], "finalize")
+                self.assertEqual(fixture.events[-1], "finalize")
                 self.assertEqual(
                     [entry["result"] for entry in runtime.trace if "iat_rva" in entry],
                     [2005 if value else 0, 2005 if value else 0],
