@@ -921,7 +921,9 @@ class EngineWorker2026Tests(unittest.TestCase):
             general_sources, encoded=False
         )
         image = Path("runtime/no-car-21/recovered/CUW.dll")
-        engine = CUWEngine2026(image.read_bytes(), general_parameters=frontend.general)
+        engine = CUWEngine2026(
+            read_private_bytes(image), general_parameters=frontend.general
+        )
         if initial_maximum:
             engine.configure(struct.pack("<IIddII", initial_maximum, 0, 0, 0, 0, 0))
         engine.bind_frontend_parameters(frontend)
