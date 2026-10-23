@@ -44,8 +44,9 @@ successful startup.
 
 The immutable source view exposes the raw classification, final periodic ID,
 `5b1e0` return AL, output flag and typed controller-local error fields.
-Classification2 stays2; the
-new-password decision is equality with1, never `bool(classification)`.
+Classification 2 stays 2. Gateway classification preserves the independent
+password-selection flag. The `5a835` caller separately publishes `BE0/980`
+after a successful `5b1e0` return.
 The source view also feeds the actual retry controller's BE48/BE34 fields at
 each classification and periodic acquisition, including partial failed startup.
 Callback14 executes the direct58530→5b1e0 path, copying BF9 and returning the

@@ -36,6 +36,13 @@ def _charge_sequence_check(budget: list[int]) -> None:
     budget[1] += _SEQUENCE_CHECK_BYTES
 
 
+def _charge_sequence_plan(budget: list[int], nodes: int, octets: int) -> None:
+    if nodes > MAX_NODES - budget[0] or octets > MAX_BYTES - budget[1]:
+        raise ReportError("DDR sequence coordinate plan exceeds aggregate budget")
+    budget[0] += nodes
+    budget[1] += octets
+
+
 @dataclass(frozen=True)
 class _Named:
     kind: str
@@ -1469,6 +1476,7 @@ def view_section(
 
     signal_masks: dict[tuple, tuple[tuple, tuple, bool | None]] = {}
     sequence_masks: dict[tuple, tuple[tuple, tuple]] = {}
+    sequence_plan_inputs: dict[tuple, tuple[tuple, tuple, tuple, dict]] = {}
 
     def text(raw: bytes) -> str:
         try:
@@ -1584,7 +1592,14 @@ def view_section(
                 path,
             )
             if not ads:
+                _charge_sequence_plan(budget, 1, 1024)
                 sequence_masks[path + (0, 24)] = (masks, path)
+                sequence_plan_inputs[path + (0, 24)] = (
+                    info,
+                    masks,
+                    path,
+                    result["ddr_headers"][-1],
+                )
             side = (20 if layout.version < 0x100A else 19) if ads else 25
             mask_slot = (17 if layout.version < 0x100A else 16) if ads else 22
             for mode in (0, 1):
@@ -1703,6 +1718,7 @@ def view_section(
             sequence = sequence_masks.get(path)
             if sequence is not None:
                 raw_masks, pair_path = sequence
+                any_admitted = False
                 for index, sample in enumerate(values):
                     _charge_sequence_check(budget)
                     checks = []
@@ -1728,10 +1744,73 @@ def view_section(
                         )
                         if not passes:
                             break
+                    admitted = all(item["passes"] for item in checks)
+                    any_admitted |= admitted
                     sample.update(
-                        sequence_format_admitted=all(item["passes"] for item in checks),
+                        sequence_format_admitted=admitted,
                         sequence_format_checks=checks,
                     )
+                info, plan_masks, pair_path, header_row = sequence_plan_inputs[path]
+                samples = info[24][7]
+                copied_masks = {}
+                for slot in (0, 1, 19, 20, 21):
+                    raw_mask = plan_masks[slot]
+                    _charge_sequence_plan(budget, len(raw_mask), 16 * len(raw_mask))
+                    copied_masks[f"mask{slot}"] = list(raw_mask)
+
+                if not samples:
+                    status = "source-derived"
+                    points = []
+                elif info[5][1] == 0 and not any_admitted:
+                    status = "source-derived"
+                    count_a, count_b = info[6], info[7]
+                    lead = 0
+                    if plan_masks[19] and plan_masks[19][0] != 0:
+                        lead = count_a
+                        count_a = 0
+                    points = []
+                    for index in range(count_a + count_b):
+                        if index >= count_a:
+                            mask_index = index - count_a
+                            if (
+                                mask_index < len(plan_masks[20])
+                                and plan_masks[20][mask_index] != 0
+                            ):
+                                continue
+                        _charge_sequence_plan(budget, 1, 384)
+                        points.append(
+                            {
+                                "coordinate": 0,
+                                "tag": 0,
+                                "source_index": lead + index,
+                            }
+                        )
+                else:
+                    status = "source-semantics-open"
+                    points = None
+
+                header_row["sequence_coordinate_plan"] = {
+                    "scope": "normal-ddr-id3-pre-sort",
+                    "status": status,
+                    "points": points,
+                    "inputs_raw": {
+                        "count_a": info[6],
+                        "count_b": info[7],
+                        "divisor": info[5][1],
+                        "sample_count": len(samples),
+                        **copied_masks,
+                    },
+                    "input_source_paths": {
+                        "count_a": list(pair_path + (0, 6)),
+                        "count_b": list(pair_path + (0, 7)),
+                        "divisor": list(pair_path + (0, 5, 1)),
+                        "sample_count": list(pair_path + (0, 24, 7)),
+                        **{
+                            f"mask{slot}": list(pair_path + (1, slot))
+                            for slot in (0, 1, 19, 20, 21)
+                        },
+                    },
+                }
             emit(
                 "parameters",
                 {

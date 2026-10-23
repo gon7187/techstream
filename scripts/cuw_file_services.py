@@ -8,12 +8,13 @@ from __future__ import annotations
 import configparser
 import hashlib
 import struct
+import threading
 import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import PureWindowsPath
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
 
 from scripts.calibration_2026 import (
     Native2026Metadata,
@@ -159,7 +160,115 @@ def file_logger_2026(
     return result
 
 
+@dataclass(frozen=True, eq=False)
+class NativeFileView2026:
+    """One immutable current-table or current-only FILE descriptor."""
+
+    sources: FileSourceSet2026 = field(repr=False, compare=False)
+    file_index: int | None
+    kind: Literal["none", "plain", "part", "whole", "retained"]
+    metadata: Native2026Metadata = field(repr=False)
+    source_container: object = field(repr=False, compare=False)
+    source_sha256: str
+    original_recovery_index: int
+    group_start: int | None
+
+
+@dataclass(frozen=True, eq=False)
+class NativeFileGroupView2026:
+    """One source-authenticated contiguous delta group and its whole FILE."""
+
+    sources: FileSourceSet2026 = field(repr=False, compare=False)
+    start: int
+    width: int
+    members: tuple[NativeFileView2026, ...]
+    whole: NativeFileView2026
+
+
+@runtime_checkable
+class _JudgeGroupResetOriginValidator2026(Protocol):
+    def _validate_judge_group_reset_origin2026(
+        self, origin: object, group: NativeFileGroupView2026
+    ) -> None: ...
+
+
+@runtime_checkable
+class _JudgeDirectResetOriginValidator2026(Protocol):
+    def _validate_judge_direct_reset_origin2026(
+        self, origin: object, current_a48: NativeFileView2026
+    ) -> None: ...
+
+
 @dataclass(frozen=True)
+class _JudgeGroupTableReplacement2026:
+    selected_metadata: Native2026Metadata
+    selected_source: Any
+    selected_name: str
+    files: tuple[Native2026Metadata, ...]
+    file_sources: tuple[Any, ...]
+    file_names: tuple[str, ...]
+    has_file_vector: bool
+    auxiliary_metadata: Native2026Metadata
+
+
+@dataclass(frozen=True)
+class _NativeWaitTimingSource2026:
+    """One exact raw source/parse pair in the captured43ee0 walk."""
+
+    source_name: str
+    source: bytes
+    metadata: Native2026Metadata | None
+
+
+@dataclass(frozen=True)
+class _NativeWaitTimingStep2026:
+    """A literal native stage; values are source inputs, never computed results."""
+
+    operation: Literal["46010", "32130", "43cd0", "41940", "32ff0"]
+    sources: tuple[_NativeWaitTimingSource2026, ...]
+    slot: int | None = None
+    value: bool | None = None
+
+
+@dataclass(frozen=True)
+class _NativePhase6Reorder67c602026:
+    """One source-issued post-4a850 table and optional mapped second select."""
+
+    post_4a850_files: tuple[Native2026Metadata, ...]
+    post_4a850_names: tuple[str, ...]
+    post_4a850_sources: tuple[Any, ...]
+    map_entries: tuple[tuple[Native2026Metadata, int], ...]
+    post_67c60_files: tuple[Native2026Metadata, ...]
+    post_67c60_names: tuple[str, ...]
+    post_67c60_sources: tuple[Any, ...]
+    second_select: tuple[int, bool, Native2026Metadata, Any, str]
+
+
+@dataclass(frozen=True)
+class _NativePhase6Transform4a8502026:
+    """The exact successful Phase6 merge/reorder producer lineage."""
+
+    raw_files: tuple[Native2026Metadata, ...]
+    raw_names: tuple[str, ...]
+    raw_sources: tuple[Any, ...]
+    edges: tuple[tuple[Any, ...], ...]
+    post_4a850_files: tuple[Native2026Metadata, ...]
+    post_4a850_names: tuple[str, ...]
+    post_4a850_sources: tuple[Any, ...]
+    mapped_reorder: _NativePhase6Reorder67c602026 | None
+
+
+@dataclass(frozen=True, eq=False)
+class _NativeColdFileTableStages2026:
+    """The exact registered cold FILE tables reachable in one native walk."""
+
+    initial: FileSourceSet2026
+    post_4a850: FileSourceSet2026 | None
+    post_67c60: FileSourceSet2026 | None
+    final: FileSourceSet2026
+
+
+@dataclass(frozen=True, eq=False)
 class FileSourceSet2026:
     """An issued43ee0 file-vector and its concrete46010 whole/delta joins."""
 
@@ -187,6 +296,19 @@ class FileSourceSet2026:
     recovery_multi_count: int
     recovery_metadata_indexes: tuple[tuple[Native2026Metadata, int], ...] = field(
         repr=False
+    )
+    _wait_timing_admission2026: Any = field(default=None, repr=False, compare=False)
+    _view_lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False, compare=False
+    )
+    _view_cache: dict[tuple[str, int | None, int | None], NativeFileView2026] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _group_view_cache: dict[int, NativeFileGroupView2026] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _admission_view_cache: NativeFileView2026 | None = field(
+        default=None, init=False, repr=False, compare=False
     )
 
     @property
@@ -284,6 +406,18 @@ class FileSourceSet2026:
         return (
             (self.selected_metadata,) if self.current_is_retained_clone else self.files
         )
+
+    def file_view2026(self, index: int) -> NativeFileView2026:
+        """Return the identity-cached descriptor for an actual table slot."""
+        return _file_view_2026(self, index)
+
+    def group_view2026(self, index: int) -> NativeFileGroupView2026 | None:
+        """Return the actual source group containing this current table slot."""
+        return _group_view_2026(self, index)
+
+    def admission_view2026(self) -> NativeFileView2026:
+        """Describe the exact initial current pointer, including no-table sources."""
+        return _admission_view_2026(self)
 
     def group_for_file(
         self, file_index: int
@@ -397,6 +531,147 @@ class FileSourceSet2026:
         )
         return result
 
+    def _after_judge_group_reset_4b900_2026(
+        self,
+        group: NativeFileGroupView2026,
+        *,
+        worker,
+        origin: object,
+    ) -> FileSourceSet2026:
+        """Issue the distinct mode1 table replacement after authenticated judging."""
+        from scripts.cuw_engine_worker import EngineWorker2026
+
+        validate_file_sources_2026(self)
+        validate_file_group_view_2026(group, self)
+        if (
+            type(worker) is not EngineWorker2026
+            or worker.engine is not self.engine
+            or worker is not self.engine.worker
+        ):
+            raise ValueError("Actual bound engine worker required for judge FILE reset")
+        if self.engine.file_sources is not self:
+            raise ValueError("Judge reset source is not the engine-owned FILE set")
+        worker.validate_source()
+        # This is the sole mode1 origin check. The worker owns its receipt and
+        # rejects anything except the actual61e40 whole-true/no-eligible branch.
+        if not isinstance(worker, _JudgeGroupResetOriginValidator2026):
+            raise TypeError("Native judge-reset origin validator is unavailable")
+        cast(
+            _JudgeGroupResetOriginValidator2026, worker
+        )._validate_judge_group_reset_origin2026(origin, group)
+
+        table = _judge_group_table_replacement2026(self, group)
+        runtime_whole = self.engine.native_metadata
+        from scripts.calibration_2026 import native2026_validate_runtime_metadata
+
+        native2026_validate_runtime_metadata(runtime_whole)
+        authored_whole = group.whole.metadata
+        if (
+            runtime_whole.source_container is not group.whole.source_container
+            or runtime_whole.source_sha256 != group.whole.source_sha256
+            or runtime_whole.node != authored_whole.node
+            or self.recovery_index_for_metadata(runtime_whole)
+            != group.whole.original_recovery_index
+        ):
+            raise ValueError(
+                "Runtime A48 metadata differs from the authenticated WHOLE"
+            )
+        if runtime_whole is not authored_whole:
+            table = replace(
+                table,
+                selected_metadata=runtime_whole,
+                auxiliary_metadata=runtime_whole,
+                files=tuple(
+                    runtime_whole if item is authored_whole else item
+                    for item in table.files
+                ),
+            )
+            replacement_groups = tuple(
+                (start, width, runtime_whole if whole is authored_whole else whole)
+                for start, width, whole in self.delta_groups
+            )
+        else:
+            replacement_groups = self.delta_groups
+        result = replace(
+            self,
+            selected_metadata=table.selected_metadata,
+            selected_source=table.selected_source,
+            selected_name=table.selected_name,
+            files=table.files,
+            file_sources=table.file_sources,
+            file_names=table.file_names,
+            has_file_vector=table.has_file_vector,
+            selection_role="file",
+            auxiliary_metadata=table.auxiliary_metadata,
+            delta_groups=replacement_groups,
+        )
+        _file_sets[id(result)] = result
+        return result
+
+    def _after_judge_direct_reset_4b900_2026(
+        self,
+        current_a48: NativeFileView2026,
+        *,
+        worker,
+        origin: object,
+    ) -> FileSourceSet2026:
+        """Issue the direct zero-map mode1 replacement for its real A48 view."""
+        from scripts.cuw_engine_worker import EngineWorker2026
+
+        validate_file_sources_2026(self)
+        validate_file_view_2026(current_a48, self)
+        if not self.delta_archive or self.delta_map_size != 0:
+            raise ValueError("Direct judge reset requires a zero-map delta archive")
+        if (
+            type(worker) is not EngineWorker2026
+            or worker.engine is not self.engine
+            or worker is not self.engine.worker
+        ):
+            raise ValueError(
+                "Actual bound engine worker required for direct judge reset"
+            )
+        if self.engine.file_sources is not self:
+            raise ValueError(
+                "Direct judge reset source is not the engine-owned FILE set"
+            )
+        worker.validate_source()
+        if not isinstance(worker, _JudgeDirectResetOriginValidator2026):
+            raise TypeError("Native direct judge-reset origin validator is unavailable")
+        cast(
+            _JudgeDirectResetOriginValidator2026, worker
+        )._validate_judge_direct_reset_origin2026(origin, current_a48)
+
+        # The engine pointer is the actual current A48 runtime projection. The
+        # descriptor authenticates its source association; it is not a fallback
+        # metadata source because a prior rebuild may have replaced that object.
+        metadata = self.engine.native_metadata
+        from scripts.calibration_2026 import native2026_validate_runtime_metadata
+
+        native2026_validate_runtime_metadata(metadata)
+        if (
+            metadata.source_container is not current_a48.source_container
+            or metadata.source_sha256 != current_a48.source_sha256
+            or metadata.node != current_a48.metadata.node
+        ):
+            raise ValueError("Direct current A48 metadata differs from its source view")
+        if (
+            self.recovery_index_for_metadata(metadata)
+            != current_a48.original_recovery_index
+        ):
+            raise ValueError("Direct current A48 recovery association differs")
+        result = replace(
+            self,
+            selected_metadata=metadata,
+            files=(),
+            file_sources=(),
+            file_names=(),
+            has_file_vector=False,
+            selection_role="retained_clone",
+            auxiliary_metadata=metadata,
+        )
+        _file_sets[id(result)] = result
+        return result
+
 
 _reset_lineage: dict[
     int, tuple[weakref.ReferenceType, weakref.ReferenceType, weakref.ReferenceType]
@@ -459,6 +734,500 @@ def validate_file_sources_2026(value: FileSourceSet2026, engine=None) -> None:
                     "Native FILE composition is outside its actual source proof"
                 )
             _validate_container_2026(source)
+
+
+def _issued_file_view2026(
+    sources: FileSourceSet2026,
+    *,
+    kind: Literal["none", "plain", "part", "whole", "retained"],
+    file_index: int | None,
+    metadata: Native2026Metadata,
+    group_start: int | None,
+) -> NativeFileView2026:
+    validate_file_sources_2026(sources)
+    key = (kind, file_index, group_start)
+    source_container = metadata.source_container
+    digest = metadata.source_sha256
+    recovery_index = sources.recovery_index_for_metadata(metadata)
+    with sources._view_lock:
+        previous = sources._view_cache.get(key)
+        if previous is not None:
+            if (
+                previous.sources is not sources
+                or previous.metadata is not metadata
+                or previous.source_container is not source_container
+                or previous.source_sha256 != digest
+                or previous.original_recovery_index != recovery_index
+            ):
+                raise ValueError("Native FILE view cache conflicts with source table")
+            return previous
+        view = NativeFileView2026(
+            sources,
+            file_index,
+            kind,
+            metadata,
+            source_container,
+            digest,
+            recovery_index,
+            group_start,
+        )
+        sources._view_cache[key] = view
+        return view
+
+
+def _whole_group_for_metadata2026(sources, metadata):
+    matches = [
+        (index, start, width, whole)
+        for index, (start, width, whole) in enumerate(sources.delta_groups)
+        if whole is metadata
+    ]
+    if len(matches) > 1:
+        raise ValueError("Whole FILE is ambiguous across native delta groups")
+    return matches[0] if matches else None
+
+
+def _whole_group_current_start2026(sources, group_index, source_start):
+    whole = sources.delta_groups[group_index][2]
+    direct_slots = tuple(
+        index for index, item in enumerate(sources.files) if item is whole
+    )
+    if len(direct_slots) == 1:
+        return direct_slots[0]
+    mapped_slots = tuple(
+        index
+        for index, item in enumerate(sources.files)
+        if any(
+            member is item and mapped == group_index
+            for member, mapped in sources.delta_map_entries
+        )
+    )
+    if mapped_slots:
+        if mapped_slots != tuple(
+            range(mapped_slots[0], mapped_slots[0] + len(mapped_slots))
+        ):
+            raise ValueError("Native FILE group is not contiguous")
+        return mapped_slots[0]
+    return source_start
+
+
+def _file_view_2026(sources: FileSourceSet2026, index: int) -> NativeFileView2026:
+    validate_file_sources_2026(sources)
+    if type(index) is not int or not sources.has_file_vector:
+        raise ValueError("Actual native FILE table index required")
+    if not 0 <= index < len(sources.files):
+        raise ValueError("Native FILE index is outside the issued table")
+    metadata = sources.files[index]
+    whole_group = _whole_group_for_metadata2026(sources, metadata)
+    if whole_group is not None:
+        return _issued_file_view2026(
+            sources,
+            kind="whole",
+            file_index=index,
+            metadata=metadata,
+            group_start=index,
+        )
+
+    mapped_group = next(
+        (
+            group_index
+            for member, group_index in sources.delta_map_entries
+            if member is metadata
+        ),
+        None,
+    )
+    if mapped_group is not None:
+        group_indices = tuple(
+            current_index
+            for current_index, current in enumerate(sources.files)
+            if any(
+                member is current and group_index == mapped_group
+                for member, group_index in sources.delta_map_entries
+            )
+        )
+        if not group_indices or group_indices != tuple(
+            range(group_indices[0], group_indices[0] + len(group_indices))
+        ):
+            raise ValueError("Mapped native FILE group is not contiguous")
+        group_start = group_indices[0]
+        kind: Literal["plain", "part"] = "part"
+    elif sources.delta_archive and sources.delta_map_size == 0:
+        direct_group = next(
+            (
+                (start, width)
+                for start, width, _whole in sources.delta_groups
+                if start <= index < start + width
+            ),
+            None,
+        )
+        if direct_group is None:
+            kind, group_start = "plain", None
+        else:
+            start, width = direct_group
+            if start + width > len(sources.files) or any(
+                _whole_group_for_metadata2026(sources, item) is not None
+                for item in sources.files[start : start + width]
+            ):
+                raise ValueError("Direct native FILE group differs from current table")
+            kind, group_start = "part", start
+    else:
+        kind, group_start = "plain", None
+    return _issued_file_view2026(
+        sources,
+        kind=kind,
+        file_index=index,
+        metadata=metadata,
+        group_start=group_start,
+    )
+
+
+def _admission_view_2026(sources: FileSourceSet2026) -> NativeFileView2026:
+    validate_file_sources_2026(sources)
+    with sources._view_lock:
+        if sources._admission_view_cache is not None:
+            view = sources._admission_view_cache
+            if view.kind == "none":
+                if (
+                    type(view) is not NativeFileView2026
+                    or view.sources is not sources
+                    or view.file_index is not None
+                    or view.metadata is not sources.selected_metadata
+                    or sources._view_cache.get(("none", None, None)) is not view
+                ):
+                    raise ValueError("Cached native no-table admission view is invalid")
+            else:
+                validate_file_view_2026(view, sources)
+            return view
+    metadata = sources.selected_metadata
+    if not sources.has_file_vector:
+        view = _issued_file_view2026(
+            sources,
+            kind="none",
+            file_index=None,
+            metadata=metadata,
+            group_start=None,
+        )
+    else:
+        current_slots = tuple(
+            index for index, item in enumerate(sources.files) if item is metadata
+        )
+        if len(current_slots) == 1:
+            view = _file_view_2026(sources, current_slots[0])
+        elif current_slots:
+            raise ValueError("Admission FILE is ambiguous in native table")
+        else:
+            whole_group = _whole_group_for_metadata2026(sources, metadata)
+            if whole_group is None:
+                capability = sources._wait_timing_admission2026
+                stages = (
+                    ()
+                    if capability is None
+                    else tuple(
+                        stage
+                        for stage in (
+                            capability.table_stages.initial,
+                            capability.table_stages.post_4a850,
+                            capability.table_stages.post_67c60,
+                            capability.table_stages.final,
+                        )
+                        if stage is not None
+                    )
+                )
+                if not any(
+                    stage is sources
+                    and stage.selected_metadata is metadata
+                    and stage.selected_source is sources.selected_source
+                    and stage.selected_name == sources.selected_name
+                    for stage in stages
+                ):
+                    raise ValueError(
+                        "Admission FILE is outside its issued source table"
+                    )
+                view = _issued_file_view2026(
+                    sources,
+                    kind="retained",
+                    file_index=None,
+                    metadata=metadata,
+                    group_start=None,
+                )
+            else:
+                group_index, source_start, width, _whole = whole_group
+                map_slots = tuple(
+                    index
+                    for index, item in enumerate(sources.files)
+                    if any(
+                        member is item and group == group_index
+                        for member, group in sources.delta_map_entries
+                    )
+                )
+                group_start = map_slots[0] if map_slots else source_start
+                if map_slots and map_slots != tuple(
+                    range(group_start, group_start + width)
+                ):
+                    raise ValueError("Admission whole FILE group is not contiguous")
+                view = _issued_file_view2026(
+                    sources,
+                    kind="whole",
+                    file_index=group_start,
+                    metadata=metadata,
+                    group_start=group_start,
+                )
+    with sources._view_lock:
+        if sources._admission_view_cache is None:
+            object.__setattr__(sources, "_admission_view_cache", view)
+        elif sources._admission_view_cache is not view:
+            raise ValueError("Concurrent native admission view differs")
+        cached = sources._admission_view_cache
+        if cached is None:
+            raise ValueError("Native admission view cache was not established")
+        return cached
+
+
+def _group_view_2026(
+    sources: FileSourceSet2026, index: int
+) -> NativeFileGroupView2026 | None:
+    validate_file_sources_2026(sources)
+    if type(index) is not int or not sources.has_file_vector:
+        raise ValueError("Actual native FILE table index required")
+    if not 0 <= index < len(sources.files):
+        raise ValueError("Native FILE index is outside the issued table")
+    metadata = sources.files[index]
+    if _whole_group_for_metadata2026(sources, metadata) is not None:
+        return None
+
+    mapped_group = next(
+        (
+            group_index
+            for member, group_index in sources.delta_map_entries
+            if member is metadata
+        ),
+        None,
+    )
+    if mapped_group is not None:
+        indices = tuple(
+            current_index
+            for current_index, current in enumerate(sources.files)
+            if any(
+                member is current and group_index == mapped_group
+                for member, group_index in sources.delta_map_entries
+            )
+        )
+        if not indices or indices != tuple(
+            range(indices[0], indices[0] + len(indices))
+        ):
+            raise ValueError("Mapped native FILE group is not contiguous")
+        start = indices[0]
+        width = len(indices)
+        whole = sources.delta_groups[mapped_group][2]
+        if width != sources.delta_groups[mapped_group][1]:
+            raise ValueError("Mapped native FILE group width differs from source")
+    elif sources.delta_archive and sources.delta_map_size == 0:
+        direct = next(
+            (
+                (start, width, whole)
+                for start, width, whole in sources.delta_groups
+                if start <= index < start + width
+            ),
+            None,
+        )
+        if direct is None:
+            return None
+        start, width, whole = direct
+        if start + width > len(sources.files) or any(
+            _whole_group_for_metadata2026(sources, item) is not None
+            for item in sources.files[start : start + width]
+        ):
+            return None
+    else:
+        return None
+    members = tuple(
+        _file_view_2026(sources, current) for current in range(start, start + width)
+    )
+    if any(member.kind != "part" or member.group_start != start for member in members):
+        raise ValueError("Native group members differ from actual part views")
+    whole_view = _issued_file_view2026(
+        sources,
+        kind="whole",
+        file_index=start,
+        metadata=whole,
+        group_start=start,
+    )
+    with sources._view_lock:
+        previous = sources._group_view_cache.get(start)
+        if previous is not None:
+            if (
+                previous.sources is not sources
+                or previous.width != width
+                or previous.members != members
+                or previous.whole is not whole_view
+            ):
+                raise ValueError("Native FILE group view cache conflicts")
+            return previous
+        result = NativeFileGroupView2026(sources, start, width, members, whole_view)
+        sources._group_view_cache[start] = result
+        return result
+
+
+def _judge_group_table_replacement2026(
+    sources: FileSourceSet2026, group: NativeFileGroupView2026
+) -> _JudgeGroupTableReplacement2026:
+    """Compute only the source table writes shared by authenticated mode1."""
+    validate_file_group_view_2026(group, sources)
+    whole = group.whole.metadata
+    group_index = next(
+        (
+            index
+            for index, (_start, _width, candidate) in enumerate(sources.delta_groups)
+            if candidate is whole
+        ),
+        None,
+    )
+    if group_index is None:
+        raise ValueError("Judge FILE group whole is outside the source set")
+    source = sources.delta_group_sources[group_index]
+    name = sources.delta_group_names[group_index]
+    if sources.delta_archive and sources.delta_map_size == 0:
+        # 46be0 clears D55C/D59C for direct zero-map delta in either mode.
+        files: tuple[Native2026Metadata, ...] = ()
+        file_sources: tuple[Any, ...] = ()
+        file_names: tuple[str, ...] = ()
+        has_file_vector = False
+    else:
+        files = (
+            *sources.files[: group.start],
+            whole,
+            *sources.files[group.start + group.width :],
+        )
+        file_sources = (
+            *sources.file_sources[: group.start],
+            source,
+            *sources.file_sources[group.start + group.width :],
+        )
+        file_names = (
+            *sources.file_names[: group.start],
+            name,
+            *sources.file_names[group.start + group.width :],
+        )
+        has_file_vector = True
+    return _JudgeGroupTableReplacement2026(
+        whole,
+        source,
+        name,
+        files,
+        file_sources,
+        file_names,
+        has_file_vector,
+        whole,
+    )
+
+
+def validate_file_view_2026(
+    view: NativeFileView2026, sources: FileSourceSet2026
+) -> None:
+    if type(view) is not NativeFileView2026 or type(sources) is not FileSourceSet2026:
+        raise TypeError("Concrete native FILE view and source set required")
+    validate_file_sources_2026(sources)
+    if view.sources is not sources:
+        raise ValueError("Native FILE view belongs to another table version")
+    if view.kind == "none":
+        if (
+            sources.has_file_vector
+            or view.file_index is not None
+            or view.group_start is not None
+            or view.metadata is not sources.selected_metadata
+            or sources._view_cache.get(("none", None, None)) is not view
+            or view is not sources._admission_view_cache
+        ):
+            raise ValueError("Native no-table view was not issued by this source set")
+    elif view.kind == "retained":
+        capability = sources._wait_timing_admission2026
+        stages = (
+            ()
+            if capability is None
+            else tuple(
+                stage
+                for stage in (
+                    capability.table_stages.initial,
+                    capability.table_stages.post_4a850,
+                    capability.table_stages.post_67c60,
+                    capability.table_stages.final,
+                )
+                if stage is not None
+            )
+        )
+        if (
+            view.file_index is not None
+            or view.group_start is not None
+            or view.metadata is not sources.selected_metadata
+            or not any(
+                stage is sources
+                and stage.selected_metadata is view.metadata
+                and stage.selected_source is sources.selected_source
+                and stage.selected_name == sources.selected_name
+                for stage in stages
+            )
+            or sources._view_cache.get(("retained", None, None)) is not view
+        ):
+            raise ValueError(
+                "Historical admission pointer lacks its exact table-stage proof"
+            )
+    elif type(view.file_index) is int:
+        expected = sources._view_cache.get(
+            (view.kind, view.file_index, view.group_start)
+        )
+        if expected is not view:
+            raise ValueError("Native FILE view was forged, copied, or is stale")
+        if view.kind == "whole":
+            if view.group_start != view.file_index:
+                raise ValueError("Native whole FILE index differs from its group start")
+            group = _whole_group_for_metadata2026(sources, view.metadata)
+            if group is None or group[3] is not view.metadata:
+                raise ValueError("Native whole FILE is outside this source set")
+            if view.file_index != _whole_group_current_start2026(
+                sources, group[0], group[1]
+            ):
+                raise ValueError("Native whole FILE index differs from source group")
+        elif view.kind not in ("plain", "part"):
+            raise ValueError("Unknown native FILE view kind")
+    else:
+        raise ValueError("Native FILE view has no actual table position")
+    if (
+        view.source_container is not view.metadata.source_container
+        or view.source_sha256 != view.metadata.source_sha256
+        or view.original_recovery_index
+        != sources.recovery_index_for_metadata(view.metadata)
+    ):
+        raise ValueError("Native FILE view source identity changed")
+
+
+def validate_file_group_view_2026(
+    group: NativeFileGroupView2026, sources: FileSourceSet2026
+) -> None:
+    if (
+        type(group) is not NativeFileGroupView2026
+        or type(sources) is not FileSourceSet2026
+    ):
+        raise TypeError("Concrete native FILE group view and source set required")
+    validate_file_sources_2026(sources)
+    if group.sources is not sources:
+        raise ValueError("Native FILE group belongs to another table version")
+    if sources._group_view_cache.get(group.start) is not group:
+        raise ValueError("Native FILE group was forged, copied, or is stale")
+    expected = _group_view_2026(sources, group.start)
+    if expected is not group:
+        raise ValueError("Native FILE group was forged, copied, or is stale")
+    if group.width != len(group.members) or group.width <= 0:
+        raise ValueError("Native FILE group width differs from its members")
+    for offset, member in enumerate(group.members):
+        validate_file_view_2026(member, sources)
+        if (
+            member.kind != "part"
+            or member.file_index != group.start + offset
+            or member.group_start != group.start
+        ):
+            raise ValueError("Native FILE group members are not contiguous parts")
+    validate_file_view_2026(group.whole, sources)
+    if group.whole.kind != "whole" or group.whole.group_start != group.start:
+        raise ValueError("Native whole FILE view differs from its source group")
 
 
 def _file_source_identity(source) -> tuple[int, str]:
@@ -631,6 +1400,8 @@ def admit_file_sources_2026(
     group_sources = []
     group_names = []
     delta = False
+    raw_parse_rows: list[_NativeWaitTimingSource2026] = []
+    json_prefix_steps: list[_NativeWaitTimingStep2026] = []
     selected_source = source
     selected_name = source_name
     is_list = PureWindowsPath(source_name).suffix.casefold() == ".json"
@@ -658,6 +1429,7 @@ def admit_file_sources_2026(
         suffix = PureWindowsPath(name).suffix.casefold()
         if suffix == ".scuw":
             delta = True
+            archive_source = _NativeWaitTimingSource2026(name, data, None)
             members = {
                 member.name.casefold(): member.data
                 for member in extract_zip(data, name, cancelled=cancelled)
@@ -678,14 +1450,24 @@ def admit_file_sources_2026(
                 if PureWindowsPath(path).as_posix().casefold() not in members:
                     raise _admission_fault(0x3226)
                 item = members[PureWindowsPath(path).as_posix().casefold()]
-                files.append(parse(item))
+                metadata = parse(item)
+                files.append(metadata)
                 names.append(path)
                 sources.append(item)
+                raw_parse_rows.append(_NativeWaitTimingSource2026(path, item, metadata))
             whole_name = settings.get("wholereprocalfile", {}).get("filename", "")[:259]
             if PureWindowsPath(whole_name).as_posix().casefold() not in members:
                 raise _admission_fault(0x3233)
             whole_bytes = members[PureWindowsPath(whole_name).as_posix().casefold()]
             whole = parse(whole_bytes)
+            whole_source = _NativeWaitTimingSource2026(whole_name, whole_bytes, whole)
+            if is_list:
+                json_prefix_steps.extend(
+                    (
+                        _NativeWaitTimingStep2026("46010", (archive_source,)),
+                        _NativeWaitTimingStep2026("32130", (whole_source,)),
+                    )
+                )
             groups.append((start, count, whole))
             group_sources.append(whole_bytes)
             group_names.append(whole_name)
@@ -736,12 +1518,16 @@ def admit_file_sources_2026(
                 names.append(member_name)
                 sources.append(item)
                 output.append(metadata)
+                raw_parse_rows.append(
+                    _NativeWaitTimingSource2026(member_name, item, metadata)
+                )
         else:
             metadata = parse(data)
             files.append(metadata)
             names.append(name)
             sources.append(data)
             output.append(metadata)
+            raw_parse_rows.append(_NativeWaitTimingSource2026(name, data, metadata))
         if len(files) > 16:
             raise _admission_fault(
                 0x308F if is_list else 0x30BE if suffix == ".cuwc" else 0x30D8
@@ -818,6 +1604,33 @@ def admit_file_sources_2026(
         if is_list
         else ()
     )
+    phase6_transform_state = None
+    json_initial_record = None
+    if (is_list or PureWindowsPath(source_name).suffix.casefold() == ".cuwc") and files:
+        initial_metadata = files[0]
+        initial_source = sources[0]
+        initial_name = names[0]
+        initial_group = next(
+            (group for member, group in map_entries if member is initial_metadata),
+            None,
+        )
+        if initial_group is not None:
+            initial_metadata = groups[initial_group][2]
+            initial_source = group_sources[initial_group]
+            initial_name = group_names[initial_group]
+        initial_candidates = list(raw_parse_rows)
+        for step in json_prefix_steps:
+            initial_candidates.extend(step.sources)
+        json_initial_record = next(
+            (
+                record
+                for record in initial_candidates
+                if record.metadata is initial_metadata
+                and record.source is initial_source
+                and record.source_name == initial_name
+            ),
+            None,
+        )
     if (
         has_vector
         and "Phase6" in contacts
@@ -826,7 +1639,6 @@ def admit_file_sources_2026(
         from scripts.calibration_2026 import (
             native2026_merge_phase6,
             native2026_node_values,
-            native2026_validate_phase6_pair,
         )
 
         def mapped(metadata):
@@ -838,6 +1650,11 @@ def admit_file_sources_2026(
             item.vehicle.get("contacttype", "") == "Phase6" and mapped(item) is not None
             for item in files
         )
+        phase6_raw_files = tuple(files)
+        phase6_raw_names = tuple(names)
+        phase6_raw_sources = tuple(sources)
+        phase6_slots = list(range(len(files)))
+        phase6_edges = []
         index = 0
         while index < len(files):
             left = files[index]
@@ -864,6 +1681,12 @@ def admit_file_sources_2026(
                         value for owner, value in recovery_indexes if owner is left
                     )
                     try:
+                        left_name = names[index]
+                        left_source = sources[index]
+                        right_name = names[following]
+                        right_source = sources[following]
+                        left_slot = phase6_slots[index]
+                        right_slot = phase6_slots[following]
                         left = native2026_merge_phase6(left, right)
                     except ValueError as error:
                         if not str(error).startswith("Not combinable:"):
@@ -871,13 +1694,31 @@ def admit_file_sources_2026(
                         from scripts.programming_2026_common import NativeException2026
 
                         raise NativeException2026("Not combinable.") from error
+                    phase6_edges.append(
+                        (
+                            len(phase6_edges),
+                            left_slot,
+                            right_slot,
+                            files[index],
+                            files[following],
+                            left,
+                            left_name,
+                            left_source,
+                            right_name,
+                            right_source,
+                        )
+                    )
                     files[index] = left
                     recovery_indexes.append((left, left_recovery_index))
                     sources[index] = left.source_container
+                    del phase6_slots[following]
                     del files[following], sources[following], names[following]
                 else:
                     following += 1
             index += 1
+        post_4a850_files = tuple(files)
+        post_4a850_names = tuple(names)
+        post_4a850_sources = tuple(sources)
         if mapped_phase6:
             # 67a60/67c60 use first DiagID (fallback LogicalAddress), inserting
             # unmapped Phase6 FILES before the first FILE in each key bucket.
@@ -919,39 +1760,64 @@ def admit_file_sources_2026(
             files = [row[0] for row in ordered]
             sources = [row[1] for row in ordered]
             names = [row[2] for row in ordered]
-            # 68190 checks each same-address run using whole-group pointers;
-            # it does not merge or rewrite their source-owned map entries.
-            index = 0
-            while index < len(files):
-                item = files[index]
-                if item.vehicle.get("contacttype", "") != "Phase6":
-                    index += 1
-                    continue
-                first = native2026_node_values(item)
-                candidates = []
-                while index < len(files):
-                    current = files[index]
-                    node = native2026_node_values(current)
-                    if any(
-                        first.get(name, "") != node.get(name, "")
-                        for name in ("diagid", "logicaladdress")
-                    ):
-                        break
-                    group = mapped(current)
-                    candidates.append(current if group is None else groups[group][2])
-                    index += 1 if group is None else groups[group][1]
-                for left_index, left in enumerate(candidates):
-                    for right in candidates[left_index + 1 :]:
-                        try:
-                            native2026_validate_phase6_pair(left, right)
-                        except ValueError as error:
-                            if not str(error).startswith("Not combinable:"):
-                                raise
-                            from scripts.programming_2026_common import (
-                                NativeException2026,
-                            )
+            if engine._metadata is not None or engine._file_sources is not None:
+                # Legacy reload remains software-open; preserve its prior
+                # preflight rejection without assigning cold C44 timing parity.
+                from scripts.calibration_2026 import native2026_validate_phase6_pair
 
-                            raise NativeException2026("Not combinable.") from error
+                index = 0
+                while index < len(files):
+                    first = files[index]
+                    if first.vehicle.get("contacttype", "") != "Phase6":
+                        index += 1
+                        continue
+                    first_node = native2026_node_values(first)
+                    candidates = []
+                    while index < len(files):
+                        item = files[index]
+                        node = native2026_node_values(item)
+                        if any(
+                            first_node.get(key, "") != node.get(key, "")
+                            for key in ("diagid", "logicaladdress")
+                        ):
+                            break
+                        group = mapped(item)
+                        if group is None:
+                            candidates.append(item)
+                            index += 1
+                        else:
+                            candidates.append(groups[group][2])
+                            index += groups[group][1]
+                    for left_index, left in enumerate(candidates):
+                        for right in candidates[left_index + 1 :]:
+                            try:
+                                native2026_validate_phase6_pair(left, right)
+                            except ValueError as error:
+                                if not str(error).startswith("Not combinable:"):
+                                    raise
+                                from scripts.programming_2026_common import (
+                                    NativeException2026,
+                                )
+
+                                raise NativeException2026("Not combinable.") from error
+        if mapped_phase6:
+            phase6_reorder_state = (
+                tuple(files),
+                tuple(names),
+                tuple(sources),
+            )
+        else:
+            phase6_reorder_state = None
+        phase6_transform_state = (
+            phase6_raw_files,
+            phase6_raw_names,
+            phase6_raw_sources,
+            tuple(phase6_edges),
+            post_4a850_files,
+            post_4a850_names,
+            post_4a850_sources,
+            phase6_reorder_state,
+        )
         output = []
         emitted_groups = set()
         for item in files:
@@ -976,6 +1842,88 @@ def admit_file_sources_2026(
     else:
         selected_source = sources[0]
         selected_name = names[0]
+
+    trajectory: list[_NativeWaitTimingStep2026] = []
+    suffix = PureWindowsPath(source_name).suffix.casefold()
+
+    if is_list:
+        trajectory.extend(json_prefix_steps)
+        trajectory.append(_NativeWaitTimingStep2026("43cd0", tuple(raw_parse_rows)))
+        if json_initial_record is None:
+            raise ValueError("Initial JSON native pointer has no raw source record")
+        trajectory.append(
+            _NativeWaitTimingStep2026(
+                "32ff0",
+                (json_initial_record,),
+                slot=0,
+                value=True,
+            )
+        )
+    elif suffix == ".scuw":
+        archive = _NativeWaitTimingSource2026(source_name, source, None)
+        whole = _NativeWaitTimingSource2026(
+            group_names[0], group_sources[0], groups[0][2]
+        )
+        trajectory.extend(
+            (
+                _NativeWaitTimingStep2026("46010", (archive,)),
+                _NativeWaitTimingStep2026("43cd0", tuple(raw_parse_rows)),
+                _NativeWaitTimingStep2026("32130", (whole,)),
+                _NativeWaitTimingStep2026("41940", (whole,)),
+            )
+        )
+    elif suffix == ".cuwc":
+        if json_initial_record is None:
+            raise ValueError("Initial CUWC native pointer has no raw source record")
+        trajectory.extend(
+            (
+                _NativeWaitTimingStep2026("43cd0", tuple(raw_parse_rows)),
+                _NativeWaitTimingStep2026(
+                    "32ff0",
+                    (json_initial_record,),
+                    slot=0,
+                    value=False,
+                ),
+            )
+        )
+    if phase6_transform_state is not None:
+        (
+            phase6_raw_files,
+            phase6_raw_names,
+            phase6_raw_sources,
+            phase6_edges,
+            post_4a850_files,
+            post_4a850_names,
+            post_4a850_sources,
+            phase6_reorder_state,
+        ) = phase6_transform_state
+        mapped_reorder = None
+        if phase6_reorder_state is not None:
+            post_67c60_files, post_67c60_names, post_67c60_sources = (
+                phase6_reorder_state
+            )
+            mapped_reorder = _NativePhase6Reorder67c602026(
+                post_4a850_files,
+                post_4a850_names,
+                post_4a850_sources,
+                map_entries,
+                post_67c60_files,
+                post_67c60_names,
+                post_67c60_sources,
+                (0, True, selected, selected_source, selected_name),
+            )
+        phase6_transform = _NativePhase6Transform4a8502026(
+            phase6_raw_files,
+            phase6_raw_names,
+            phase6_raw_sources,
+            phase6_edges,
+            post_4a850_files,
+            post_4a850_names,
+            post_4a850_sources,
+            mapped_reorder,
+        )
+    else:
+        phase6_transform = None
     result = FileSourceSet2026(
         engine,
         source_name,
@@ -1002,6 +1950,244 @@ def admit_file_sources_2026(
         tuple(recovery_indexes),
     )
     _file_sets[id(result)] = result
+    if trajectory and engine._metadata is None and engine._file_sources is None:
+        steps = tuple(trajectory)
+        issued_stages = False
+
+        def _issue_cold_file_table_stages_2026(
+            stage_sources: FileSourceSet2026,
+            *,
+            steps: tuple[_NativeWaitTimingStep2026, ...],
+            phase6_transform: _NativePhase6Transform4a8502026 | None,
+        ) -> _NativeColdFileTableStages2026:
+            nonlocal issued_stages
+            if (
+                issued_stages
+                or stage_sources is not result
+                or steps is not locals_steps
+                or phase6_transform is not locals_transform
+            ):
+                raise ValueError("Cold FILE stage issuer is one-shot and source-bound")
+            issued_stages = True
+
+            def output_for(table_files):
+                output_files = []
+                emitted = set()
+                index = 0
+                while index < len(table_files):
+                    item = table_files[index]
+                    group_index = next(
+                        (group for member, group in map_entries if member is item),
+                        None,
+                    )
+                    if group_index is None:
+                        direct = next(
+                            (
+                                (start, width, group)
+                                for group, (start, width, _whole) in enumerate(groups)
+                                if delta and not is_list and start == index
+                            ),
+                            None,
+                        )
+                        if direct is None:
+                            output_files.append(item)
+                        else:
+                            _start, width, group = direct
+                            output_files.append(groups[group][2])
+                            index += width
+                            continue
+                    elif group_index not in emitted:
+                        output_files.append(groups[group_index][2])
+                        emitted.add(group_index)
+                    index += 1
+                return tuple(output_files)
+
+            def stage(
+                table_files,
+                table_names,
+                table_sources,
+                pointer,
+                pointer_source,
+                pointer_name,
+            ):
+                positions = tuple(
+                    index for index, item in enumerate(table_files) if item is pointer
+                )
+                if len(positions) > 1:
+                    raise ValueError("Cold FILE pointer is ambiguous in table")
+                retained = not positions
+                return replace(
+                    result,
+                    selected_metadata=pointer,
+                    selected_source=pointer_source,
+                    selected_name=pointer_name,
+                    file_names=tuple(table_names),
+                    files=tuple(table_files),
+                    file_sources=tuple(table_sources),
+                    output_files=output_for(table_files),
+                    selection_role="retained_clone" if retained else "file",
+                    auxiliary_metadata=pointer if retained else None,
+                )
+
+            if locals_transform is None:
+                raw_files, raw_names, raw_sources = (
+                    result.files,
+                    result.file_names,
+                    result.file_sources,
+                )
+            else:
+                raw_files = locals_transform.raw_files
+                raw_names = locals_transform.raw_names
+                raw_sources = locals_transform.raw_sources
+
+            if is_list or suffix == ".cuwc":
+                initial_record = json_initial_record
+                if initial_record is None:
+                    raise ValueError("Cold initial pointer lacks its raw source record")
+                initial_pointer = initial_record.metadata
+                initial_pointer_source = initial_record.source
+                initial_pointer_name = initial_record.source_name
+            elif suffix == ".scuw":
+                initial_pointer = groups[0][2]
+                initial_pointer_source = group_sources[0]
+                initial_pointer_name = group_names[0]
+            else:
+                initial_pointer = result.selected_metadata
+                initial_pointer_source = result.selected_source
+                initial_pointer_name = result.selected_name
+
+            initial = stage(
+                raw_files,
+                raw_names,
+                raw_sources,
+                initial_pointer,
+                initial_pointer_source,
+                initial_pointer_name,
+            )
+            if (
+                locals_transform is None
+                and initial.files == result.files
+                and all(
+                    a is b for a, b in zip(initial.files, result.files, strict=True)
+                )
+                and initial.file_names == result.file_names
+                and all(
+                    a is b
+                    for a, b in zip(
+                        initial.file_sources, result.file_sources, strict=True
+                    )
+                )
+                and initial.output_files == result.output_files
+                and all(
+                    a is b
+                    for a, b in zip(
+                        initial.output_files, result.output_files, strict=True
+                    )
+                )
+                and initial.selected_metadata is result.selected_metadata
+                and initial.selected_source is result.selected_source
+                and initial.selected_name == result.selected_name
+                and initial.selection_role == result.selection_role
+                and initial.auxiliary_metadata is result.auxiliary_metadata
+            ):
+                initial = result
+
+            post_4a850 = None
+            post_67c60 = None
+            if locals_transform is not None:
+                pointer = initial_pointer
+                pointer_source = initial_pointer_source
+                pointer_name = initial_pointer_name
+                for edge in locals_transform.edges:
+                    if pointer is edge[3]:
+                        pointer = edge[5]
+                        pointer_source = edge[5].source_container
+                        pointer_name = edge[6]
+                post_4a850 = stage(
+                    locals_transform.post_4a850_files,
+                    locals_transform.post_4a850_names,
+                    locals_transform.post_4a850_sources,
+                    pointer,
+                    pointer_source,
+                    pointer_name,
+                )
+                reorder = locals_transform.mapped_reorder
+                if reorder is not None:
+                    post_67c60 = stage(
+                        reorder.post_67c60_files,
+                        reorder.post_67c60_names,
+                        reorder.post_67c60_sources,
+                        pointer,
+                        pointer_source,
+                        pointer_name,
+                    )
+                elif (
+                    len(post_4a850.files) == len(result.files)
+                    and all(
+                        left is right
+                        for left, right in zip(
+                            post_4a850.files, result.files, strict=True
+                        )
+                    )
+                    and post_4a850.file_names == result.file_names
+                    and len(post_4a850.file_sources) == len(result.file_sources)
+                    and all(
+                        a is b
+                        for a, b in zip(
+                            post_4a850.file_sources,
+                            result.file_sources,
+                            strict=True,
+                        )
+                    )
+                    and len(post_4a850.output_files) == len(result.output_files)
+                    and all(
+                        a is b
+                        for a, b in zip(
+                            post_4a850.output_files,
+                            result.output_files,
+                            strict=True,
+                        )
+                    )
+                    and post_4a850.selected_metadata is result.selected_metadata
+                    and post_4a850.selected_source is result.selected_source
+                    and post_4a850.selected_name == result.selected_name
+                    and post_4a850.selection_role == result.selection_role
+                    and post_4a850.auxiliary_metadata is result.auxiliary_metadata
+                ):
+                    post_4a850 = result
+
+            stages = _NativeColdFileTableStages2026(
+                initial, post_4a850, post_67c60, result
+            )
+            for derivative in (initial, post_4a850, post_67c60, result):
+                if derivative is not None:
+                    _file_sets[id(derivative)] = derivative
+            return stages
+
+        locals_steps = steps
+        locals_transform = phase6_transform
+        table_stages = _issue_cold_file_table_stages_2026(
+            result,
+            steps=steps,
+            phase6_transform=phase6_transform,
+        )
+        admission = engine._issue_file_wait_timing_admission2026(
+            result,
+            steps,
+            phase6_transform=phase6_transform,
+            table_stages=table_stages,
+        )
+        if any(
+            derivative._wait_timing_admission2026 is not admission
+            for derivative in (
+                table_stages.initial,
+                table_stages.post_4a850,
+                table_stages.post_67c60,
+                table_stages.final,
+            )
+            if derivative is not None
+        ):
+            raise ValueError("Cold FILE table derivatives lost their admission")
     return result
 
 
@@ -1164,6 +2350,7 @@ def read_reprogramming_data_file_2026(
     """1005ccf0 byte-input producer and output flow; public region is one based."""
     from scripts.cuw_2026 import CUWEngine2026
     from scripts.programming_2026_common import (
+        NativeCallbackLookupError,
         NativeException2026,
         NativePassThruException2026,
     )
@@ -1207,7 +2394,7 @@ def read_reprogramming_data_file_2026(
                     engine, source_name, source, region=region - 1
                 )
                 metadata = engine.bind_file_sources(sources)
-            except NativeException2026 as error:
+            except (NativeException2026, NativeCallbackLookupError) as error:
                 return rejected(error)
         else:
             if type(source) is LargeSource2026:
@@ -1231,7 +2418,7 @@ def read_reprogramming_data_file_2026(
                     cancelled=cancelled,
                 )
                 metadata = engine.bind_file_sources(sources)
-            except NativeException2026 as error:
+            except (NativeException2026, NativeCallbackLookupError) as error:
                 return rejected(error)
         else:
             # 331b0 creates an independent parser; recovery output never binds it.

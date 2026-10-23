@@ -38,6 +38,20 @@ captured file bytes, without writing extracted OEM content to disk:
 - Actual multi-file metadata versions 10/12 are rejected (`0x318c`). Mixed
   Ethernet/unsupported contacts fail (`0x31a2`). File capacity is 16.
 
+For a cold raw admission, the same walk also issues a private immutable wait
+timing trajectory on its `FileSourceSet2026`. It records source bytes, parsed
+metadata identities and literal operation order only; it does not carry
+precomputed wait values. Issuance requires the engine's exact frontend catalog
+and its General table to be bound already. JSON keeps each encountered SCUW
+`46010`/whole `32130` before the flattened `43cd0` files and ends with
+`32ff0(0, TRUE)`. Direct SCUW keeps `46010`, PARTS `43cd0`, whole `32130`, and
+the separate final whole `41940`. Direct CUWC keeps extracted-member `43cd0`
+and ends with `32ff0(0, FALSE)`. Ordinary direct CUW is a current-only route
+and receives no timing capability. Derived file sets retain the same one-use
+capability; `bind_file_sources` consumes it under the engine lock after host
+validation, immediately before the first source mutation. Native writes
+already reached remain visible if a later step fails.
+
 Known native admission rejection branches issue error 6 with the original
 `CPassThruCtrlr.cpp` location from authenticated PE RVA `7c810` and their native
 line value. The public wrapper returns 1001 and logs `1(6)` while preserving
@@ -84,11 +98,16 @@ Native integer lookup faults retain partial output writes and status 1001;
 PassThru faults 9999/1021 map to 2001/1002, as recovered from catch ASM.
 
 `FileSourceSet2026.after_group_reset(..., worker=actual_worker)` produces native
-`4b900` FILE replacement views. Private lineage proves the exact old source and
-worker that issued each reset; arbitrary admitted sets and dataclass copies are
-not accepted as reset results. Direct delta clears the FILE table and selects
-A48. A mapped JSON group replaces its member span with the same whole pointer;
-the source pointer-map entries remain distinct from the current FILE indices.
+mode2 `4b900` FILE replacement views. Private lineage proves the exact old
+source and worker that issued each reset; arbitrary admitted sets and dataclass
+copies are not accepted as reset results. The separate mode1 mapped factory
+requires the worker's authenticated judge origin. Its direct zero-map sibling
+requires the canonical current A48 view and the worker's direct origin receipt,
+then issues a new no-table version retaining that runtime A48 metadata and the
+original output/recovery descriptors. Neither mode1 factory is a public source
+selector or a replacement for the engine's single authenticated publisher.
+A mapped JSON group replaces its member span with the same whole pointer; the
+source pointer-map entries remain distinct from the current FILE indices.
 Initial `32ff0(0,true)` selects the whole pointer whenever table slot zero is
 mapped. `execution_files` describes the initial execution lease, **not** a
 replacement for `3ec30`/`48e80` traversal over the actual FILE table and captured
@@ -157,10 +176,49 @@ view. Public tests trigger the real notification writer and verify the saved
 full-file identity, including a streamed 300 MiB large original and original SCUW
 archive bytes distinct from the current whole-calibration digest.
 
+`FileSourceSet2026` also issues immutable `NativeFileView2026` and
+`NativeFileGroupView2026` values for the current table version. Descriptor
+identity is cached on that exact source set: plain and part views name real
+table slots, while a whole view names its group's current start. A current-only
+source has an admission view of kind `none` with no table index; its metadata
+still describes the actual current FILE. Validation rejects copied, stale and
+cross-version descriptors. The authenticated mode1 judge-reset seam is
+separate from the existing mode2 retry producer and requires the worker's
+exact native judge-origin receipt; the positive mode1 source producer is owned
+by the later getter/judge stage. Mapped table views follow the identity pointer
+map after group compaction; original group ranges are consulted only for direct
+zero-map archives. The mode1 source transform clears the FILE table for that
+same zero-map branch while selecting the source-issued whole FILE.
+
+Cold C44 timing admission captures the raw 43cd0 table and initial JSON/CUWC
+32ff0 source before the Phase6 transform. The same one-shot admission carries
+an immutable Phase6 transform: successful merge edges preserve original raw
+slot ordinals, exact input metadata/source identities, and each returned
+composite lineage. The post-4a850 table is separate from the optional mapped
+post-67c60 table. Only the source-issued mapped branch runs 68190 and a second
+32ff0 selection; plain Phase6 keeps the initial selection and timing vectors.
+The admission also owns the exact registered FILE-table derivatives for the
+initial pointer, post-4a850 table, optional post-67c60 table, and final pointer.
+The engine publishes each derivative only at its native source point, so a
+failure after a reached pointer or table store leaves that precise table
+visible while the admission remains sealed from retry and downstream consumers.
+Historical pointers are admitted only through their identity in that same
+one-shot table-stage payload.
+The raw consumer tests fault the initial JSON selector, direct SCUW WHOLE
+selector, and mapped second selector at their actual source points. They also
+fault the host persistence bind after a completed no-map Phase6 transform;
+each case checks the retained canonical stage, sealed retries, and close
+cleanup. A wrong-stage publication and replayed consumed stage are rejected
+without changing the published tuple.
+The helper does not replay the merge producer or claim parity for native late
+allocation, payload-transfer, rebuild, destruction, or partial-compaction
+faults.
+
 Run the authored producer/consumer checks:
 
 ```sh
-python -m unittest discover -s tests -p test_cuw_file_services.py -v
+flock -x runtime/no-car-next-20261022/unittest.lock \
+  python -m unittest discover -s tests -p test_cuw_file_services.py -v
 ```
 
 Tests use authored binary containers and archives, with a static authenticated

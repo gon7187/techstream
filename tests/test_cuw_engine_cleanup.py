@@ -140,54 +140,18 @@ class EngineCleanupTests(unittest.TestCase):
         self.assertEqual(tuple(state.targets), resources)
 
     def stopped_two_file_job(self):
-        from scripts.cuw_file_services import admit_file_sources_2026
         from tests.test_cuw_engine_threads import ThreadOwnershipTests
 
         fixture = ThreadOwnershipTests()
         self.addCleanup(fixture.doCleanups)
-        original, _controller, _job, session = fixture.imported_prepare(
-            operation="get_cid"
+        engine, controller, job, root, _pair, _rows, _sdk, _sources = (
+            fixture.authored_two_file_getter_job()
         )
-        source = original._source
-        assert isinstance(source, bytes)
-        engine = CUWEngine2026(
-            Path("runtime/no-car-21/recovered/CUW.dll").read_bytes(),
-            general_parameters=original._general_parameters,
-        )
-        self.addCleanup(engine.close)
-        engine.configure(struct.pack("<IIddII", 4, 0, 5.0, 13.0, 0, 0))
-        sources = admit_file_sources_2026(
-            engine,
-            "files.json",
-            b'["one.cuw","two.cuw"]',
-            region=0,
-            source_files={"one.cuw": source, "two.cuw": calibration()},
-        )
-        engine.bind_file_sources(sources)
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        names, originals, count = sources.recovery_sources()
-        engine.bind_persistence(
-            CUWPersistence(
-                Path(directory.name),
-                ReproInfoState(
-                    tuple(
-                        RecoveryCalibration(name, data)
-                        for name, data in zip(names, originals, strict=True)
-                    ),
-                    multi_calibration_file_num=count,
-                ),
-            )
-        )
-        runtime = NativeRuntime2026(
-            session.trace.action,
-            clock=session.trace.clock,
-            cancelled=session.trace.cancelled,
-            local_seconds_of_day=session.trace.native_local_seconds_of_day,
-            local_milliseconds_of_day=session.trace.native_local_milliseconds_of_day,
-        )
-        controller = make_controller(runtime)
-        job = engine.bind_thread_job(controller)
+        fixture.complete_two_file_getter_roots(engine, controller, job, root)
+        session = root.next_session2026("get_cid", node=1, cpu_index=0)
+        session.bind_runtime2026(controller.runtime)
+        session.bind_engine2026(engine)
+        session.bind_controller2026(controller)
         fault = OSError("authored CID clock boundary")
 
         def clock_fault():
@@ -201,14 +165,6 @@ class EngineCleanupTests(unittest.TestCase):
         self.assertIs(caught.exception, fault)
         self.assertEqual(engine.stop_receiving_cid(timeout=2), 0)
         self.assertFalse(job.native_worker_exists)
-        from scripts.j2534_2026 import J2534InterfacePair2026
-
-        engine_device = J2534Device2026(self.provider, background_workers=False)
-        control_device = J2534Device2026(self.provider, background_workers=False)
-        controller.runtime.action = control_device.primitive
-        engine.bind_interface_pair(
-            J2534InterfacePair2026(engine_device, control_device)
-        )
         return engine, controller, job
 
     def test_native_cid_stop_reissues_worker_preserving_actual_two_file_globals(self):
@@ -397,14 +353,19 @@ class EngineCleanupTests(unittest.TestCase):
     def test_disconnect_host_fault_retains_identity_and_all_target_owners(self):
         error = OSError("authored host primitive failure")
         original = tuple(self.cleanup.state.targets)
+        self.engine._cid_selection_initialized = True
         self.device.connecting, self.device.channel_id = True, 7
         self.provider_fault = error
         with self.assertRaises(OSError) as caught:
             self.cleanup.run()
         self.assertIs(caught.exception, error)
+        self.assertTrue(self.engine._cid_selection_initialized)
         self.assertEqual(tuple(self.cleanup.state.targets), original)
         self.assertFalse(self.cleanup.state.completed)
         self.assertEqual(self.cleanup.state.trace, ["disconnect"])
+        self.provider_fault = None
+        self.cleanup.run()
+        self.assertFalse(self.engine._cid_selection_initialized)
 
     def test_device_clear_fault_keeps_prior_target_release_and_global_reset(self):
         error = InterruptedError("authored host cancellation during device clear")
@@ -613,7 +574,19 @@ class EngineCleanupTests(unittest.TestCase):
 
     def delta_engine(self, *, listed=False):
         from scripts.cuw_file_services import admit_file_sources_2026
+        from tests.test_calibration_2026 import cuw
         from tests.test_cuw_file_services import PublicFileTests
+
+        def source(target):
+            return cuw(
+                "[Format]\nVersion=105\n[Vehicle]\nNumberOfNode=1\n"
+                "ContactType=P5-Unified\nKindOfECU=149\n"
+                "[Node01]\nDiagID=0700\nRequiredSpecReproVer=02\n"
+                "NumberOfCalibration=1\n[CPU11]\nCPUImageName=authored.bin\n"
+                "CPUType=311\nNewCID=NEW1\nNumberOfTargets=2\n"
+                f"01_TargetCalibration={target}\n02_TargetCalibration=LATEST\n",
+                (b"data",),
+            )
 
         archive = PublicFileTests.archive(
             b"[Vehicle]\nContactType=P5-Unified\n",
@@ -622,15 +595,16 @@ class EngineCleanupTests(unittest.TestCase):
                     "Setting.ini",
                     b"[DeltaReproCalFile]\nFileNum=2\nFileName1=part1.cuw\nFileName2=part2.cuw\n[WholeReproCalFile]\nFileName=whole.cuw\n",
                 ),
-                ("part1.cuw", calibration(first_target="PART-1")),
-                ("part2.cuw", calibration(first_target="PART-2")),
-                ("whole.cuw", calibration(first_target="WHOLE")),
+                ("part1.cuw", source("PART-1")),
+                ("part2.cuw", source("PART-2")),
+                ("whole.cuw", source("WHOLE")),
             ),
         )
         engine = CUWEngine2026(
             Path("runtime/no-car-21/recovered/CUW.dll").read_bytes(),
         )
         self.addCleanup(engine.close)
+        engine.bind_frontend_parameters(PublicFileTests.frontend_parameters())
         engine.configure(struct.pack("<IIddII", 4, 0, 5.0, 13.0, 0, 0))
         if listed:
             sources = admit_file_sources_2026(
@@ -639,7 +613,7 @@ class EngineCleanupTests(unittest.TestCase):
                 b'["plain.cuw","parts.scuw"]',
                 region=0,
                 source_files={
-                    "plain.cuw": calibration(first_target="PLAIN"),
+                    "plain.cuw": source("PLAIN"),
                     "parts.scuw": archive,
                 },
             )

@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast
+from typing import Any, cast
 
 from scripts.calibration_2026 import NativeUSBSource2026, _validate_container_2026
 from scripts.cuw_large import MAX_SIZE, LargeSource2026, validate_large_container_2026
@@ -35,6 +35,33 @@ STREAM_CHUNK = 1024 * 1024
 
 
 CalibrationSource = bytes | LargeSource2026 | NativeUSBSource2026
+
+
+@dataclass(frozen=True, eq=False)
+class _NativeRecoverySourceReplacement2026:
+    """One exact23b10 row replacement, kept separate from source originals."""
+
+    engine: Any
+    persistence: Any
+    state: Any
+    sources: Any
+    origin: object
+    index: int
+    original_path: str
+    original_source: CalibrationSource
+    replacement_path: str
+    replacement_source: CalibrationSource
+    whole_metadata: Any
+
+
+@dataclass(frozen=True, eq=False)
+class _NativeRecoverySourceReplacementSuccessors2026:
+    engine: Any
+    persistence: Any
+    state: Any
+    old_sources: Any
+    new_sources: Any
+    replacements: Any
 
 
 def calibration_source_identity(source: CalibrationSource) -> tuple[int, str]:
@@ -555,6 +582,15 @@ class CUWPersistence:
         self._lock = threading.RLock()
         self._cleanup_lease = None
         self._cleanup_assignment = None
+        self._file_source_replacements2026: dict[
+            int, _NativeRecoverySourceReplacement2026
+        ] = {}
+
+    def _guard_cold_file_admission2026(self) -> None:
+        engine = self._engine
+        if engine is None or engine._wait_admission_cursor2026 is None:
+            return
+        engine._reject_failed_cold_file_admission2026()
 
     def validate_engine_owner(self, engine):
         """Preflight concrete engine identity without mutating source or owner."""
@@ -565,16 +601,55 @@ class CUWPersistence:
         if self._engine is not None and self._engine is not engine:
             raise ValueError("Persistence source engine cannot be replaced")
 
+    def _associate_engine_owner2026(self, engine) -> None:
+        """Reserve the bidirectional host owner before the first FILE source exists."""
+        self._guard_cold_file_admission2026()
+        self.validate_engine_owner(engine)
+        with self._lock:
+            if self._cleanup_lease is not None:
+                raise ValueError("Persistence cleanup is active")
+            if self._engine is not None and self._engine is not engine:
+                raise ValueError("Persistence source engine cannot be replaced")
+            self._engine = engine
+
     def bind_engine_source(self, engine):
         """Bind the actual CUW engine, without replacing either notification."""
+        self._guard_cold_file_admission2026()
         self.validate_engine_owner(engine)
         engine.validate_persistence_binding(self)
+        if self.state.loaded:
+            engine._record_getter_protocol_recovery_389c0_2026(self)
+        if self._engine is not engine:
+            self._file_source_replacements2026.clear()
         self._engine = engine
 
     def validate_file_source_association(
         self, sources, metadata, *, state_snapshot=None
     ):
         """Authenticate43ee0's recovery originals against its exact selected FILE."""
+        index = self._validate_file_source_membership(
+            sources, metadata, state_snapshot=state_snapshot
+        )
+        state = self.state if state_snapshot is None else state_snapshot
+        if state.calibration_file_index != index:
+            raise ValueError(
+                "Recovery file index differs from the actual selected FILE"
+            )
+
+    def _validate_file_source_membership(
+        self, sources, metadata, *, state_snapshot=None
+    ):
+        """Validate authored originals and resolve a live FILE's original index."""
+        return self._validate_file_source_membership_using_replacements2026(
+            sources,
+            metadata,
+            state_snapshot=state_snapshot,
+            replacements=self._file_source_replacements2026,
+        )
+
+    def _validate_file_source_membership_using_replacements2026(
+        self, sources, metadata, *, state_snapshot, replacements
+    ):
         from scripts.cuw_file_services import validate_file_sources_2026
 
         validate_file_sources_2026(sources, sources.engine)
@@ -592,65 +667,290 @@ class CUWPersistence:
             raise ValueError(
                 "Recovery file count differs from its actual source producer"
             )
-        for calibration, name, original in zip(
-            state.calibrations, names, originals, strict=True
+        # Keeping the association per row avoids changing FileSourceSet's
+        # immutable recovery provenance.
+        for index, (calibration, name, original) in enumerate(
+            zip(state.calibrations, names, originals, strict=True)
         ):
-            if (
-                calibration.source_path != name
-                or calibration.source_bytes is not original
-            ):
+            binding = replacements.get(index)
+            if binding is None:
+                matches = (
+                    calibration.source_path == name
+                    and calibration.source_bytes is original
+                )
+            else:
+                matches = (
+                    self._validate_file_source_replacement2026(
+                        binding,
+                        sources=sources,
+                        state=state,
+                        index=index,
+                        name=name,
+                        original=original,
+                    )
+                    and calibration.source_path == binding.replacement_path
+                    and (calibration.source_bytes is binding.replacement_source)
+                )
+            if not matches:
                 raise ValueError(
                     "Recovery originals differ from the issued FILE association"
                 )
         index = sources.recovery_index_for_metadata(metadata)
-        if state.calibration_file_index != index:
-            raise ValueError(
-                "Recovery file index differs from the actual selected FILE"
+        return index
+
+    def _prepare_file_source_binding_candidate2026(self, sources):
+        """Preflight the final recovery association without publishing it."""
+        from scripts.cuw_file_services import validate_file_sources_2026
+
+        engine = sources.engine
+        validate_file_sources_2026(sources, engine)
+        self.validate_engine_owner(engine)
+        if engine.persistence is not self or self._cleanup_lease is not None:
+            raise ValueError("Actual idle FILE persistence owner required")
+        if self.state.calibrations:
+            self.state.validate()
+        elif not self._same_cleanup_fields(self.state, ReproInfoState(())):
+            raise ValueError("Fresh FILE state must follow actual recovery reset")
+        names, originals, count = sources.recovery_sources()
+        if not names or len(names) != len(originals) or len(names) != (count or 1):
+            raise ValueError("Complete native recovery original vector required")
+        configuration = engine.configuration
+        if configuration is None:
+            raise ValueError("Configured native engine required for FILE persistence")
+        calibrations = tuple(
+            replace(
+                self.state.calibrations[index],
+                source_path=name,
+                source_bytes=original,
             )
+            if index < len(self.state.calibrations)
+            else RecoveryCalibration(
+                name,
+                original,
+                blank_ecu_flags=(False,) * configuration.cpu_maximum,
+            )
+            for index, (name, original) in enumerate(zip(names, originals, strict=True))
+        )
+        candidate = replace(
+            self.state, calibrations=calibrations, multi_calibration_file_num=count
+        )
+        candidate.validate()
+        self.validate_file_source_association(
+            sources, sources.selected_metadata, state_snapshot=candidate
+        )
+        return candidate
+
+    def _validate_file_source_replacement2026(
+        self, binding, *, sources, state, index, name, original
+    ) -> bool:
+        """Validate one engine-issued23b10 replacement without relaxing other rows."""
+        from scripts.calibration_2026 import Native2026Metadata
+        from scripts.cuw_file_services import FileSourceSet2026
+
+        if (
+            type(binding) is not _NativeRecoverySourceReplacement2026
+            or binding.engine is not self._engine
+            or binding.persistence is not self
+            or binding.state is not state
+            or state is not self.state
+            or binding.sources is not sources
+            or type(sources) is not FileSourceSet2026
+            or binding.index != index
+            or binding.original_path != name
+            or binding.original_source is not original
+        ):
+            return False
+        metadata = binding.whole_metadata
+        if type(metadata) is not Native2026Metadata:
+            return False
+        try:
+            if sources.recovery_index_for_metadata(metadata) != index:
+                return False
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _prepare_file_source_replacement_successors2026(
+        self, old_sources, new_sources
+    ) -> _NativeRecoverySourceReplacementSuccessors2026:
+        """Precompute source-preserving associations for one exact mode1 reset."""
+        from scripts.cuw_file_services import (
+            FileSourceSet2026,
+            validate_file_sources_2026,
+        )
+
+        engine = self._engine
+        state = self.state
+        if (
+            type(old_sources) is not FileSourceSet2026
+            or type(new_sources) is not FileSourceSet2026
+            or engine is None
+            or old_sources.engine is not engine
+            or new_sources.engine is not engine
+            or engine._file_sources is not old_sources
+        ):
+            raise ValueError("Exact mode1 recovery source successor required")
+        validate_file_sources_2026(old_sources, engine)
+        validate_file_sources_2026(new_sources, engine)
+        old_names, old_originals, old_count = old_sources.recovery_sources()
+        new_names, new_originals, new_count = new_sources.recovery_sources()
+        if (
+            old_names != new_names
+            or old_count != new_count
+            or len(old_originals) != len(new_originals)
+            or any(
+                old is not new
+                for old, new in zip(old_originals, new_originals, strict=True)
+            )
+        ):
+            raise ValueError("Mode1 reset changed immutable recovery originals")
+        replacements = {}
+        for index, binding in self._file_source_replacements2026.items():
+            if (
+                index >= len(state.calibrations)
+                or binding.sources is not old_sources
+                or not self._validate_file_source_replacement2026(
+                    binding,
+                    sources=old_sources,
+                    state=state,
+                    index=index,
+                    name=old_names[index],
+                    original=old_originals[index],
+                )
+                or state.calibrations[index].source_path != binding.replacement_path
+                or state.calibrations[index].source_bytes
+                is not binding.replacement_source
+                or new_sources.recovery_index_for_metadata(binding.whole_metadata)
+                != index
+            ):
+                raise ValueError("Prior23b10 source association cannot be carried")
+            replacements[index] = replace(binding, sources=new_sources)
+        return _NativeRecoverySourceReplacementSuccessors2026(
+            engine, self, state, old_sources, new_sources, replacements
+        )
+
+    def _validate_file_source_membership_successor2026(self, prepared, metadata) -> int:
+        """Validate rows against the exact prepared S1→S2 source lineage."""
+        if (
+            type(prepared) is not _NativeRecoverySourceReplacementSuccessors2026
+            or prepared.engine is not self._engine
+            or prepared.persistence is not self
+            or prepared.state is not self.state
+            or prepared.old_sources is not prepared.engine._file_sources
+            or type(prepared.replacements) is not dict
+        ):
+            raise ValueError("Exact prepared replacement successor required")
+        return self._validate_file_source_membership_using_replacements2026(
+            prepared.new_sources,
+            metadata,
+            state_snapshot=None,
+            replacements=prepared.replacements,
+        )
+
+    def _publish_file_source_replacement_successors2026(self, prepared) -> None:
+        """Assignment-only part of the engine's coherent native source commit."""
+        self._file_source_replacements2026 = prepared.replacements
+
+    def _replace_calibration_from_judge_23b10_2026(
+        self, binding: _NativeRecoverySourceReplacement2026
+    ) -> None:
+        """Run23b10 with one temporary exact association for its state commit."""
+        if type(binding) is not _NativeRecoverySourceReplacement2026:
+            raise TypeError("Engine-issued native23b10 source binding required")
+        with self._lock:
+            engine = binding.engine
+            state = binding.state
+            previous_binding = self._file_source_replacements2026.get(binding.index)
+            if (
+                binding.persistence is not self
+                or self._engine is not engine
+                or state is not self.state
+                or getattr(engine, "_file_sources", None) is not binding.sources
+            ):
+                raise ValueError("Current23b10 persistence/source tuple required")
+            names, originals, _ = binding.sources.recovery_sources()
+            if (
+                not 0 <= binding.index < len(state.calibrations)
+                or binding.index >= len(names)
+                or names[binding.index] != binding.original_path
+                or originals[binding.index] is not binding.original_source
+                or binding.sources.recovery_index_for_metadata(binding.whole_metadata)
+                != binding.index
+                or type(binding.replacement_path) is not str
+                or not binding.replacement_path
+            ):
+                raise ValueError(
+                    "Native23b10 replacement differs from its source point"
+                )
+            calibration_source_identity(binding.replacement_source)
+            current = state.calibrations[binding.index]
+            if previous_binding is None:
+                if (
+                    current.source_path != binding.original_path
+                    or current.source_bytes is not binding.original_source
+                ):
+                    raise ValueError("23b10 original recovery row changed")
+            elif (
+                not self._validate_file_source_replacement2026(
+                    previous_binding,
+                    sources=binding.sources,
+                    state=state,
+                    index=binding.index,
+                    name=binding.original_path,
+                    original=binding.original_source,
+                )
+                or current.source_path != previous_binding.replacement_path
+                or current.source_bytes is not previous_binding.replacement_source
+            ):
+                raise ValueError("Prior23b10 replacement lineage changed")
+            self._file_source_replacements2026[binding.index] = binding
+            try:
+                previous = state.calibrations[binding.index]
+                self.replace_calibration(
+                    binding.index,
+                    replace(
+                        previous,
+                        source_path=binding.replacement_path,
+                        source_bytes=binding.replacement_source,
+                        whole_repro=True,
+                    ),
+                )
+                self._validate_file_source_membership(
+                    binding.sources, binding.whole_metadata
+                )
+            except BaseException:
+                current = state.calibrations[binding.index]
+                if (
+                    not (
+                        current.source_path == binding.replacement_path
+                        and current.source_bytes is binding.replacement_source
+                        and current.whole_repro
+                    )
+                    and self._file_source_replacements2026.get(binding.index) is binding
+                ):
+                    if previous_binding is None:
+                        del self._file_source_replacements2026[binding.index]
+                    else:
+                        self._file_source_replacements2026[binding.index] = (
+                            previous_binding
+                        )
+                raise
 
     @contextmanager
     def _file_source_binding(self, sources):
         """Apply only32130/20eb0 original file fields around an actual engine commit."""
-        from scripts.cuw_file_services import validate_file_sources_2026
-
+        self._guard_cold_file_admission2026()
         with self._lock:
             engine = sources.engine
-            validate_file_sources_2026(sources, engine)
-            self.validate_engine_owner(engine)
-            if engine.persistence is not self or self._cleanup_lease is not None:
-                raise ValueError("Actual idle FILE persistence owner required")
             previous, previous_engine = dict(vars(self.state)), self._engine
-            if self.state.calibrations:
-                self._guard_engine_source(self._snapshot())
-            elif not self._same_cleanup_fields(self.state, ReproInfoState(())):
-                raise ValueError("Fresh FILE state must follow actual recovery reset")
-            names, originals, count = sources.recovery_sources()
-            if not names or len(names) != len(originals) or len(names) != (count or 1):
-                raise ValueError("Complete native recovery original vector required")
-            calibrations = tuple(
-                replace(
-                    self.state.calibrations[index],
-                    source_path=name,
-                    source_bytes=original,
-                )
-                if index < len(self.state.calibrations)
-                else RecoveryCalibration(
-                    name,
-                    original,
-                    blank_ecu_flags=(False,) * engine.configuration.cpu_maximum,
-                )
-                for index, (name, original) in enumerate(
-                    zip(names, originals, strict=True)
-                )
-            )
-            candidate = replace(
-                self.state, calibrations=calibrations, multi_calibration_file_num=count
-            )
-            candidate.validate()
-            self.validate_file_source_association(
-                sources, sources.selected_metadata, state_snapshot=candidate
-            )
+            previous_replacements = dict(self._file_source_replacements2026)
+            candidate = self._prepare_file_source_binding_candidate2026(sources)
+            # A true source bind starts a new original-file association epoch.
+            self._file_source_replacements2026 = {}
             try:
+                self.validate_file_source_association(
+                    sources, sources.selected_metadata, state_snapshot=candidate
+                )
                 self.state.calibrations = candidate.calibrations
                 self.state.multi_calibration_file_num = (
                     candidate.multi_calibration_file_num
@@ -665,6 +965,7 @@ class CUWPersistence:
                 for name, value in previous.items():
                     setattr(self.state, name, value)
                 self._engine = previous_engine
+                self._file_source_replacements2026 = previous_replacements
                 raise
 
     @contextmanager
@@ -1153,6 +1454,7 @@ class CUWPersistence:
         return names
 
     def _notification(self, value: bool):
+        self._guard_cold_file_admission2026()
         if not value:
             if self._cleanup_assignment == "primary":
                 self._validate_cleanup_assignment("primary")
@@ -1212,6 +1514,7 @@ class CUWPersistence:
 
     def _last_block_changed(self, value: bool):
         """30b50: every assignment updatesEC9a and writes iffECDc logged."""
+        self._guard_cold_file_admission2026()
         with self._lock:
             self._event("last_block_notification")
             if self._cleanup_assignment == "secondary":
@@ -1236,6 +1539,8 @@ class CUWPersistence:
                 self.persist()
 
     def persist(self):
+        self._guard_cold_file_admission2026()
+        self._guard_cold_file_admission2026()
         with self._lock:
             self._event("encode_recovery")
             snapshot = self._snapshot()
@@ -1245,6 +1550,7 @@ class CUWPersistence:
 
     def update_cpu(self, cpu_index: int):
         """3f620: updateEC94;21660 only whenECDc logged is already true."""
+        self._guard_cold_file_admission2026()
         self._check()
         old_cpu = self.state.write_cpu_index
         new_cpu = _uint(cpu_index)
@@ -1256,6 +1562,7 @@ class CUWPersistence:
 
     def update_divided_image(self, index: int):
         """58e80 callback45: updateED6c and persist iffECDc is logged."""
+        self._guard_cold_file_admission2026()
         self._check()
         self.state.write_target_divided_cpu_image_index = _uint(index)
         if self.state.logged:
@@ -1318,6 +1625,7 @@ class CUWPersistence:
 
     def replace_calibration(self, index: int, calibration: RecoveryCalibration):
         """23b10: mark whole-file result and update the cached source association."""
+        self._guard_cold_file_admission2026()
         with self._lock:
             self._check()
             _uint(index, len(self.state.calibrations) - 1)
@@ -1383,6 +1691,7 @@ class CUWPersistence:
         Host cancellation/deadline stops immediately and retains the live state;
         ordinary file failures are collected and native reset still takes place.
         """
+        self._guard_cold_file_admission2026()
         with self._lock:
             self._check()
             failures = []
@@ -1409,6 +1718,7 @@ class CUWPersistence:
                     failures.append(type(exc).__name__)
             # 23630 resets in place, retaining engine-owned object identity.
             self.state.calibrations = ()
+            self._file_source_replacements2026.clear()
             defaults = ReproInfoState(())
             for name, value in vars(defaults).items():
                 if name != "calibrations":

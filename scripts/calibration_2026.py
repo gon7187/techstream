@@ -14,10 +14,10 @@ import stat
 import struct
 import weakref
 import zlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from scripts.calibration import (
     CalibrationContainer,
@@ -3241,26 +3241,35 @@ def _select_projection(metadata: Native2026Metadata, index: int) -> Native2026Me
     )
 
 
-def _project_cpu_rows(
-    metadata: Native2026Metadata, order: tuple[int, ...], targets: tuple[int, ...]
+def _reorder_cpu_rows(
+    metadata: Native2026Metadata,
+    order: tuple[int, ...],
+    *,
+    archive_order: tuple[int, ...] | None = None,
 ) -> Native2026Metadata:
-    """16ae0/16fb0 preserve archive objects;19300→111e0 prunes logical backing."""
+    """Reorder CPU rows and their separately copied archive backing."""
     native2026_validate_runtime_metadata(metadata)
-    contexts = tuple(native2026_metadata_for_cpu(metadata, index) for index in order)
+    row_contexts = tuple(
+        native2026_metadata_for_cpu(metadata, index) for index in order
+    )
+    contexts = (
+        row_contexts
+        if archive_order is None
+        else tuple(
+            native2026_metadata_for_cpu(metadata, index) for index in archive_order
+        )
+    )
+    if len(contexts) != len(order):
+        raise ValueError("CPU metadata/archive projection widths differ")
     rows = tuple(native2026_cpu_values(metadata, index) for index in order)
     nodes = tuple(native2026_node_index(metadata, index) for index in order)
     blocks: dict[tuple[int, int], NativeLogicalBlock2026] = {}
-    for new_index, (old_index, context) in enumerate(zip(order, contexts, strict=True)):
+    for new_index, (old_index, context) in enumerate(
+        zip(order, row_contexts, strict=True)
+    ):
         for block in context.logical_blocks:
             if block.cpu_index != old_index:
                 continue
-            if block.targets:
-                selected = targets[new_index]
-                old_targets = native2026_cpu_targets(metadata, old_index)
-                if not 0 <= selected < len(old_targets):
-                    raise ValueError("Native logical rebuild selected target is absent")
-                if old_targets[selected].calibration not in block.targets:
-                    continue
             blocks[(block.node, block.slot)] = replace(block, cpu_index=new_index)
     projection = NativeCPUProjection2026(
         metadata.source_container,
@@ -3303,6 +3312,43 @@ def _project_cpu_rows(
         runtime_selected_cpu=0,
     )
     return _select_projection(result, 0) if order else _issue_metadata(result)
+
+
+def _prune_logical_cpu_rows(
+    metadata: Native2026Metadata, targets: tuple[int, ...]
+) -> Native2026Metadata:
+    """19300→10f70/111e0→19360 after CPU/archive reorder has committed."""
+    native2026_validate_runtime_metadata(metadata)
+    projection = metadata.runtime_projection
+    if projection is None:
+        raise ValueError("Issued reordered CPU projection required for logical prune")
+    blocks = []
+    for block in projection.blocks:
+        if block.targets:
+            selected = targets[block.cpu_index]
+            old_targets = native2026_cpu_targets(metadata, block.cpu_index)
+            if not 0 <= selected < len(old_targets):
+                raise ValueError("Native logical rebuild selected target is absent")
+            if old_targets[selected].calibration not in block.targets:
+                continue
+        blocks.append(block)
+    if tuple(blocks) == projection.blocks:
+        return metadata
+    pruned = replace(projection, blocks=tuple(blocks))
+    _CPU_PROJECTIONS[id(pruned)] = pruned
+    result = replace(metadata, runtime_projection=pruned)
+    return (
+        _select_projection(result, metadata.runtime_selected_cpu)
+        if metadata.cpu_rows
+        else _issue_metadata(result)
+    )
+
+
+def _project_cpu_rows(
+    metadata: Native2026Metadata, order: tuple[int, ...], targets: tuple[int, ...]
+) -> Native2026Metadata:
+    """Existing composition, retaining its reorder-then-logical-prune behavior."""
+    return _prune_logical_cpu_rows(_reorder_cpu_rows(metadata, order), targets)
 
 
 @dataclass(frozen=True)
@@ -3661,6 +3707,7 @@ class NativeCIDMatch2026:
     unmatched_companions: tuple[bytes, ...] = field(repr=False)
     authored_cpu_count: int
     check_target: bool
+    cpu_maximum: int
 
 
 _CID_MATCHES: weakref.WeakValueDictionary[int, NativeCIDMatch2026] = (
@@ -3732,6 +3779,9 @@ def native2026_match_received_cids(
     configuration: Any,
     shrink_flag: bool,
     received_hardware: bytes = b"",
+    configured_cpu_flags: tuple[bool, ...] | None = None,
+    live_received_identifiers: tuple[bytes, ...] | None = None,
+    configured_metadata: Native2026Metadata | None = None,
 ) -> NativeCIDMatch2026:
     """34e10 authored snapshot only: no3ddf0/3e710/General lookup."""
     native2026_validate_runtime_metadata(metadata)
@@ -3756,6 +3806,17 @@ def native2026_match_received_cids(
         raise ValueError("Received CID vector exceeds the host bound")
     if any(type(cid) is not bytes or b"\0" in cid for cid in received_identifiers):
         raise ValueError("Native received CID byte strings required")
+    live = (
+        received_identifiers
+        if live_received_identifiers is None
+        else live_received_identifiers
+    )
+    if type(live) is not tuple:
+        raise TypeError("Exact live received CID tuple required")
+    if len(live) > MAX_RECORDS or any(
+        type(cid) is not bytes or b"\0" in cid for cid in live
+    ):
+        raise ValueError("Bounded live native received CID byte strings required")
     companions = []
     for record in identifier_records:
         if type(record) is not bytes or len(record) != 12 or b"\0" not in record[4:]:
@@ -3769,36 +3830,55 @@ def native2026_match_received_cids(
         raise ValueError("Metadata exceeds configured native CPU capacity")
     if type(received_hardware) is not bytes or b"\0" in received_hardware:
         raise ValueError("Exact native captured hardware byte string required")
+    if configured_cpu_flags is not None and (
+        type(configured_cpu_flags) is not tuple
+        or len(configured_cpu_flags) != configuration.cpu_maximum
+        or any(type(flag) is not bool for flag in configured_cpu_flags)
+    ):
+        raise ValueError("Exact configured-capacity native Boolean flags required")
+    indexed_metadata = metadata if configured_metadata is None else configured_metadata
+    native2026_validate_runtime_metadata(indexed_metadata)
+    if native2026_cpu_count(indexed_metadata) > configuration.cpu_maximum:
+        raise ValueError("Indexed FILE exceeds configured native CPU capacity")
+    for source in (metadata, indexed_metadata):
+        if (
+            source.parser_parameters_validated
+            and source.parser_general_parameters.source_sha256
+            != general_parameters.source_sha256
+        ):
+            raise ValueError("Selection General source differs from parser profile")
     vbf = count > 0 and ".vbf" in native2026_cpu_values(metadata, 0).get(
         "cpuimagename", ""
     )
     hardware_only = False
+    hardware_rejected = False
     if vbf:
         values = native2026_cpu_values(metadata, 0)
         hardware_count = _number(values, "NumberOfTargetHardwares", maximum=99)
         hardware = received_hardware.decode("latin1")
-        if not any(
+        hardware_rejected = not any(
             values.get(f"{slot:02}_targethardware", "") == hardware
             for slot in range(1, hardware_count + 1)
+        )
+        hardware_only = not hardware_rejected and not live
+
+    def configured_for(source: Native2026Metadata, cpu: int) -> bool:
+        if not (
+            source.is_controlled_by_scc
+            or source.vehicle.get("contacttype", "") == "Phase6"
         ):
-            raise ValueError(
-                "Native VBF target hardware does not match captured hardware"
-            )
-        hardware_only = not received
-    if not hardware_only and (configuration.flags[0] or metadata.is_blank_ecu):
-        raise ValueError(
-            "Native blank/D4f8 selection branch requires its source producer"
-        )
-    if len(received) < count and not hardware_only:
-        raise ValueError(
-            "Native constructor-zero selection has fewer received CIDs than CPUs"
-        )
-    if (
-        metadata.parser_parameters_validated
-        and metadata.parser_general_parameters.source_sha256
-        != general_parameters.source_sha256
-    ):
-        raise ValueError("Selection General source differs from parser profile")
+            return False
+        if configured_cpu_flags is None:
+            raise ValueError("Actual per-FILE configured flags required for SCC/Phase6")
+        # Native CPU+184 is its retained node association, not CPU ordinal.
+        node = native2026_node_index(source, cpu)
+        if not 0 <= node < len(configured_cpu_flags):
+            raise ValueError("Native configured node index exceeds capacity")
+        return configured_cpu_flags[node]
+
+    configured = [False] * count
+    if not hardware_rejected and not hardware_only:
+        configured = [configured_for(metadata, cpu) for cpu in range(count)]
     ids = [native2026_new_calibration_id(metadata, i) for i in range(count)]
     contact = metadata.vehicle.get("contacttype", "")
     phased = contact in ("P5-Unified", "Phase6", "Ethernet")
@@ -3816,31 +3896,55 @@ def native2026_match_received_cids(
             for n, value in enumerate(received)
         )
 
-    selected = (
-        ([0] + [-1] * (count - 1))
-        if hardware_only
-        else [
-            next(
+    selected = [0 if flag else -1 for flag in configured]
+    check_target = True
+    unmatched = []
+    if hardware_rejected:
+        # 350a8 exits before target matching or unmatched population.
+        check_target = False
+    elif hardware_only:
+        selected[0] = 0
+    else:
+        # 351b1 retains this Boolean while still computing reached footprints.
+        if len(received) < count:
+            check_target = 0 in selected
+        for cpu in range(count):
+            if (
+                configured_for(indexed_metadata, cpu)
+                or metadata.is_blank_ecu
+                or configuration.flags[0]
+            ):
+                continue
+            selected[cpu] = next(
                 (
-                    n
-                    for n, target in enumerate(native2026_cpu_targets(metadata, i))
-                    if received_match(target.calibration, i)
+                    index
+                    for index, target in enumerate(
+                        native2026_cpu_targets(metadata, cpu)
+                    )
+                    if received_match(target.calibration, cpu)
                 ),
-                -1,
+                selected[cpu],
             )
-            for i in range(count)
+        unmatched = [
+            (ids[cpu], node_ids[cpu]) for cpu in range(count) if selected[cpu] == -1
         ]
-    )
-    unmatched = (
-        []
-        if hardware_only
-        else [(ids[i], node_ids[i]) for i in range(count) if selected[i] == -1]
-    )
-    if len(unmatched) != count and not shrink_flag:
-        for i in range(count):
-            pair = (ids[i], node_ids[i])
-            if received_match(ids[i], i) and pair not in unmatched:
-                unmatched.append(pair)
+        if check_target:
+            if len(unmatched) == count:
+                check_target = False
+            elif not shrink_flag:
+                for cpu in range(count):
+                    pair = (ids[cpu], node_ids[cpu])
+                    if not configured_for(indexed_metadata, cpu) and received_match(
+                        ids[cpu], cpu
+                    ):
+                        if phased:
+                            absent = pair not in unmatched
+                        else:
+                            absent = ids[cpu] not in (cid for cid, _ in unmatched)
+                        if absent:
+                            unmatched.append(pair)
+                if len(unmatched) == count:
+                    check_target = False
     match = NativeCIDMatch2026(
         metadata,
         general_parameters,
@@ -3848,10 +3952,269 @@ def native2026_match_received_cids(
         tuple(pair[0].encode("latin1") for pair in unmatched),
         tuple(pair[1].encode("latin1") for pair in unmatched) if phased else (),
         count,
-        hardware_only or (count > 0 and len(unmatched) != count),
+        check_target,
+        configuration.cpu_maximum,
     )
     _CID_MATCHES[id(match)] = match
     return match
+
+
+@dataclass(frozen=True)
+class NativeCIDRebuildOffset2026:
+    value: int
+
+
+@dataclass(frozen=True)
+class NativeCIDRebuildTargets2026:
+    indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class NativeCIDRebuildMetadata2026:
+    metadata: Native2026Metadata = field(repr=False)
+    operation: Literal["16ae0", "16fb0", "19300", "17280"]
+    cpu_index: int | None = None
+
+
+@dataclass(frozen=True)
+class NativeCIDRebuildTargetStore2026:
+    cpu_index: int
+    target_index: int
+
+
+@dataclass(frozen=True)
+class NativeCIDRebuildComplete2026:
+    selection: NativeCPUSelection2026 = field(repr=False)
+
+
+NativeCIDRebuildStep2026 = (
+    NativeCIDRebuildOffset2026
+    | NativeCIDRebuildTargets2026
+    | NativeCIDRebuildMetadata2026
+    | NativeCIDRebuildTargetStore2026
+    | NativeCIDRebuildComplete2026
+)
+
+
+def _validate_cid_rebuild_inputs(
+    metadata: Native2026Metadata,
+    target_indices: tuple[int, ...],
+    unmatched_identifiers: tuple[bytes, ...],
+    unmatched_companions: tuple[bytes, ...],
+    general_parameters: Any,
+    maximum: int,
+) -> None:
+    native2026_validate_runtime_metadata(metadata)
+    from scripts.programming_2026_common import NativeGeneralParameters2026
+
+    _validate_container_2026(metadata.source_container)
+    if type(general_parameters) is not NativeGeneralParameters2026:
+        raise TypeError("Concrete native General parameter source required")
+    if (
+        metadata.parser_parameters_validated
+        and metadata.parser_general_parameters.source_sha256
+        != general_parameters.source_sha256
+    ):
+        raise ValueError("CID rebuild General source differs from parser profile")
+    count = native2026_cpu_count(metadata)
+    if count > maximum:
+        raise ValueError("Actual CPU count exceeds configured rebuild capacity")
+    if (
+        type(target_indices) is not tuple
+        or len(target_indices) != maximum
+        or any(
+            type(index) is not int or not -1 <= index < 0xFFFFFFFF
+            for index in target_indices
+        )
+    ):
+        raise ValueError("Exact current native target vector required")
+    for values in (unmatched_identifiers, unmatched_companions):
+        if (
+            type(values) is not tuple
+            or len(values) > MAX_RECORDS
+            or any(type(value) is not bytes or b"\0" in value for value in values)
+        ):
+            raise ValueError("Exact bounded native unmatched byte tuples required")
+    if metadata.vehicle.get("contacttype", "") in (
+        "P5-Unified",
+        "Phase6",
+        "Ethernet",
+    ) and len(unmatched_identifiers) != len(unmatched_companions):
+        raise ValueError("Native phased unmatched CID/companion counts differ")
+    if count and not native2026_cid_rebuild_allowed(metadata):
+        raise ValueError("Native36800 skips CID rebuild for this first CPU")
+
+
+def _cid_rebuild_steps(
+    metadata: Native2026Metadata,
+    selected: tuple[int, ...],
+    unmatched_identifiers: tuple[bytes, ...],
+    unmatched_companions: tuple[bytes, ...],
+    general_parameters: Any,
+) -> Iterator[NativeCIDRebuildStep2026]:
+    # Data steps grant no live mutation authority; the caller owns its source scope.
+    offset = 0
+    yield NativeCIDRebuildOffset2026(offset)
+    count = native2026_cpu_count(metadata)
+    ids = [native2026_new_calibration_id(metadata, cpu) for cpu in range(count)]
+    contact = metadata.vehicle.get("contacttype", "")
+    phased = contact in ("P5-Unified", "Phase6", "Ethernet")
+    node_ids = []
+    if phased:
+        for cpu in range(count):
+            context = native2026_metadata_for_cpu(metadata, cpu)
+            node_ids.append(
+                context.node_values.get("diagid", "")
+                or context.node_values.get("logicaladdress", "")
+            )
+    unmatched_ids = [value.decode("latin1") for value in unmatched_identifiers]
+    unmatched_nodes = [value.decode("latin1") for value in unmatched_companions]
+    desired, desired_nodes = ids.copy(), node_ids.copy()
+    kind = metadata.vehicle.get("kindofecu", "")
+    for cpu in range(count):
+        if (
+            general_parameters.boolean_with_keys(
+                kind, native2026_cpu_type(metadata, cpu), contact, "M16CTypeFlag"
+            )
+            and ids[cpu] not in unmatched_ids
+        ):
+            for forest in range(count):
+                if (
+                    general_parameters.boolean_with_keys(
+                        kind,
+                        native2026_cpu_type(metadata, forest),
+                        contact,
+                        "FORESTTypeFlag",
+                    )
+                    and ids[forest] in unmatched_ids
+                ):
+                    # 3ddf0 moves only CID strings; companion positions stay put.
+                    desired.insert(0, desired.pop(forest))
+                    offset += 1
+                    yield NativeCIDRebuildOffset2026(offset)
+            break
+    cursor = offset
+    while cursor < len(desired):
+        found = (
+            (desired[cursor], desired_nodes[cursor])
+            in zip(unmatched_ids, unmatched_nodes, strict=True)
+            if phased
+            else desired[cursor] in unmatched_ids
+        )
+        if found:
+            desired.pop(cursor)
+            if phased:
+                desired_nodes.pop(cursor)
+        else:
+            cursor += 1
+
+    def position(cpu: int) -> int | None:
+        return next(
+            (
+                slot
+                for slot, cid in enumerate(desired)
+                if cid == ids[cpu]
+                and (not phased or desired_nodes[slot] == node_ids[cpu])
+            ),
+            None,
+        )
+
+    remapped = [-1] * len(selected)
+    for cpu in range(count):
+        slot = position(cpu)
+        if slot is not None:
+            remapped[slot] = selected[cpu]
+    yield NativeCIDRebuildTargets2026(tuple(remapped))
+    if any(not cid for cid in desired) and len(selected) > count:
+        raise ValueError(
+            "Rebuild of empty NewCID requires the actual unused CPU capacity records"
+        )
+    # Both helper branches finish with0d2f0: LAST old CPU wins per first
+    # matching desired slot, even when16fb0 copied FIRST-old archive objects.
+    slots: list[int | None] = [None] * len(desired)
+    for cpu in range(count):
+        slot = (
+            next((index for index, cid in enumerate(desired) if cid == ids[cpu]), None)
+            if metadata.format_version == 9
+            else position(cpu)
+        )
+        if slot is not None:
+            slots[slot] = cpu
+    prefix = next((slot for slot, cpu in enumerate(slots) if cpu is None), len(slots))
+    order = tuple(cpu for cpu in slots[:prefix] if cpu is not None)
+    if metadata.format_version == 9:
+        archive_order = tuple(
+            next(cpu for cpu in range(count) if ids[cpu] == cid)
+            for cid in desired[:prefix]
+        )
+        operation = "16fb0"
+    else:
+        archive_order = None
+        operation = "16ae0"
+    rebuilt = _reorder_cpu_rows(metadata, order, archive_order=archive_order)
+    yield NativeCIDRebuildMetadata2026(rebuilt, operation)
+    rebuilt = _prune_logical_cpu_rows(rebuilt, tuple(remapped))
+    yield NativeCIDRebuildMetadata2026(rebuilt, "19300")
+    output_indices = remapped[: native2026_cpu_count(rebuilt)]
+    for cpu, target in enumerate(output_indices):
+        if target == -1:
+            rebuilt, new_target = native2026_append_current_target(
+                rebuilt, cpu, general_parameters
+            )
+            output_indices[cpu] = new_target
+            yield NativeCIDRebuildMetadata2026(rebuilt, "17280", cpu)
+            yield NativeCIDRebuildTargetStore2026(cpu, new_target)
+    yield NativeCIDRebuildComplete2026(
+        NativeCPUSelection2026(
+            rebuilt,
+            order,
+            tuple(output_indices),
+            offset,
+            unmatched_identifiers,
+            unmatched_companions,
+            count,
+            selected[:count],
+        )
+    )
+
+
+def native2026_rebuild_current_cids_steps(
+    metadata: Native2026Metadata,
+    target_indices: tuple[int, ...],
+    unmatched_identifiers: tuple[bytes, ...],
+    unmatched_companions: tuple[bytes, ...],
+    general_parameters: Any,
+    *,
+    configuration: Any,
+) -> Iterator[NativeCIDRebuildStep2026]:
+    """Reached3e710 body from actual current state, without a34e10 receipt.
+
+    Consume only under the caller's authenticated source origin. These immutable
+    steps are values, not live permissions; D300 and live unmatched vectors do
+    not change. Complete alone represents the terminal D304 store.
+    """
+    from scripts.cuw_2026 import EngineConfiguration2026, configure_2026
+
+    if (
+        type(configuration) is not EngineConfiguration2026
+        or configure_2026(configuration.arguments) != configuration
+    ):
+        raise TypeError("Exact native rebuild configuration required")
+    _validate_cid_rebuild_inputs(
+        metadata,
+        target_indices,
+        unmatched_identifiers,
+        unmatched_companions,
+        general_parameters,
+        configuration.cpu_maximum,
+    )
+    yield from _cid_rebuild_steps(
+        metadata,
+        target_indices,
+        unmatched_identifiers,
+        unmatched_companions,
+        general_parameters,
+    )
 
 
 def native2026_rebuild_received_cids(
@@ -3859,7 +4222,7 @@ def native2026_rebuild_received_cids(
     match: NativeCIDMatch2026,
     general_parameters: Any,
 ) -> NativeCPUSelection2026:
-    """Source-gated3e710→3ddf0/reorder/prune/17280, after34e10 snapshot."""
+    """Registered34e10 wrapper over the same source-ordered rebuild core."""
     _validate_cid_match(match)
     if (
         metadata is not match.metadata
@@ -3868,91 +4231,37 @@ def native2026_rebuild_received_cids(
         raise ValueError("CID rebuild requires original issued metadata and General")
     if not native2026_cid_rebuild_allowed(metadata):
         raise ValueError("Native36800 skips CID rebuild for this first CPU")
-    count = match.authored_cpu_count
-    selected = match.authored_target_indices
-    ids = [native2026_new_calibration_id(metadata, i) for i in range(count)]
-    contact = metadata.vehicle.get("contacttype", "")
-    phased = contact in ("P5-Unified", "Phase6", "Ethernet")
-    node_ids = []
-    for i in range(count):
-        context = native2026_metadata_for_cpu(metadata, i)
-        node_ids.append(
-            context.node_values.get("diagid", "")
-            or context.node_values.get("logicaladdress", "")
-        )
-    unmatched = list(
-        zip(
-            (value.decode("latin1") for value in match.unmatched_identifiers),
-            (value.decode("latin1") for value in match.unmatched_companions)
-            if phased
-            else ("" for _ in match.unmatched_identifiers),
-            strict=True,
-        )
+    if match.authored_cpu_count != native2026_cpu_count(metadata):
+        raise ValueError("CID match authored CPU count differs from current metadata")
+    if type(match.cpu_maximum) is not int or not 1 <= match.cpu_maximum <= 4096:
+        raise ValueError("Issued CID match configured capacity required")
+    if len(match.authored_target_indices) != match.authored_cpu_count:
+        raise ValueError("Issued CID match authored target width differs")
+    if match.authored_cpu_count > match.cpu_maximum:
+        raise ValueError("Issued CID match exceeds configured capacity")
+    # 34e10 initializes ALL M D2A4 slots to-1 before matching active CPUs.
+    # This tail comes from that issued receipt, never from generic metadata.
+    targets = match.authored_target_indices + (-1,) * (
+        match.cpu_maximum - match.authored_cpu_count
     )
-    kind = metadata.vehicle.get("kindofecu", "")
-    desired = ids.copy()
-    desired_nodes = node_ids.copy()
-    offset = 0
-    # Native M16C/FOREST lookups use NewCID membership without a companion.
-    unmatched_ids = [pair[0] for pair in unmatched]
-    for i in range(count):
-        if (
-            general_parameters.boolean_with_keys(
-                kind, native2026_cpu_type(metadata, i), contact, "M16CTypeFlag"
-            )
-            and ids[i] not in unmatched_ids
-        ):
-            for j in range(count):
-                if (
-                    general_parameters.boolean_with_keys(
-                        kind,
-                        native2026_cpu_type(metadata, j),
-                        contact,
-                        "FORESTTypeFlag",
-                    )
-                    and ids[j] in unmatched_ids
-                ):
-                    desired.pop(j)
-                    desired.insert(0, ids[j])
-                    offset += 1
-            break
-    cursor = offset
-    while cursor < len(desired):
-        pair = (desired[cursor], desired_nodes[cursor])
-        if pair in unmatched if phased else desired[cursor] in unmatched_ids:
-            desired.pop(cursor)
-            if phased:
-                desired_nodes.pop(cursor)
-        else:
-            cursor += 1
-    order = []
-    for position, cid in enumerate(desired):
-        matches = [
-            i
-            for i in range(count)
-            if ids[i] == cid and (not phased or node_ids[i] == desired_nodes[position])
-        ]
-        if len(matches) != 1:
-            raise ValueError("Native CPU reorder has an ambiguous or absent slot")
-        order.append(matches[0])
-    target_indices = tuple(selected[i] for i in order)
-    rebuilt = _project_cpu_rows(metadata, tuple(order), target_indices)
-    output_indices = list(target_indices)
-    for i, selected_target in enumerate(target_indices):
-        if selected_target == -1:
-            rebuilt, output_indices[i] = native2026_append_current_target(
-                rebuilt, i, general_parameters
-            )
-    return NativeCPUSelection2026(
-        rebuilt,
-        tuple(order),
-        tuple(output_indices),
-        offset,
-        tuple(pair[0].encode("latin1") for pair in unmatched),
-        tuple(pair[1].encode("latin1") for pair in unmatched) if phased else (),
-        count,
-        tuple(selected),
+    _validate_cid_rebuild_inputs(
+        metadata,
+        targets,
+        match.unmatched_identifiers,
+        match.unmatched_companions,
+        general_parameters,
+        match.cpu_maximum,
     )
+    for step in _cid_rebuild_steps(
+        metadata,
+        targets,
+        match.unmatched_identifiers,
+        match.unmatched_companions,
+        general_parameters,
+    ):
+        if isinstance(step, NativeCIDRebuildComplete2026):
+            return step.selection
+    raise AssertionError("Native CID rebuild did not reach its terminal source store")
 
 
 def native2026_select_received_cids(
@@ -3964,6 +4273,9 @@ def native2026_select_received_cids(
     configuration: Any,
     shrink_flag: bool,
     received_hardware: bytes = b"",
+    configured_cpu_flags: tuple[bool, ...] | None = None,
+    live_received_identifiers: tuple[bytes, ...] | None = None,
+    configured_metadata: Native2026Metadata | None = None,
 ) -> NativeCPUSelection2026:
     """Host composition of primitives with36800 shape gate, not CheckTarget success.
 
@@ -3978,6 +4290,9 @@ def native2026_select_received_cids(
         configuration=configuration,
         shrink_flag=shrink_flag,
         received_hardware=received_hardware,
+        configured_cpu_flags=configured_cpu_flags,
+        live_received_identifiers=live_received_identifiers,
+        configured_metadata=configured_metadata,
     )
     if native2026_cid_rebuild_allowed(metadata):
         return native2026_rebuild_received_cids(metadata, match, general_parameters)

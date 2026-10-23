@@ -5,8 +5,10 @@ import os
 import struct
 import tempfile
 import unittest
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -20,6 +22,1351 @@ from scripts.programming_replay import (
 )
 
 
+@dataclass(frozen=True)
+class AuthoredCanCIDReplayFixture:
+    calibration: bytes
+    catalog_sources: dict[str, bytes]
+    module_bytes: dict[str, bytes]
+    events_by_root: tuple[tuple[dict[str, Any], ...], ...]
+    captured_identifiers_by_root: tuple[tuple[bytes, ...], ...]
+    typed_outputs: tuple[dict[str, Any], ...]
+    captured_tail_events: tuple[dict[str, Any], ...]
+    trace_setup: dict[str, Any]
+
+
+def make_authored_control_recorder(
+    case: unittest.TestCase,
+    *,
+    source: bytes,
+    catalog_sources: Mapping[str, bytes],
+    module_files: Mapping[str, bytes],
+    primitive_reply: Callable[[dict[str, Any], float | None], Any],
+):
+    """Create one source-bound CONTROL recording root and its live J2534 pair.
+
+    The callback supplies actual SDK primitive replies and authored host observations;
+    it never supplies getter results or other native business outcomes.
+    """
+    from scripts.j2534_2026 import (
+        DriverMetadata2026,
+        NativeMessage,
+        PrimitiveResult,
+    )
+    from scripts.programming_2026_common import NativeRuntime2026
+    from scripts.programming_replay import _native_request
+    from tests.private_evidence import read_private_bytes
+
+    if type(source) is not bytes or not isinstance(catalog_sources, Mapping):
+        raise TypeError("Exact source and catalog inputs are required")
+    if any(
+        type(name) is not str or type(data) is not bytes
+        for name, data in catalog_sources.items()
+    ):
+        raise TypeError("Exact authored catalog bytes are required")
+    if any(
+        type(name) is not str or type(data) is not bytes
+        for name, data in module_files.items()
+    ):
+        raise TypeError("Exact authored module bytes are required")
+    if not callable(primitive_reply):
+        raise TypeError("Authored primitive reply callback is required")
+
+    context = {
+        "schema": "techstream-programming-replay-v1",
+        "source": "recorded_unverified",
+        "calibration_sha256": hashlib.sha256(source).hexdigest(),
+        "operation": "get_cid",
+        "node": 1,
+        "observations": {
+            "current_cids": [],
+            "tester_info_hex": bytes(32).hex(),
+            "system_time": [2026, 10, 22, 22, 1, 2, 3, 4],
+            "timeout_seconds": 30,
+            "cid_mode": 2,
+            "host": {"driver_recording": "j2534_2026"},
+        },
+        "events": [],
+    }
+    modules = dict(module_files)
+    modules.setdefault(
+        "TCUWJ2534DeviceIF.dll",
+        read_private_bytes(Path("runtime/no-car-21/recovered/TCUWJ2534DeviceIF.dll")),
+    )
+    root = load_programming_replay(
+        source, json.dumps(context).encode(), catalog_sources, modules
+    )
+    case.addCleanup(root.trace.close)
+    rows: list[dict[str, Any]] = []
+    root.trace.rows = rows
+    original_consume = root.trace.consume
+    sdk_operations = frozenset(
+        {
+            "close_handle",
+            "call_symbol",
+            "create_mutex",
+            "free_library",
+            "get_symbol",
+            "get_system_time",
+            "lock",
+            "load_library",
+            "passthru_close",
+            "passthru_connect",
+            "passthru_disconnect",
+            "passthru_ioctl",
+            "passthru_load_library",
+            "passthru_logical_connect",
+            "passthru_logical_disconnect",
+            "passthru_next_device",
+            "passthru_open",
+            "passthru_queue",
+            "passthru_read",
+            "passthru_read_buffer",
+            "passthru_read_version",
+            "passthru_save_log",
+            "passthru_scan_devices",
+            "passthru_start_filter",
+            "passthru_start_periodic",
+            "passthru_status",
+            "passthru_stop_filter",
+            "passthru_stop_periodic",
+            "passthru_unload_library",
+            "passthru_voltage",
+            "passthru_write",
+            "local_time_ms",
+            "release_mutex",
+            "set_communication_log_mode",
+            "unlock",
+            "wait",
+            "wait_handle",
+        }
+    )
+
+    def encode(value: Any) -> dict[str, Any]:
+        if value is None:
+            return {"type": "none", "value": None}
+        if type(value) is bool:
+            return {"type": "bool", "value": value}
+        if type(value) is int:
+            return {"type": "int", "value": value}
+        if type(value) is str:
+            return {"type": "text", "value": value}
+        if type(value) is bytes:
+            return {"type": "bytes", "value": value.hex()}
+        if isinstance(value, NativeMessage):
+            return {
+                "type": "mapping",
+                "value": {
+                    "_native_type": {"type": "text", "value": "PASSTHRU_MSG_2026"},
+                    **{key: encode(item) for key, item in vars(value).items()},
+                },
+            }
+        if type(value) is tuple:
+            return {"type": "tuple", "value": [encode(item) for item in value]}
+        if type(value) is dict:
+            return {
+                "type": "mapping",
+                "value": {key: encode(item) for key, item in value.items()},
+            }
+        raise TypeError(f"Unsupported authored recorder value: {type(value)!r}")
+
+    def authoring_consume(kind: str, request: dict[str, Any], remaining=None):
+        response = primitive_reply(request, remaining)
+        if kind == "action" and request.get("operation") in sdk_operations:
+            if type(response) is PrimitiveResult:
+                result = encode({"status": response.status, "value": response.value})
+            elif request.get("operation") == "set_communication_log_mode":
+                result = encode(response)
+            else:
+                raise TypeError("Actual J2534 SDK replies must be PrimitiveResult")
+        else:
+            if isinstance(response, PrimitiveResult):
+                raise TypeError("Host observations must be their raw typed values")
+            result = encode(response)
+        rows.append(
+            {
+                "kind": kind,
+                "request": _native_request(request),
+                "result": result,
+                "elapsed_ms": 1,
+            }
+        )
+        return original_consume(kind, request, remaining)
+
+    root.trace.consume = authoring_consume
+    runtime = NativeRuntime2026(
+        root.trace.action,
+        clock=root.trace.clock,
+        cancelled=root.trace.cancelled,
+        local_seconds_of_day=root.trace.native_local_seconds_of_day,
+        local_milliseconds_of_day=root.trace.native_local_milliseconds_of_day,
+    )
+    root.bind_runtime2026(runtime)
+    pair = root.trace.interface_pair
+    if pair is None:
+        raise AssertionError("Source recorder must issue its paired J2534 interfaces")
+    for view in (pair.engine, pair.control):
+        view.set_current_driver(DriverMetadata2026("Authored", "authored.dll"))
+    return root, runtime, pair, rows
+
+
+def _run_authored_suzuki_raw_control(case, calibration, catalog, module_files):
+    """Run the selected Suzuki writer through an actual raw CONTROL helper lease."""
+    import tempfile
+    import threading
+
+    from scripts.cuw_2026 import CUWEngine2026, identity_2026
+    from scripts.cuw_persistence import (
+        CUWPersistence,
+        RecoveryCalibration,
+        ReproInfoState,
+    )
+    from scripts.j2534_2026 import DriverMetadata2026, NativeMessage, PrimitiveResult
+    from scripts.programming_2026_common import (
+        ControlCommPhase2026,
+        NativeFrontendParameters2026,
+        NativeRuntime2026,
+    )
+    from scripts.programming_replay import _native_request
+    from tests.private_evidence import read_private_bytes
+    from tests.test_programming_2026_vendor import TypedDriver
+
+    recording = {
+        "schema": "techstream-programming-replay-v1",
+        "source": "recorded_unverified",
+        "calibration_sha256": hashlib.sha256(calibration).hexdigest(),
+        "operation": "write",
+        "node": 1,
+        "observations": {
+            "current_cids": [],
+            "tester_info_hex": bytes(32).hex(),
+            "system_time": [2026, 10, 22, 22, 1, 2, 3, 4],
+            "timeout_seconds": 30,
+            "cid_mode": 2,
+            "host": {"cpu_index": 0, "driver_recording": "j2534_2026"},
+        },
+        "events": [],
+    }
+    raw_modules = {
+        **module_files,
+        "TCUWJ2534DeviceIF.dll": read_private_bytes(
+            Path("runtime/no-car-21/recovered/TCUWJ2534DeviceIF.dll")
+        ),
+    }
+    raw = load_programming_replay(
+        calibration, json.dumps(recording).encode(), catalog, raw_modules
+    )
+    case.addCleanup(raw.trace.close)
+    raw.trace.rows = []
+    raw.trace.position = 0
+    raw.trace.elapsed = 0.0
+    driver = TypedDriver.__new__(TypedDriver)
+    driver.replies = {
+        b"\x2e\xcf\x80\x01": [b"\x6e\xcf\x80"],
+        b"\x31\x01\xda\x00": [b"\x71\x01\xda\x00\x01"],
+        b"\x31\x03\xda\x00": [b"\x71\x03\xda\x00\x06"],
+        b"\x31\x01\xd9\x15": [b"\x71\x01\xd9\x15\x01"],
+        b"\x31\x01\xda\x01": [b"\x71\x01\xda\x01\x01"],
+    }
+    driver.pending = []
+    driver.events = []
+    driver.fault = None
+    driver.now = 0.0
+    local_ms = 1000
+    callback_authority: list[dict[str, Any]] = []
+    runtime = None
+    controller = None
+    engine = None
+
+    def typed(value):
+        if value is None:
+            return {"type": "none", "value": None}
+        if type(value) is bool:
+            return {"type": "bool", "value": value}
+        if type(value) is int:
+            return {"type": "int", "value": value}
+        if type(value) is bytes:
+            return {"type": "bytes", "value": value.hex()}
+        if isinstance(value, NativeMessage):
+            return {
+                "type": "mapping",
+                "value": {
+                    "_native_type": {
+                        "type": "text",
+                        "value": "PASSTHRU_MSG_2026",
+                    },
+                    **{key: typed(item) for key, item in vars(value).items()},
+                },
+            }
+        if type(value) is tuple:
+            return {"type": "tuple", "value": [typed(item) for item in value]}
+        if type(value) is dict:
+            return {
+                "type": "mapping",
+                "value": {key: typed(item) for key, item in value.items()},
+            }
+        raise TypeError(f"Unsupported captured raw CONTROL value: {type(value)!r}")
+
+    def consume(kind, request, remaining=None):
+        nonlocal local_ms
+        if kind != "action":
+            raise ValueError(f"Unexpected raw CONTROL chronology kind: {kind}")
+        operation = request["operation"]
+        if operation == "notify_igoffon_wait":
+            if runtime is None or controller is None:
+                raise AssertionError("Selected callback owners must be bound")
+            scope = runtime._device_calls.suzuki_wait_scope
+            stage = scope.stage if scope is not None else None
+            target = scope.target if scope is not None else None
+            callback_authority.append(
+                {
+                    "scope_active": scope is not None,
+                    "target_active": target is not None,
+                    "target_type": (
+                        type(target).__name__ if target is not None else None
+                    ),
+                    "stage_target_matches": (
+                        stage is not None and stage._control_target2026 is target
+                    ),
+                    "stage_owners_match": (
+                        stage is not None
+                        and stage._engine2026 is engine
+                        and stage._controller2026 is controller
+                    ),
+                    "export": scope.export if scope is not None else None,
+                    "lease_active": (
+                        scope is not None
+                        and scope.helper_lease is not None
+                        and controller._native_control_export_lease2026
+                        is scope.helper_lease
+                    ),
+                    "entry_active": (
+                        controller._native_control_helper_entry2026 is not None
+                    ),
+                    "thread_matches": (
+                        scope is not None and scope.thread == threading.get_ident()
+                    ),
+                    "context_matches": (
+                        scope is not None
+                        and stage is not None
+                        and scope.runner_context.container is stage.container
+                    ),
+                    "module": (
+                        target.module_binding.module_name
+                        if target is not None
+                        else None
+                    ),
+                }
+            )
+        if operation.startswith("passthru_") or operation in (
+            "create_mutex",
+            "load_library",
+            "get_symbol",
+        ):
+            result = (
+                PrimitiveResult(value=2000)
+                if operation == "get_timeout"
+                else driver(request, remaining or 1.0)
+            )
+            value = {"status": result.status, "value": result.value}
+            encoded = typed(value)
+            returned = value
+        else:
+            if operation == "get_local_milliseconds_of_day":
+                returned = local_ms
+                local_ms += 1000
+            elif operation == "get_local_seconds_of_day":
+                returned = 1
+            elif operation == "set_communication_log_mode":
+                returned = 0
+            elif operation == "load_library":
+                returned = 2
+            elif operation == "get_symbol":
+                returned = 3
+            else:
+                returned = None
+            encoded = typed(returned)
+        captured = cast(list[dict[str, Any]], raw.trace.rows)
+        captured.append(
+            {
+                "kind": "action",
+                "request": _native_request(request),
+                "result": encoded,
+                "elapsed_ms": 1,
+            }
+        )
+        raw.trace.position += 1
+        raw.trace.elapsed += 0.001
+        return returned
+
+    raw.trace.consume = consume
+    runtime = NativeRuntime2026(
+        raw.trace.action,
+        clock=raw.trace.clock,
+        cancelled=raw.trace.cancelled,
+        local_seconds_of_day=raw.trace.native_local_seconds_of_day,
+        local_milliseconds_of_day=raw.trace.native_local_milliseconds_of_day,
+        native_cancelled=lambda: False,
+    )
+    raw.bind_runtime2026(runtime)
+    pair = raw.trace.interface_pair
+    if pair is None:
+        raise AssertionError("Raw paired provider was not issued")
+    for view in (pair.engine, pair.control):
+        view.set_current_driver(DriverMetadata2026("Authored", "authored.dll"))
+    pair.engine.open()
+    pair.engine.connect(6)
+
+    frontend = NativeFrontendParameters2026.from_sources(catalog, encoded=True)
+    engine = CUWEngine2026(module_files["CUW.dll"], general_parameters=frontend.general)
+    case.addCleanup(engine.close)
+    engine.configure(struct.pack("<IIddII", 1, 0, 1, 2, 0, 0))
+    engine.bind_frontend_parameters(frontend)
+    engine.load_cuw(calibration)
+    engine.bind_interface_pair(pair)
+    persistence_dir = tempfile.TemporaryDirectory()
+    case.addCleanup(persistence_dir.cleanup)
+    engine.bind_persistence(
+        CUWPersistence(
+            Path(persistence_dir.name),
+            ReproInfoState(
+                (
+                    RecoveryCalibration(
+                        "authored.cuw", calibration, blank_ecu_flags=(False,)
+                    ),
+                ),
+                multi_calibration_file_num=1,
+                loaded=False,
+            ),
+        )
+    )
+    controller = ControlCommPhase2026(
+        identity_2026(
+            module_files["TCUWControlCommPhase.dll"], "TCUWControlCommPhase.dll"
+        ),
+        runtime,
+    )
+    case.addCleanup(lambda: controller._close_control_pool2026(engine))
+    raw.bind_controller2026(controller)
+    raw.bind_engine2026(engine)
+    with engine.controller_execution(controller, 2):
+        result = controller.execute(engine, raw)
+    rows = raw.trace.rows
+    if not isinstance(rows, list):
+        raise TypeError("Captured raw events must remain an owned list")
+    ProgrammingTrace.validate(rows)
+    return result, callback_authority, rows, driver, engine, controller, raw, runtime
+
+
+def capture_authored_cancid_replay_fixture(
+    case: unittest.TestCase,
+    *,
+    calibration: bytes | None = None,
+    catalog_sources: Mapping[str, bytes] | None = None,
+    raw_reply_payloads_by_root: tuple[tuple[bytes, ...], tuple[bytes, ...]]
+    | None = None,
+    tail_capture: Callable[[Any, Any], None] | None = None,
+    tail_driver: Callable[[dict[str, Any], float], Any] | None = None,
+) -> AuthoredCanCIDReplayFixture:
+    """Capture two actual acquisitions; strictly replay the first source root."""
+    if (tail_capture is None) is not (tail_driver is None):
+        raise ValueError("Tail body and primitive reply callback are a required pair")
+    if tail_capture is not None and (
+        not callable(tail_capture) or not callable(tail_driver)
+    ):
+        raise TypeError("Callable actual tail body and primitive reply required")
+    from scripts.calibration_2026 import native2026_metadata
+    from scripts.j2534_2026 import (
+        DriverMetadata2026,
+        J2534Device2026,
+        J2534InterfacePair2026,
+        NativeMessage,
+        PrimitiveResult,
+    )
+    from scripts.programming_2026_common import (
+        ControlCommPhase2026,
+        NativeFrontendParameters2026,
+        NativeRuntime2026,
+        _control_getter_output2026,
+    )
+    from scripts.programming_2026_legacy import (
+        bind_can_cid_context,
+        decode_can_cids2026,
+        run_can_cid,
+    )
+    from scripts.programming_replay import _native_request
+    from tests.private_evidence import read_private_bytes
+    from tests.test_calibration_2026 import cuw, srecord
+    from tests.test_cuw_engine_worker import encoded_table
+    from tests.test_programming_2026_common import (
+        RawControlStageMachineTests,
+        make_raw_control_fixture2026,
+    )
+
+    if calibration is None:
+        calibration = cuw(
+            "[Format]\nVersion=105\n[Vehicle]\nNumberOfNode=1\n"
+            "ContactType=P5-Unified\nKindOfECU=149\n[Node01]\n"
+            "RequiredSpecReproVer=02\nDiagID=0200\nNumberOfCalibration=2\n"
+            "[CPU11]\nCPUImageName=image0.vbf\nCPUType=311\n"
+            "NumberOfTargets=1\n01_TargetCalibration=PLAIN_OLD\n"
+            "[CPU12]\nCPUImageName=image1.vbf\nCPUType=312\n"
+            "NumberOfTargets=1\n01_TargetCalibration=OLD_GROUP\n",
+            (
+                b"\n".join((srecord(1, 0, b"xPLAIN_OLD"), srecord(7, 0))),
+                b"\n".join((srecord(1, 0, b"xOLD_GROUP"), srecord(7, 0))),
+            ),
+        )
+    elif type(calibration) is not bytes:
+        raise TypeError("Exact authored calibration bytes required")
+    parameter_values = {
+        "GetCANIDFunctionNameForGetCID": "GetCanIDsFromParamForGetCID",
+        "CanIDForGetCID": "0200/0208",
+        "ReceiveTimeoutBeforeGetCID": "123",
+    }
+    table_headers = (
+        "ParamFileKeySystemProtocolMicon",
+        "DLLFileNameForPrepareWrite",
+        "DLLFileNameForFlashWrite",
+        "DLLFileNameForGetCID",
+        "DLLFileNameForChangeToReprogGatewayMode",
+        "EnableDLLVersionInformation",
+        "GetCANIDFunctionNameForFlashWrite",
+        "AlternateDLLFileNamesForGetCID",
+        *parameter_values,
+    )
+    keys = ("149P5-Unified311", "149P5-Unified312")
+    default_catalog_sources = {
+        "Parameter.ini": encoded_table(
+            (
+                "ParamFileKeySystemProtocolMicon",
+                "M16CTypeFlag",
+                "FORESTTypeFlag",
+                "PasswordAddress",
+                "ByteOrder",
+                "FlagToDoIGOFFONAtCPUTypeChange",
+                "FlagToChangeToReprogGWModeForCentralGW",
+            ),
+            (
+                ("149P5-Unified", "0", "0", "00", "1", "0", "0"),
+                (keys[0], "1", "0", "00", "1", "0", "0"),
+                (keys[1], "0", "1", "01", "1", "0", "0"),
+            ),
+        ),
+        "CanIDTable.ini": encoded_table(
+            ("RequestCANID", "CalibrationType"), (("0200", "17"),)
+        ),
+        "LogicalAddressTable.ini": encoded_table(
+            ("LogicalAddress", "CalibrationType"), (("0103", "18"),)
+        ),
+    }
+    module_bytes = {
+        name: read_private_bytes(Path("runtime/no-car-21/recovered") / name)
+        for name in (
+            "TCUWCanCIDGetter.dll",
+            "TCUWSilPrepareWriter.dll",
+            "TCUWSilFlashWriter.dll",
+        )
+    }
+    for key in keys:
+        default_catalog_sources[key + ".ini"] = encoded_table(
+            table_headers,
+            (
+                (
+                    key,
+                    "TCUWSilPrepareWriter.dll",
+                    "TCUWSilFlashWriter.dll",
+                    "TCUWCanCIDGetter.dll",
+                    "",
+                    "0\n0\n0\n0",
+                    "",
+                    "",
+                    *parameter_values.values(),
+                ),
+            ),
+        )
+    default_catalog_sources["149P5-Unified.ini"] = encoded_table(
+        table_headers,
+        (
+            (
+                "149P5-Unified",
+                "TCUWSilPrepareWriter.dll",
+                "TCUWSilFlashWriter.dll",
+                "TCUWCanCIDGetter.dll",
+                "",
+                "0\n0\n0\n0",
+                "",
+                "",
+                *parameter_values.values(),
+            ),
+        ),
+    )
+    if catalog_sources is None:
+        selected_catalog_sources = default_catalog_sources
+    else:
+        if not isinstance(catalog_sources, Mapping) or any(
+            type(name) is not str or type(data) is not bytes
+            for name, data in catalog_sources.items()
+        ):
+            raise TypeError("Exact authored catalog source bytes required")
+        selected_catalog_sources = dict(catalog_sources)
+    if raw_reply_payloads_by_root is None:
+        payloads_by_root = (
+            (b"\x49\0\x10\0\0\0", b"\x49\x04\x01" + b"PLAIN_OLD\0".ljust(16, b" ")),
+            (b"\x49\0\x10\0\0\0", b"\x49\x04\x01" + b"OLD_GROUP\0".ljust(16, b" ")),
+        )
+    else:
+        if (
+            type(raw_reply_payloads_by_root) is not tuple
+            or len(raw_reply_payloads_by_root) != 2
+            or any(
+                type(root_payloads) is not tuple
+                or not root_payloads
+                or any(
+                    type(payload) is not bytes or len(payload) > 4096
+                    for payload in root_payloads
+                )
+                for root_payloads in raw_reply_payloads_by_root
+            )
+        ):
+            raise TypeError("Two raw CanCID reply-payload sequences required")
+        payloads_by_root = raw_reply_payloads_by_root
+
+    recorder = RawControlStageMachineTests()
+    case.addCleanup(recorder.doCleanups)
+    _engine, _controller, recorder_session = make_raw_control_fixture2026(
+        recorder,
+        source=calibration,
+        catalog=selected_catalog_sources,
+        module_files=module_bytes,
+        operation="get_cid",
+    )
+    source_metadata = native2026_metadata(
+        recorder_session.container, node=1, cpu_index=0
+    )
+    binding, module, *_ = recorder_session._dispatch()
+    if module.native_identity is None:
+        raise AssertionError("Authenticated CanCID module identity required")
+    reads: list[NativeMessage] = []
+    rows: list[dict[str, Any]] = []
+    payload_iter = iter(payloads_by_root[0])
+    response_headers_by_request: dict[bytes, bytes] = {}
+    delivered_raw_replies: list[tuple[bytes, bytes]] = []
+    tail_active = False
+    tail_clock_ticks = 0
+
+    def capture_local_clock(operation: str) -> int:
+        nonlocal tail_clock_ticks
+        value = 1000 + tail_clock_ticks * 1000
+        tail_clock_ticks += 1
+        if tail_active:
+            event = {"operation": operation}
+            rows.append(
+                {
+                    "kind": "action",
+                    "request": _native_request(event),
+                    "result": {"type": "int", "value": value},
+                    "elapsed_ms": 1,
+                }
+            )
+        return value
+
+    def encode(value: Any) -> dict[str, Any]:
+        if value is None:
+            return {"type": "none", "value": None}
+        if type(value) is bool:
+            return {"type": "bool", "value": value}
+        if type(value) is int:
+            return {"type": "int", "value": value}
+        if type(value) is bytes:
+            return {"type": "bytes", "value": value.hex()}
+        if isinstance(value, NativeMessage):
+            return {
+                "type": "mapping",
+                "value": {
+                    "_native_type": {"type": "text", "value": "PASSTHRU_MSG_2026"},
+                    **{key: encode(item) for key, item in vars(value).items()},
+                },
+            }
+        if type(value) is tuple:
+            return {"type": "tuple", "value": [encode(item) for item in value]}
+        if type(value) is dict:
+            return {
+                "type": "mapping",
+                "value": {key: encode(item) for key, item in value.items()},
+            }
+        raise TypeError(f"Unsupported captured J2534 result: {type(value)!r}")
+
+    def capture_driver(event: dict[str, Any], _remaining: float) -> PrimitiveResult:
+        if tail_active:
+            if tail_driver is None:
+                raise AssertionError("Tail primitive reply callback disappeared")
+            result = tail_driver(event, _remaining)
+            if type(result) is not PrimitiveResult:
+                raise TypeError("Actual tail provider must return PrimitiveResult")
+        else:
+            result = None
+        operation = event["operation"]
+        if result is not None:
+            pass
+        elif operation == "passthru_write":
+            message = event["messages"][0]
+            response_header = response_headers_by_request.get(message.data[:4])
+            if response_header is None:
+                raise AssertionError("Actual selected CanCID response address required")
+            payload = next(payload_iter)
+            delivered_raw_replies.append((response_header, payload))
+            reads.extend(
+                (
+                    NativeMessage(6, message.data[:4], rx_status=9),
+                    NativeMessage(6, response_header + payload),
+                )
+            )
+            result = PrimitiveResult(value=1)
+        elif operation == "passthru_read":
+            result = PrimitiveResult(value=(reads.pop(0),))
+        elif operation in ("passthru_open", "passthru_connect"):
+            result = PrimitiveResult(value=17)
+        elif operation == "passthru_start_filter":
+            result = PrimitiveResult(value=101)
+        elif operation == "create_mutex":
+            result = PrimitiveResult(value=1)
+        elif operation == "wait_handle":
+            result = PrimitiveResult(value=0)
+        elif operation == "load_library":
+            result = PrimitiveResult(value=2)
+        elif operation == "get_symbol":
+            result = PrimitiveResult(value=3)
+        else:
+            result = PrimitiveResult()
+        rows.append(
+            {
+                "kind": "action",
+                "request": _native_request(event),
+                "result": encode({"status": result.status, "value": result.value}),
+                "elapsed_ms": 1,
+            }
+        )
+        return result
+
+    class CapturedNativeRuntime2026(NativeRuntime2026):
+        """Record notifications and log-mode host calls, retaining J2534 action."""
+
+        def _provider(self, operation: str, cleanup: bool = False, **kwargs):
+            if tail_active and (
+                operation.startswith("notify_")
+                or operation == "set_communication_log_mode"
+            ):
+                host_driver = tail_driver
+                if host_driver is None:
+                    raise AssertionError("Tail host reply callback disappeared")
+
+                def capture_host_reply(event: dict[str, Any], remaining: float):
+                    result = host_driver(event, remaining)
+                    if type(result) is not PrimitiveResult:
+                        raise TypeError(
+                            "Actual tail host reply must be PrimitiveResult"
+                        )
+                    if result.status:
+                        rows.append(
+                            {
+                                "kind": "action",
+                                "request": _native_request(event),
+                                "result": {
+                                    "type": "error",
+                                    "value": {
+                                        "domain": "j2534_2026",
+                                        "code": result.status,
+                                        "detail": result.status,
+                                    },
+                                },
+                                "elapsed_ms": 1,
+                            }
+                        )
+                        raise ValueError(
+                            "Native host callback returned a failure status"
+                        )
+                    rows.append(
+                        {
+                            "kind": "action",
+                            "request": _native_request(event),
+                            "result": encode(result.value),
+                            "elapsed_ms": 1,
+                        }
+                    )
+                    return result.value
+
+                return capture_host_reply
+            return super()._provider(operation, cleanup, **kwargs)
+
+    def capture_runtime() -> CapturedNativeRuntime2026:
+        return CapturedNativeRuntime2026(
+            device.primitive,
+            clock=clock,
+            native_cancelled=lambda: False,
+            local_seconds_of_day=lambda: (
+                capture_local_clock("get_local_seconds_of_day") // 1000
+            ),
+            local_milliseconds_of_day=lambda: capture_local_clock(
+                "get_local_milliseconds_of_day"
+            ),
+        )
+
+    clock = lambda: 0
+    device = J2534Device2026(capture_driver, clock=clock, background_workers=False)
+    peer = J2534Device2026(capture_driver, clock=clock, background_workers=False)
+    direct_pair = J2534InterfacePair2026(peer, device)
+    for view in (direct_pair.engine, direct_pair.control):
+        view.set_current_driver(DriverMetadata2026("Authored", "authored.dll"))
+    device.have_ownership()
+    initial_ownership_rows = tuple(rows)
+
+    events_by_root = []
+    captured_identifiers_by_root = []
+    raw_transport_by_root: list[tuple[tuple[bytes, bytes], ...]] = []
+    for root_index in range(2):
+        rows.clear()
+        if root_index == 0:
+            rows.extend(initial_ownership_rows)
+        reads.clear()
+        payload_iter = iter(payloads_by_root[root_index])
+        delivered_raw_replies.clear()
+        cid_context = bind_can_cid_context(
+            recorder_session.container,
+            recorder_session.node,
+            (),
+            binding,
+            module.native_identity,
+            {},
+            {},
+        )
+        response_headers_by_request = {
+            address.headers()[0]: address.headers()[1]
+            for address in cid_context.addresses
+        }
+        if len(response_headers_by_request) != len(cid_context.addresses):
+            raise AssertionError("Selected CanCID request addresses must be unique")
+        result = run_can_cid(
+            cid_context,
+            capture_runtime(),
+        )
+        if result["native_success"] is not True:
+            raise AssertionError("Captured actual CanCID body did not succeed")
+        if tuple(payload_iter):
+            raise AssertionError("Captured CanCID body left raw reply payloads unused")
+        raw_replies = tuple(delivered_raw_replies)
+        transport_cids = tuple(
+            cid.encode("latin-1")
+            for response_header, payload in raw_replies
+            if payload[:2] == b"\x49\x04"
+            for cid in decode_can_cids2026(response_header + payload)
+        )
+        if result["cids"] != transport_cids:
+            raise AssertionError("CanCID output differs from raw transport replies")
+        captured_identifiers_by_root.append(tuple(result["cids"]))
+        raw_transport_by_root.append(raw_replies)
+        events_by_root.append(tuple(rows))
+    captured_tail_events: tuple[dict[str, Any], ...] = ()
+    try:
+        if tail_capture is not None:
+            tail_active = True
+            tail_start = len(rows)
+            tail_runtime = capture_runtime()
+            if (
+                tail_runtime.action != device.primitive
+                or direct_pair.control is not device
+            ):
+                raise AssertionError(
+                    "Tail must retain the exact captured provider and pair"
+                )
+            tail_result = tail_capture(direct_pair, tail_runtime)
+            if tail_result is not None:
+                raise TypeError(
+                    "Tail callback may execute native work but return no outcome"
+                )
+            captured_tail_events = tuple(rows[tail_start:])
+    finally:
+        device.close()
+        peer.close()
+
+    typed_outputs = []
+    replay = RawControlStageMachineTests()
+    case.addCleanup(replay.doCleanups)
+    from scripts.cuw_2026 import CUWEngine2026, identity_2026
+    from scripts.programming_replay import load_programming_replay
+    from tests.private_evidence import read_private_bytes
+
+    events = (
+        replay.event("get_local_milliseconds_of_day", 1000),
+        *events_by_root[0],
+        replay.event("get_local_milliseconds_of_day", 2000),
+    )
+    context = {
+        "schema": "techstream-programming-replay-v1",
+        "source": "recorded_unverified",
+        "calibration_sha256": hashlib.sha256(calibration).hexdigest(),
+        "operation": "get_cid",
+        "node": 1,
+        "observations": {
+            "current_cids": [],
+            "tester_info_hex": bytes(32).hex(),
+            "system_time": [2026, 10, 22, 22, 1, 2, 3, 4],
+            "timeout_seconds": 30,
+            "cid_mode": 2,
+            "host": {"driver_recording": "j2534_2026"},
+        },
+        "events": list(events),
+    }
+
+    session = load_programming_replay(
+        calibration,
+        json.dumps(context).encode(),
+        selected_catalog_sources,
+        {
+            **module_bytes,
+            "TCUWJ2534DeviceIF.dll": read_private_bytes(
+                Path("runtime/no-car-21/recovered/TCUWJ2534DeviceIF.dll")
+            ),
+        },
+    )
+    case.addCleanup(session.trace.close)
+    runtime = NativeRuntime2026(
+        session.trace.action,
+        clock=session.trace.clock,
+        cancelled=session.trace.cancelled,
+        local_seconds_of_day=session.trace.native_local_seconds_of_day,
+        local_milliseconds_of_day=session.trace.native_local_milliseconds_of_day,
+    )
+    frontend = NativeFrontendParameters2026.from_sources(
+        selected_catalog_sources, encoded=True
+    )
+    engine = CUWEngine2026(
+        read_private_bytes(Path("runtime/no-car-21/recovered/CUW.dll")),
+        general_parameters=frontend.general,
+    )
+    engine.bind_frontend_parameters(frontend)
+    engine.configure(struct.pack("<IIddII", 2, 0, 1, 2, 0, 0))
+    engine.load_cuw(calibration)
+    case.addCleanup(engine.close)
+    controller = ControlCommPhase2026(
+        identity_2026(
+            read_private_bytes(
+                Path("runtime/no-car-21/recovered/TCUWControlCommPhase.dll")
+            ),
+            "TCUWControlCommPhase.dll",
+        ),
+        runtime,
+    )
+    session.bind_runtime2026(runtime)
+    if session.trace.interface_pair is None:
+        raise AssertionError("Paired strict replay did not issue an interface pair")
+    for view in (
+        session.trace.interface_pair.engine,
+        session.trace.interface_pair.control,
+    ):
+        view.set_current_driver(DriverMetadata2026("Authored", "authored.dll"))
+    engine.bind_interface_pair(session.trace.interface_pair)
+    with engine.controller_execution(controller, 0):
+        result = controller.execute(engine, session)
+        context = controller.native_control_context2026(engine)
+        output = _control_getter_output2026(context)
+        if output is None:
+            pool = controller._control_parameter_pool2026
+            filenames = (
+                tuple(slot.filename for slot in pool._state.slots)
+                if pool is not None
+                else ()
+            )
+            raise AssertionError(
+                f"Captured CanCID trace did not issue typed output: {result!r}; "
+                f"cursor={session.trace.position}; "
+                f"next={[row['request']['operation'] for row in session.trace.rows[session.trace.position : session.trace.position + 4]]}; "
+                f"native_error={engine.dh_state._primary_error}; "
+                f"pool_filenames={filenames!r}"
+            )
+        typed_outputs.append(
+            {
+                "identifiers": output.identifiers,
+                "raw_al": output.raw_al,
+                "getter_mode": output.getter_mode,
+                "module_names": tuple(
+                    target.module_binding.module_name
+                    for target in output.getter_targets
+                ),
+                "query_records34": output.query_records34,
+                "communication_addresses": output.communication_addresses,
+                "hardware": output.hardware,
+            }
+        )
+        if result["identifiers"] != output.identifiers or output.identifiers != tuple(
+            cid.encode("latin-1")
+            for response_header, payload in raw_transport_by_root[0]
+            if payload[:2] == b"\x49\x04"
+            for cid in decode_can_cids2026(response_header + payload)
+        ):
+            raise AssertionError("Replay identifiers differ from typed output")
+
+    return AuthoredCanCIDReplayFixture(
+        calibration,
+        selected_catalog_sources,
+        module_bytes,
+        (events_by_root[0], events_by_root[1]),
+        (captured_identifiers_by_root[0], captured_identifiers_by_root[1]),
+        (typed_outputs[0],),
+        captured_tail_events,
+        {
+            "operation": "get_cid",
+            "contact": source_metadata.vehicle.get("contacttype", ""),
+            "cpus": 2,
+            "getter": "TCUWCanCIDGetter.dll",
+            "selector": "GetCanIDsFromParamForGetCID",
+            "parameter_values": {
+                "GetCANIDFunctionNameForGetCID": "GetCanIDsFromParamForGetCID",
+                "CanIDForGetCID": "0200/0208",
+                "ReceiveTimeoutBeforeGetCID": "123",
+            },
+            "paired": True,
+            "source_names": tuple(
+                cpu.values.get("cpuimagename", "") for cpu in source_metadata.cpus
+            ),
+            "local_clock_ms": (1000, 2000),
+            "capture_order": (0, 1),
+        },
+    )
+
+
+class AuthoredDHTail:
+    """Capture a real whole-file DH writer tail on the fixture's same J2534 pair."""
+
+    def __init__(self):
+        from tests.private_evidence import read_private_bytes
+        from tests.test_calibration_2026 import cuw, srecord
+        from tests.test_cuw_engine_worker import encoded_table
+
+        self.source = cuw(
+            "[Format]\nVersion=105\n[Vehicle]\nNumberOfNode=1\n"
+            "ContactType=P5-Unified\nKindOfECU=149\n[Node01]\n"
+            "RequiredSpecReproVer=02\nDiagID=0200\nNumberOfCalibration=1\n"
+            "[CPU11]\nCPUImageName=whole.vbf\nCPUType=311\n"
+            "NumberOfTargetHardwares=1\n01_TargetHardware=\n"
+            "NumberOfTargets=1\n01_TargetCalibration=OLD_GROUP\n",
+            (b"\n".join((srecord(1, 0, b"xOLD_GROUP"), srecord(7, 0))),),
+        )
+        key = "149P5-Unified"
+        values = {
+            "ParamFileKeySystemProtocolMicon": key,
+            "DLLFileNameForFlashWrite": "TCUWCanDHFlashWriter.dll",
+            "DLLFileNameForPrepareWrite": "TCUWCanDHPrepareWriter.dll",
+            "GetCANIDFunctionNameForFlashWrite": "GetCanIDsFromParamForPrepareWrite",
+            "CanIDForPrepareWrite": "0700/0708",
+            "StartAddress": "00000000",
+            "FlagToNonChangeReprogGWModeProcess": "1",
+            "PrepareRetryFlag": "1",
+            "IGOffRetriableFlag": "1",
+            "EnableDLLVersionInformation": "0\n0\n0\n0",
+        }
+        self.catalog = {
+            key + ".ini": encoded_table(tuple(values), (tuple(values.values()),)),
+            "Parameter.ini": encoded_table(
+                (
+                    "ParamFileKeySystemProtocolMicon",
+                    "M16CTypeFlag",
+                    "FORESTTypeFlag",
+                    "PasswordAddress",
+                    "ByteOrder",
+                    "FlagToDoIGOFFONAtCPUTypeChange",
+                    "FlagToChangeToReprogGWModeForCentralGW",
+                ),
+                (
+                    (key, "0", "0", "00", "1", "0", "0"),
+                    ("149P5-Unified311", "1", "0", "00", "1", "0", "0"),
+                ),
+            ),
+        }
+        self.modules = {
+            name: read_private_bytes(Path("runtime/no-car-21/recovered") / name)
+            for name in (
+                "TCUWCanDHFlashWriter.dll",
+                "TCUWCanDHPrepareWriter.dll",
+                "TCUWDHUtils.dll",
+                "SecretInfo.dll",
+                "CUW.dll",
+            )
+        }
+        self.pending: list[Any] = []
+        self.pdus: list[str] = []
+        self.result: dict[str, Any] | None = None
+        self.pair: Any = None
+
+    def driver(self, event: dict[str, Any], _remaining: float):
+        from scripts.j2534_2026 import NativeMessage, PrimitiveResult
+
+        operation = event["operation"]
+        if operation.startswith("notify_"):
+            return PrimitiveResult()
+        if operation == "passthru_write":
+            pdu = event["messages"][0].data[4:]
+            self.pdus.append(pdu.hex())
+            if pdu.startswith(b"\x34"):
+                return PrimitiveResult(status=24)
+            if pdu != bytes.fromhex("22fd10"):
+                raise AssertionError(f"Unexpected actual DH PDU {pdu.hex()}")
+            self.pending.append(
+                NativeMessage(6, bytes.fromhex("00000708") + bytes.fromhex("62fd10"))
+            )
+            return PrimitiveResult(value=1)
+        if operation == "passthru_read":
+            return PrimitiveResult(value=(self.pending.pop(0),))
+        if operation in ("passthru_open", "passthru_connect"):
+            return PrimitiveResult(value=17)
+        if operation == "passthru_start_filter":
+            return PrimitiveResult(value=101)
+        if operation == "wait_handle":
+            return PrimitiveResult(value=0)
+        return PrimitiveResult()
+
+    def capture(self, pair: Any, runtime: Any) -> None:
+        import hashlib
+        import struct
+        import tempfile
+
+        from scripts.calibration import CalibrationContainer
+        from scripts.calibration_2026 import parse_cuw_2026
+        from scripts.calibration_catalog import inspect_module_bytes
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+        from scripts.native_modules import identify_native_module
+        from scripts.programming_2026_common import (
+            NativeGeneralParameters2026,
+            bind_native_parameter2026,
+        )
+        from scripts.programming_2026_dh import bind_native_context, execute_context
+
+        self.pair = pair
+        if (
+            pair.control.interface_pair is not pair
+            or pair.engine.provider is not pair.control.provider
+        ):
+            raise AssertionError("DH tail must use the CanCID pair and provider")
+        general = NativeGeneralParameters2026.from_sources(self.catalog, encoded=True)
+        engine = CUWEngine2026(self.modules["CUW.dll"], general_parameters=general)
+        persistence_dir = None
+        try:
+            engine.configure(struct.pack("<IIddII", 1, 0, 1, 2, 0, 0))
+            engine.load_cuw(self.source)
+            persistence_dir = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+            engine.bind_persistence(
+                CUWPersistence(
+                    Path(persistence_dir.name),
+                    ReproInfoState(
+                        (
+                            RecoveryCalibration(
+                                "whole.cuw", self.source, blank_ecu_flags=(False,)
+                            ),
+                        ),
+                        multi_calibration_file_num=1,
+                        loaded=False,
+                    ),
+                )
+            )
+            container = parse_cuw_2026(self.source)
+            if not isinstance(container, CalibrationContainer):
+                raise TypeError("DH calibration source did not parse")
+            selected = bind_native_parameter2026(
+                container,
+                self.catalog,
+                "write",
+                metadata_state=engine.native_metadata,
+                encoded=True,
+            )
+            writer = "TCUWCanDHFlashWriter.dll"
+            identity = identify_native_module(
+                hashlib.sha256(self.modules[writer]).hexdigest(), writer
+            )
+            context = bind_native_context(
+                container,
+                1,
+                (),
+                selected,
+                identity,
+                {
+                    "selected_module": self.modules[writer],
+                    "dh_utils_module": self.modules["TCUWDHUtils.dll"],
+                    "secret_info_module": self.modules["SecretInfo.dll"],
+                    "cuw_module": self.modules["CUW.dll"],
+                },
+                {
+                    "cpu_index": 0,
+                    "dh_state": engine.dh_state,
+                    "module_version": inspect_module_bytes(
+                        self.modules[writer], writer
+                    )["version"],
+                },
+            )
+            if not pair.control.opened:
+                pair.control.open()
+            if not pair.control.connecting:
+                pair.control.connect(6)
+            self.result = execute_context(context, runtime)
+            if (
+                self.result["native_return"] is not False
+                or self.result.get("native_passthru_error") != 24
+            ):
+                raise AssertionError(
+                    f"Actual DH writer did not report status 24: {self.result}"
+                )
+        finally:
+            engine.close()
+            if persistence_dir is not None:
+                persistence_dir.cleanup()
+
+
+def authored_classic_can40_inputs() -> tuple[
+    bytes, Mapping[str, bytes], tuple[tuple[bytes, ...], tuple[bytes, ...]]
+]:
+    from tests.test_calibration_2026 import cuw, srecord
+    from tests.test_cuw_engine_worker import encoded_table
+
+    def assert_equal(actual: object, expected: object) -> None:
+        if actual != expected:
+            raise AssertionError(f"Authored classic CAN input mismatch: {actual!r}")
+
+    def classic_source() -> bytes:
+        source_text = (
+            "[Format]\nVersion=40\n[Vehicle]\nContactType=CAN\n"
+            "KindOfECU=149\nNumberOfCalibration=2\n"
+        )
+        for index, (new_cid, target) in enumerate(
+            (
+                ("PLAIN_NEW", "NO_PLAIN_MATCH"),
+                ("PLAIN_FOREST_NEW", "NO_OTHER_MATCH"),
+            ),
+            1,
+        ):
+            source_text += (
+                f"[CPU{index:02}]\nCPUImageName=plain{index}.bin\n"
+                f"CPUType={310 + index}\nNewCID={new_cid}\n"
+                "NumberOfTargetHardwares=1\n01_TargetHardware=\n"
+                f"NumberOfTargets=1\n01_TargetCalibration={target}\n"
+            )
+        file_payloads = tuple(
+            b"\n".join((srecord(1, 0, value), srecord(7, 0)))
+            for value in (b"\x11\x22\x33\x44", b"\x01\x02\x03\x04")
+        )
+        return cuw(source_text, file_payloads)
+
+    calibration = classic_source()
+    assert_equal(
+        hashlib.sha256(calibration).hexdigest(),
+        "699a07351b446defe869a120aab0481a0498ef0caeee1b95f310724ccc277556",
+    )
+    common = {
+        "PasswordAddress": "00",
+        "ByteOrder": "1",
+        "FlagToHoldSFormatRecords": "0",
+        "FlagToChangeProtocolAtSuccessGetCID": "0",
+        "FlagToDoIGOFFONAtCPUTypeChange": "0",
+        "FlagToChangeToReprogGWModeForCentralGW": "0",
+        "FlagToUseCIDGetterAndFlashWriterDLL": "0",
+        "WaitTimeForIGOFFON": "0",
+        "WaitTimeAfterBatteryDisconnected": "0",
+        "WaitTimeAfterBatteryConnected": "0",
+        "BatteryVoltageUpperThreshold": "16000",
+        "KindOfECUNames": "Authored CAN\nAuthored CAN\nAuthored CAN\nAuthored CAN",
+    }
+    parameter_headers = (
+        "ParamFileKeySystemProtocolMicon",
+        "M16CTypeFlag",
+        "FORESTTypeFlag",
+        *common,
+    )
+    catalog_sources = {
+        "Parameter.ini": encoded_table(
+            parameter_headers,
+            tuple(
+                (key, m16c, forest, *common.values())
+                for key, m16c, forest in (
+                    ("149CAN311", "1", "0"),
+                    ("149CAN312", "0", "1"),
+                    ("P5-Unified", "0", "0"),
+                )
+            ),
+        ),
+        "CanIDTable.ini": encoded_table(
+            ("RequestCANID", "CalibrationType"), (("0200", "17"),)
+        ),
+        "LogicalAddressTable.ini": encoded_table(
+            ("LogicalAddress", "CalibrationType"), (("0103", "18"),)
+        ),
+    }
+    profile = {
+        "DLLFileNameForGetCID": "TCUWCanCIDGetter.dll",
+        "DLLFileNameForPrepareWrite": "TCUWCanDHPrepareWriter.dll",
+        "DLLFileNameForFlashWrite": "TCUWCanDHFlashWriter.dll",
+        "DLLFileNameForChangeToReprogGatewayMode": "",
+        "EnableDLLVersionInformation": "0\n0\n0\n0",
+        "GetCANIDFunctionNameForGetCID": "GetCanIDsFromParamForGetCID",
+        "CanIDForGetCID": "0200/0208",
+        "ReceiveTimeoutBeforeGetCID": "123",
+        "GetCANIDFunctionNameForPrepareWrite": "GetCanIDsFromParamForPrepareWrite",
+        "GetCANIDFunctionNameForFlashWrite": "GetCanIDsFromParamForPrepareWrite",
+        "CanIDForPrepareWrite": "0200/0208",
+        "AlternateDLLFileNamesForGetCID": "",
+        "StartAddress": "00000000",
+        "FlagToNonChangeReprogGWModeProcess": "1",
+        "PrepareRetryFlag": "1",
+        "IGOffRetriableFlag": "1",
+    }
+    profile_headers = (
+        "ParamFileKeySystemProtocolMicon",
+        *profile,
+    )
+    for key in ("149CAN311", "149CAN312"):
+        catalog_sources[key + ".ini"] = encoded_table(
+            profile_headers, ((key, *profile.values()),)
+        )
+    catalog_hashes = {
+        "Parameter.ini": "5878a20c88505851c89e4f37811a4a0942518168aba82ed5bb58597a65d24af5",
+        "CanIDTable.ini": "315d719007e06ab32377df35e856ab79dfcdaa820b4d713369bdf2654972caf3",
+        "LogicalAddressTable.ini": "09983797fc3cd8e4988fbca32973808a30d8669658b4c4b1c97ccdb8582727dc",
+        "149CAN311.ini": "731711c3555b1012025903ec560414f81a3d7870911320ebdc1a3bf0809e80d1",
+        "149CAN312.ini": "0f97224ea1ecd5547adc4d3a7d978720dc136894789e5ee7eeded98fb8b01e1d",
+    }
+    for name, data in catalog_sources.items():
+        assert_equal(hashlib.sha256(data).hexdigest(), catalog_hashes[name])
+    payloads_by_root = (
+        (
+            bytes.fromhex("490010000000"),
+            bytes.fromhex(
+                "490402504c41494e5f4f4c4400202020202020554e52454c415445445f4f4c44002020"
+            ),
+        ),
+        (
+            bytes.fromhex("490010000000"),
+            bytes.fromhex(
+                "4904024f4c445f47524f555000202020202020464f524553545f4e4557002020202020"
+            ),
+        ),
+    )
+    assert_equal(
+        payloads_by_root[0][1],
+        bytes.fromhex(
+            "490402504c41494e5f4f4c4400202020202020554e52454c415445445f4f4c44002020"
+        ),
+    )
+    assert_equal(
+        payloads_by_root[1][1],
+        bytes.fromhex(
+            "4904024f4c445f47524f555000202020202020464f524553545f4e4557002020202020"
+        ),
+    )
+
+    return calibration, MappingProxyType(catalog_sources), payloads_by_root
+
+
 class ProgrammingReplayTests(unittest.TestCase):
     def setUp(self):
         self.files = create_programming_examples()
@@ -29,6 +1376,554 @@ class ProgrammingReplayTests(unittest.TestCase):
             for i, row in enumerate(self.document["events"])
             if row["kind"] == "exchange"
         )
+
+    def test_authored_cancid_fixture_replays_first_of_two_real_getters(self):
+        fixture = capture_authored_cancid_replay_fixture(self)
+        self.assertEqual(len(fixture.events_by_root), 2)
+        self.assertIsNot(fixture.events_by_root[0], fixture.events_by_root[1])
+        self.assertIn("TCUWCanCIDGetter.dll", fixture.module_bytes)
+        self.assertEqual(fixture.trace_setup["local_clock_ms"], (1000, 2000))
+        self.assertEqual(fixture.trace_setup["capture_order"], (0, 1))
+        self.assertEqual(len(fixture.typed_outputs), 1)
+        output = fixture.typed_outputs[0]
+        for index, events in enumerate(fixture.events_by_root):
+            operations = tuple(row["request"]["operation"] for row in events)
+            self.assertIn("passthru_open", operations)
+            self.assertIn("passthru_connect", operations)
+            self.assertIn("passthru_write", operations)
+            self.assertIn("passthru_read", operations)
+            expected = b"PLAIN_OLD" if index == 0 else b"OLD_GROUP"
+            if index == 0:
+                self.assertEqual(output["identifiers"], (expected,))
+            self.assertTrue(output["raw_al"])
+            self.assertEqual(output["getter_mode"], 0)
+            self.assertEqual(output["module_names"], ("TCUWCanCIDGetter.dll",))
+            self.assertTrue(
+                all(len(record) == 12 for record in output["query_records34"])
+            )
+
+    def test_authored_no_file_bin_cancid_source_uses_actual_parser_and_body(self):
+        from scripts.calibration_2026 import (
+            native2026_cid_rebuild_allowed,
+            native2026_metadata,
+            parse_cuw_2026,
+        )
+        from tests.test_calibration_2026 import cuw
+
+        calibration = cuw(
+            "[Format]\nVersion=40\n[Vehicle]\nContactType=P5-Unified\n"
+            "KindOfECU=149\nNumberOfCalibration=2\nDiagID=0200\n"
+            "RequiredSpecReproVer=02\n[CPU01]\nCPUImageName=source.bin\n"
+            "CPUType=312\nNewCID=NEW_PLAIN\nNumberOfTargets=1\n"
+            "01_TargetCalibration=NOT_RECEIVED\n[CPU02]\n"
+            "CPUImageName=source2.bin\nCPUType=311\nNewCID=NEW_GROUP\n"
+            "NumberOfTargets=1\n01_TargetCalibration=OLD_GROUP\n",
+            (b"", b""),
+        )
+        self.assertEqual(
+            hashlib.sha256(calibration).hexdigest(),
+            "875cfc80ead03f5923555983c5dd582b4930288c4403ae7803d7470bcf7e1316",
+        )
+        container = parse_cuw_2026(calibration)
+        first_cpu = native2026_metadata(container, node=1, cpu_index=0)
+        second_cpu = native2026_metadata(container, node=1, cpu_index=1)
+        self.assertTrue(native2026_cid_rebuild_allowed(first_cpu))
+        self.assertEqual(first_cpu.cpu.files, ())
+        self.assertEqual(second_cpu.cpu.files, ())
+        self.assertEqual(first_cpu.cpu.values["cpuimagename"], "source.bin")
+        self.assertEqual(second_cpu.cpu.values["cpuimagename"], "source2.bin")
+        self.assertEqual(first_cpu.cpu.values["cputype"], "312")
+        self.assertEqual(second_cpu.cpu.values["cputype"], "311")
+        self.assertEqual(first_cpu.cpu.values["newcid"], "NEW_PLAIN")
+        self.assertEqual(second_cpu.cpu.values["newcid"], "NEW_GROUP")
+        self.assertEqual(first_cpu.cpu.values["01_targetcalibration"], "NOT_RECEIVED")
+        self.assertEqual(second_cpu.cpu.values["01_targetcalibration"], "OLD_GROUP")
+
+        fixture = capture_authored_cancid_replay_fixture(self, calibration=calibration)
+        self.assertEqual(fixture.calibration, calibration)
+        self.assertEqual(
+            fixture.trace_setup["source_names"], ("source.bin", "source2.bin")
+        )
+        self.assertEqual(len(fixture.events_by_root), 2)
+        self.assertEqual(fixture.typed_outputs[0]["identifiers"], (b"PLAIN_OLD",))
+
+    def test_authored_classic_can40_sources_drive_two_real_cancid_acquisitions(self):
+        calibration, catalog_sources, payloads_by_root = authored_classic_can40_inputs()
+        fixture = capture_authored_cancid_replay_fixture(
+            self,
+            calibration=calibration,
+            catalog_sources=catalog_sources,
+            raw_reply_payloads_by_root=cast(
+                tuple[tuple[bytes, ...], tuple[bytes, ...]], payloads_by_root
+            ),
+        )
+
+        self.assertEqual(fixture.calibration, calibration)
+        self.assertEqual(fixture.catalog_sources, catalog_sources)
+        self.assertEqual(fixture.trace_setup["contact"], "CAN")
+        self.assertEqual(
+            fixture.captured_identifiers_by_root,
+            (
+                (b"PLAIN_OLD", b"UNRELATED_OLD"),
+                (b"OLD_GROUP", b"FOREST_NEW"),
+            ),
+        )
+        self.assertEqual(
+            fixture.typed_outputs[0]["identifiers"],
+            (b"PLAIN_OLD", b"UNRELATED_OLD"),
+        )
+        self.assertEqual(fixture.trace_setup["capture_order"], (0, 1))
+
+    def test_actual_dh_writer_tail_uses_same_cancid_pair_and_records_fault(self):
+        tail = AuthoredDHTail()
+        fixture = capture_authored_cancid_replay_fixture(
+            self, tail_capture=tail.capture, tail_driver=tail.driver
+        )
+        self.assertEqual(len(fixture.events_by_root), 2)
+        self.assertIs(tail.pair.control, tail.pair.engine.interface_pair.control)
+        self.assertIs(tail.pair.control.provider, tail.pair.engine.provider)
+        self.assertIsNotNone(tail.result)
+        assert tail.result is not None
+        self.assertIs(tail.result["native_return"], False)
+        self.assertEqual(tail.result["native_passthru_error"], 24)
+        self.assertTrue(any(pdu.startswith("34") for pdu in tail.pdus))
+        operations = tuple(
+            row["request"]["operation"] for row in fixture.captured_tail_events
+        )
+        self.assertIn("passthru_open", operations)
+        self.assertIn("passthru_connect", operations)
+        self.assertIn("notify_programming_active", operations)
+        self.assertIn("passthru_write", operations)
+        host_rows = tuple(
+            row
+            for row in fixture.captured_tail_events
+            if row["request"]["operation"].startswith("notify_")
+        )
+        self.assertTrue(host_rows)
+        self.assertTrue(
+            all(row["result"] == {"type": "none", "value": None} for row in host_rows)
+        )
+
+    def test_selected_suzuki_usb_callback_publishes_before_provider_fault(self):
+        import hashlib
+        import tempfile
+        import zlib
+
+        from scripts.calibration_2026 import parse_cuw_2026
+        from scripts.cuw_2026 import CUWEngine2026, identity_2026
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+        from scripts.native_modules import identify_native_module
+        from scripts.programming_2026_common import (
+            ControlCommPhase2026,
+            NativeFrontendParameters2026,
+            NativeRuntime2026,
+            bind_native_parameter2026,
+        )
+        from scripts.programming_2026_suzuki_fhi import (
+            bind_native_context,
+            execute_context,
+        )
+        from scripts.programming_replay import _native_request
+        from tests.private_evidence import read_private_bytes
+        from tests.test_cuw_engine_worker import encoded_table
+
+        def encode(value: Any) -> dict[str, Any]:
+            if value is None:
+                return {"type": "none", "value": None}
+            if type(value) is bool:
+                return {"type": "bool", "value": value}
+            if type(value) is int:
+                return {"type": "int", "value": value}
+            if type(value) is bytes:
+                return {"type": "bytes", "value": value.hex()}
+            if type(value) is tuple:
+                return {"type": "tuple", "value": [encode(item) for item in value]}
+            raise TypeError(
+                f"Unsupported captured Suzuki callback value: {type(value)!r}"
+            )
+
+        def record(header: bytes, data: bytes) -> bytes:
+            return (
+                struct.pack(">H", len(header))
+                + header
+                + struct.pack(">II", len(data), zlib.crc32(data))
+                + data
+            )
+
+        metadata = (
+            b"[Format]\nVersion=10\n[Vehicle]\nKindOfECU=31\n"
+            b"ContactType=SUZUKI\nNumberOfCalibration=1\n"
+            b"ByteNumberOfTransmitting=00000003\nCANIDTx_Func_USDT=07DF\n"
+            b"CANIDTx_Phys_USDT=07E01234\nCANIDRx_Phys_USDT=07E85678\n"
+            b"[CPU01]\nCPUImageName=authored.vbf\nStartAddress=0100001000\n"
+            b"SizeOfUncompressedDownloadData=00000008\nSizeOfDownloadData=00000004\n"
+        )
+        payload = b"DATAextra"
+        body = (
+            record(b"authored.att", metadata)
+            + b"\x01"
+            + record(b"authored.bin", payload)
+        )
+        calibration = (
+            b"\0CALIBRATION\0\x68" + bytes(4) + struct.pack(">I", 22 + len(body)) + body
+        )
+        calibration = (
+            calibration[:14]
+            + struct.pack(">I", zlib.crc32(calibration[18:]))
+            + calibration[18:]
+        )
+        module_name = "TCUWCanSuzukiUSBReproUDSFlashWriter.dll"
+        utility_name = "TCUWCanSuzukiUDSUtils.dll"
+        source_catalog = {
+            "31SUZUKI.ini": encoded_table(
+                (
+                    "ParamFileKeySystemProtocolMicon",
+                    "DLLFileNameForFlashWrite",
+                    "GetCANIDFunctionNameForFlashWrite",
+                    "WaitTimeForIGOFFON",
+                    "AlternateWaitTimeForIGOFFON",
+                    "CpuLoopBetweenPrepareAndWriteFlag",
+                    "EnableDLLVersionInformation",
+                ),
+                (
+                    (
+                        "31SUZUKI",
+                        module_name,
+                        "GetCanIDsFromCalibrationFileForSUZUKI",
+                        "5",
+                        "12",
+                        "0",
+                        "0\n0\n0\n0",
+                    ),
+                ),
+            ),
+            "Parameter.ini": encoded_table(
+                (
+                    "ParamFileKeySystemProtocolMicon",
+                    "M16CTypeFlag",
+                    "FORESTTypeFlag",
+                    "PasswordAddress",
+                    "ByteOrder",
+                    "FlagToDoIGOFFONAtCPUTypeChange",
+                    "FlagToChangeToReprogGWModeForCentralGW",
+                    "WaitTimeForIGOFFON",
+                    "WaitTimeAfterBatteryDisconnected",
+                    "WaitTimeAfterBatteryConnected",
+                    "BatteryVoltageUpperThreshold",
+                ),
+                (("31SUZUKI", "0", "0", "00", "1", "0", "0", "5", "6", "7", "12.5"),),
+            ),
+            "CanIDTable.ini": encoded_table(
+                ("RequestCANID", "ResponseCANID"), (("07E0", "07E8"),)
+            ),
+            "LogicalAddressTable.ini": encoded_table(
+                ("LogicalAddress",), (("SUZUKI",),)
+            ),
+        }
+        image_root = Path("runtime/no-car-21/recovered")
+        module_files = {
+            name: read_private_bytes(image_root / name)
+            for name in (
+                module_name,
+                utility_name,
+                "CUW.dll",
+                "TCUWControlCommPhase.dll",
+            )
+        }
+        container = parse_cuw_2026(calibration)
+        frontend = NativeFrontendParameters2026.from_sources(
+            source_catalog, encoded=True
+        )
+
+        direct_engine = CUWEngine2026(
+            module_files["CUW.dll"], general_parameters=frontend.general
+        )
+        self.addCleanup(direct_engine.close)
+        direct_engine.configure(struct.pack("<IIddII", 1, 0, 1, 2, 0, 0))
+        direct_engine.bind_frontend_parameters(frontend)
+        direct_engine.load_cuw(calibration)
+        direct_persistence = tempfile.TemporaryDirectory()
+        self.addCleanup(direct_persistence.cleanup)
+        direct_engine.bind_persistence(
+            CUWPersistence(
+                Path(direct_persistence.name),
+                ReproInfoState(
+                    (
+                        RecoveryCalibration(
+                            "authored.cuw", calibration, blank_ecu_flags=(False,)
+                        ),
+                    ),
+                    multi_calibration_file_num=1,
+                    loaded=False,
+                ),
+            )
+        )
+        binding = bind_native_parameter2026(
+            container,
+            source_catalog,
+            "write",
+            node=1,
+            cpu_index=0,
+            metadata_state=direct_engine.native_metadata,
+            encoded=True,
+        )
+        identity = identify_native_module(
+            hashlib.sha256(module_files[module_name]).hexdigest(), module_name
+        )
+        native_context = bind_native_context(
+            container,
+            1,
+            (),
+            binding,
+            identity,
+            {
+                "selected_module": module_files[module_name],
+                "utils_module": module_files[utility_name],
+                "cuw_module": module_files["CUW.dll"],
+            },
+            {"cpu_index": 0, "suzuki_state": direct_engine.suzuki_state},
+        )
+        captured_rows: list[dict[str, Any]] = []
+        nested_action_rows: list[dict[str, Any]] = []
+        nested_action_capture = False
+        last_request = b""
+
+        def capture_action(event: dict[str, Any], _remaining: float):
+            nonlocal last_request
+            operation = event["operation"]
+            if operation == "start_flow_control_filter":
+                result: Any = 8
+            elif operation == "get_timeout":
+                result = 2000
+            elif operation == "write_messages":
+                last_request = event["data"][4:]
+                result = 1
+            elif operation == "read_specified_can_message":
+                replies = {
+                    b"\x2e\xcf\x80\x01": b"\x6e\xcf\x80",
+                    b"\x31\x01\xda\x00": b"\x71\x01\xda\x00\x01",
+                    b"\x31\x03\xda\x00": b"\x71\x03\xda\x00\x06",
+                    b"\x31\x01\xd9\x15": b"\x71\x01\xd9\x15\x01",
+                    b"\x31\x01\xda\x01": b"\x71\x01\xda\x01\x01",
+                }
+                result = bytes.fromhex("000007e8") + replies[last_request]
+            else:
+                result = None
+            row = {
+                "kind": "action",
+                "request": _native_request(event),
+                "result": encode(result),
+                "elapsed_ms": 1,
+            }
+            (nested_action_rows if nested_action_capture else captured_rows).append(row)
+            return result
+
+        capture_runtime = NativeRuntime2026(
+            capture_action, native_cancelled=lambda: False
+        )
+        captured_result = execute_context(native_context, capture_runtime)
+        self.assertTrue(captured_result["native_return"])
+        self.assertEqual(direct_engine.native_wait_time_for_igoffon2026(1), 0)
+        self.assertIn(
+            "notify_igoffon_wait",
+            [row["request"]["operation"] for row in captured_rows],
+        )
+        callback_row = next(
+            row
+            for row in captured_rows
+            if row["request"]["operation"] == "notify_igoffon_wait"
+        )
+        self.assertEqual(callback_row["request"]["value"], 12)
+        callback_row["result"] = {
+            "type": "error",
+            "value": {
+                "domain": "j2534_2026",
+                "code": 5,
+                "detail": 5,
+            },
+        }
+        recording = {
+            "schema": "techstream-programming-replay-v1",
+            "source": "recorded_unverified",
+            "calibration_sha256": hashlib.sha256(calibration).hexdigest(),
+            "operation": "write",
+            "node": 1,
+            "observations": {
+                "current_cids": [],
+                "tester_info_hex": bytes(32).hex(),
+                "system_time": [2026, 10, 22, 22, 1, 2, 3, 4],
+                "timeout_seconds": 30,
+                "cid_mode": 2,
+                "host": {"cpu_index": 0},
+            },
+            "events": [
+                {
+                    "kind": "action",
+                    "request": {"operation": "get_local_milliseconds_of_day"},
+                    "result": {"type": "int", "value": 1000},
+                    "elapsed_ms": 1,
+                },
+                *captured_rows,
+                {
+                    "kind": "action",
+                    "request": {"operation": "get_local_milliseconds_of_day"},
+                    "result": {"type": "int", "value": 2000},
+                    "elapsed_ms": 1,
+                },
+            ],
+        }
+        session = load_programming_replay(
+            calibration, json.dumps(recording).encode(), source_catalog, module_files
+        )
+        self.addCleanup(session.trace.close)
+        runtime = None
+        trace_action = session.trace.action
+        reentry_started = False
+        reentry_result = None
+        reentry_error = None
+        reentry_wait_value = None
+
+        def replay_action(event: dict[str, Any], remaining: float):
+            nonlocal nested_action_capture
+            nonlocal reentry_started, reentry_result, reentry_error
+            nonlocal reentry_wait_value
+            scope = (
+                getattr(runtime._device_calls, "suzuki_wait_scope", None)
+                if runtime is not None
+                else None
+            )
+            if scope is not None and not reentry_started:
+                reentry_started = True
+                nested_action_capture = True
+                try:
+                    reentry_result = execute_context(scope.runner_context, runtime)
+                except ValueError as exc:
+                    reentry_error = exc
+                finally:
+                    nested_action_capture = False
+                reentry_wait_value = engine.native_wait_time_for_igoffon2026(1)
+            if nested_action_capture:
+                return capture_action(event, remaining)
+            return trace_action(event, remaining)
+
+        session.trace.action = replay_action
+        runtime = NativeRuntime2026(
+            session.trace.action,
+            clock=session.trace.clock,
+            cancelled=session.trace.cancelled,
+            local_seconds_of_day=session.trace.native_local_seconds_of_day,
+            local_milliseconds_of_day=session.trace.native_local_milliseconds_of_day,
+        )
+        controller = ControlCommPhase2026(
+            identity_2026(
+                module_files["TCUWControlCommPhase.dll"], "TCUWControlCommPhase.dll"
+            ),
+            runtime,
+        )
+        engine = CUWEngine2026(
+            module_files["CUW.dll"], general_parameters=frontend.general
+        )
+        self.addCleanup(engine.close)
+        engine.configure(struct.pack("<IIddII", 1, 0, 1, 2, 0, 0))
+        engine.bind_frontend_parameters(frontend)
+        engine.load_cuw(calibration)
+        persistence_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(persistence_dir.cleanup)
+        engine.bind_persistence(
+            CUWPersistence(
+                Path(persistence_dir.name),
+                ReproInfoState(
+                    (
+                        RecoveryCalibration(
+                            "authored.cuw", calibration, blank_ecu_flags=(False,)
+                        ),
+                    ),
+                    multi_calibration_file_num=1,
+                    loaded=False,
+                ),
+            )
+        )
+        session.bind_controller2026(controller)
+        session.bind_engine2026(engine)
+        with engine.controller_execution(controller, 0):
+            result = session.run_bound2026(runtime)
+        self.assertTrue(reentry_started)
+        self.assertIn(
+            "start_flow_control_filter",
+            [row["request"]["operation"] for row in nested_action_rows],
+        )
+        self.assertIsInstance(reentry_result, dict)
+        assert reentry_result is not None
+        self.assertEqual(reentry_result["error"], "ValueError")
+        self.assertIsNone(reentry_error)
+        self.assertEqual(reentry_wait_value, 0)
+        self.assertEqual(result["module"], module_name)
+        self.assertIs(result["native_return"], False)
+        self.assertEqual(engine.native_wait_time_for_igoffon2026(1), 12)
+        self.assertEqual(engine.native_wait_time_for_igoffon2026(2), 0)
+        self.assertEqual(engine.native_wait_time_for_igoffon2026(3), 0)
+        self.assertEqual(session.trace.position, len(captured_rows) + 2)
+
+        (
+            raw_result,
+            raw_callback_authority,
+            raw_events,
+            raw_driver,
+            raw_engine,
+            raw_controller,
+            raw_session,
+            raw_runtime,
+        ) = _run_authored_suzuki_raw_control(
+            self, calibration, source_catalog, module_files
+        )
+        self.assertEqual(raw_result["native_phase"], 2)
+        self.assertIs(raw_result["native_return"], True)
+        self.assertEqual(raw_result["exports"][0]["state"], "writer_completed")
+        self.assertEqual(raw_result["exports"][0]["module"], module_name)
+        self.assertEqual(
+            raw_callback_authority,
+            [
+                {
+                    "scope_active": True,
+                    "target_active": True,
+                    "target_type": "NativeControlExportTarget2026",
+                    "stage_target_matches": True,
+                    "stage_owners_match": True,
+                    "export": "StartFlashWrite",
+                    "lease_active": True,
+                    "entry_active": True,
+                    "thread_matches": True,
+                    "context_matches": True,
+                    "module": module_name,
+                }
+            ],
+        )
+        self.assertEqual(raw_engine.native_wait_time_for_igoffon2026(1), 12)
+        self.assertEqual(raw_controller._native_control_export_lease2026, None)
+        self.assertIsNone(raw_controller._native_control_helper_entry2026)
+        self.assertIsNone(raw_session._control_target2026)
+        self.assertIsNone(raw_session._control_export2026)
+        self.assertIsNone(raw_runtime._device_calls.suzuki_wait_scope)
+        self.assertEqual(len(raw_events), 35)
+        self.assertEqual(raw_session.trace.position, len(raw_events))
+        self.assertTrue(
+            any(
+                row["request"]["operation"] == "notify_igoffon_wait"
+                for row in raw_events
+            )
+        )
+        self.assertTrue(
+            any(
+                event["operation"] == "passthru_write"
+                and event["messages"][0].data[4:] == b"\x2e\xcf\x80\x01"
+                for event in raw_driver.events
+            )
+        )
+        self.assertEqual(raw_driver.pending, [])
 
     def test_same_json_stream_is_validated_before_execution_and_spooled(self):
         class SmallReads(io.BytesIO):
@@ -196,6 +2091,68 @@ class ProgrammingReplayTests(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "previous raw root"),
         ):
             session._next_vbf_prepare2026(object(), request)
+
+    def test_next_getter_root_rejects_noncontinuations_before_source_access(self):
+        session = self.load()
+        trace_position = session.trace.position
+        with self.assertRaisesRegex(TypeError, "Exact native getter continuation"):
+            session._next_cid_root_34cb0_2026(cast(Any, object()))
+        self.assertEqual(session.trace.position, trace_position)
+        self.assertFalse(session.used)
+
+    def test_next_getter_root_rejects_continuation_with_foreign_job_type(self):
+        from scripts.cuw_engine_worker import _NativeGetterContinuation2026
+
+        session = self.load()
+        entry = object.__new__(_NativeGetterContinuation2026)
+        object.__setattr__(entry, "job", object())
+        trace_position = session.trace.position
+        with self.assertRaisesRegex(TypeError, "Exact native getter job"):
+            session._next_cid_root_34cb0_2026(entry)
+        self.assertEqual(session.trace.position, trace_position)
+        self.assertFalse(session.used)
+
+    def test_next_getter_root_rejects_continuation_with_foreign_worker_type(self):
+        from scripts.cuw_engine_threads import EngineThreadJob2026
+        from scripts.cuw_engine_worker import _NativeGetterContinuation2026
+
+        session = self.load()
+        entry = object.__new__(_NativeGetterContinuation2026)
+        object.__setattr__(entry, "job", object.__new__(EngineThreadJob2026))
+        object.__setattr__(entry, "worker", object())
+        trace_position = session.trace.position
+        with self.assertRaisesRegex(TypeError, "Exact native getter worker"):
+            session._next_cid_root_34cb0_2026(entry)
+        self.assertEqual(session.trace.position, trace_position)
+        self.assertFalse(session.used)
+
+    def test_constructed_getter_continuation_reaches_rejecting_validator_before_clone(
+        self,
+    ):
+        from scripts.cuw_engine_threads import _TOKEN, EngineThreadJob2026
+        from scripts.cuw_engine_worker import (
+            EngineWorker2026,
+            _NativeGetterContinuation2026,
+        )
+        from scripts.programming_replay import ProgrammingReplay
+
+        session = self.load()
+        entry = object.__new__(_NativeGetterContinuation2026)
+        job = EngineThreadJob2026(SimpleNamespace(worker=None), None, _token=_TOKEN)
+        object.__setattr__(entry, "job", job)
+        object.__setattr__(entry, "worker", object.__new__(EngineWorker2026))
+        object.__setattr__(entry, "old_completion", object())
+        object.__setattr__(entry, "old_lease", object())
+        trace_position = session.trace.position
+
+        with (
+            patch.object(ProgrammingReplay, "__init__", autospec=True) as clone,
+            self.assertRaisesRegex(ValueError, "stale or foreign"),
+        ):
+            session._next_cid_root_34cb0_2026(entry)
+        clone.assert_not_called()
+        self.assertEqual(session.trace.position, trace_position)
+        self.assertFalse(session.used)
 
     def test_fresh_clone_actual_import_metadata_writer_and_identity(self):
         from scripts.calibration_catalog import inspect_module_bytes

@@ -141,3 +141,32 @@ Full acceptance requires the independently reviewed same-engine failed-family
 export → callback 3 → captured `5e950` input → callback 8 → actual retry consumer,
 including post-wait multi-file reorder and nonretry whole-engine cleanup. Passing
 input-validation tests alone does not certify that larger chain or vehicle use.
+
+The shared `36800` prepare initializer clears only the source battery comparison
+byte (`D548`), measured voltage (`D550`), query-valid byte (`D558`), and child
+checkpoint (`C24`), in that order. It retains an existing native modal result.
+The engine publishes the captured local timestamp to its canonical `D314` before
+this helper; lazy retry-controller construction retains that timestamp instead
+of restarting it at zero. Source `3c720` and cleanup use the same clock carrier.
+These carrier checks do not establish acceptance of the whole retry controller
+or the ongoing ordinary-prepare integration.
+
+The current retry regression fixtures bind real frontend tables before cold
+named FILE admission, including the actual empty DiagID row used by their
+source bytes. The getter stop/reissue case binds its replay to the exact
+runtime, engine and controller before `start`, so source `34cb0` publishes the
+receiving state before the captured child clock fault. A generic phase-zero
+reservation does not authorize `5f030`.
+
+The original private119 helper and trace files remain immutable. The new
+`retry-regressions/prepare_ack.py` fixture records a separate ordinary `36800`
+entry with the actual Control module present and no selected family targets.
+The real raw phase-one return is false with no family exports; this does not
+claim successful prepare or programming. Its source-issued initial receipt is
+consumed once by the child, and the canonical `D314` is 1000. The actual child
+then parks with handshake one. A recorded engine-view `ReadVersion` status seven
+produces `33e50` → `41e60` acknowledgement and handshake two, both after parking
+and while the real outer tail is delayed. Fresh strict replay consumes each new
+trace completely, retaining the live child and producing no retry input.
+Public tests check private helper availability before importing it, so an
+ordinary public checkout still collects and skips absent private evidence.

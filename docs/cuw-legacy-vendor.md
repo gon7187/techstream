@@ -108,6 +108,18 @@ admitted original executable's string resources and retains global CPU count/ind
 The matched success callback pair remains a controller precondition. The predicate
 alone does not authorize finalization.
 
+`techvim_progress_status(context, category, method, hresult)` admits the exact
+original CUW12/18 executable before classifying a typed `GetProgress` failure.
+It returns `0` for HRESULT `800f0205` (restart the poll), `3` for `800f0204`,
+`4` for CAN-only `800f0209`, `2` when `(HRESULT & 00ff0000) == 000d0000`,
+and `1` otherwise. Only category `0`, method `24` gets those HRESULT cases;
+other typed errors return `1`. A zero return is a poll transition, not a
+successful programming result. Static anchors are CUW12 VA `46c964–46cde0`
+and CUW18 VA `4a369a` (SIL) / `4a3f2f` (CAN); these helpers preserve original
+HRESULT while the CTester2 translation wrapper can discard it. The reducer does
+not load the SDK, acquire a profile, poll, or invoke UI callbacks. Full TechVim
+controller, SDK provisioning, and manager/UI lifecycle remain unsupported.
+
 Outstanding gates include the full TechVim controller, whole-family
 independent source review, and the final getter/manager/recovery and outer resource
 lifetime composition. Current source-bound EMPS/DCM/DH router checks cover the

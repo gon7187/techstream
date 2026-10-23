@@ -71,6 +71,100 @@ def minimal(layout: Any, expand: int = 0, scope: tuple = ()) -> Any:
 
 
 class ReportTests(unittest.TestCase):
+    def test_normal_zero_step_plan_joins_the_existing_pair_header(self):
+        version = 0x1000
+        root = list(
+            minimal(report._section_layout("DDRData", 0xFFFFFF31, version).item)
+        )
+        info = list(minimal(report._layout("b1340", version)))
+        info[5] = (info[5][0], 0, *info[5][2:])
+        info[6], info[7] = 2, 2
+        saved = list(minimal(report._signal(version, 7, False)))
+        saved[0], saved[1], saved[-1] = 303, b"Target", ((1, b"stored", 0xA5),)
+        info[24] = tuple(saved)
+        masks = list(minimal(report._layout("b1760", version)))
+        masks[19], masks[20], masks[21] = (1,), (), (255,)
+        root[1] = ((tuple(info), tuple(masks)),)
+        section = report.ReportSection(
+            "DDRData", 7, 0xFFFFFF31, version, (tuple(root),), 1
+        )
+        wire = report.encode_section(section)
+        decoded = report.decode_section("DDRData", wire)
+        self.assertEqual(report.encode_section(decoded), wire)
+
+        budget = [0, 0]
+        view = report.view_section(decoded, encoding="ascii", _budget=budget)
+        row = next(
+            item for item in view["ddr_headers"] if item["source_path"] == [0, 1, 0]
+        )
+        plan = row["sequence_coordinate_plan"]
+        self.assertEqual(
+            plan,
+            {
+                "scope": "normal-ddr-id3-pre-sort",
+                "status": "source-derived",
+                "points": [
+                    {"coordinate": 0, "tag": 0, "source_index": 2},
+                    {"coordinate": 0, "tag": 0, "source_index": 3},
+                ],
+                "inputs_raw": {
+                    "count_a": 2,
+                    "count_b": 2,
+                    "divisor": 0,
+                    "sample_count": 1,
+                    "mask0": [],
+                    "mask1": [],
+                    "mask19": [1],
+                    "mask20": [],
+                    "mask21": [255],
+                },
+                "input_source_paths": {
+                    "count_a": [0, 1, 0, 0, 6],
+                    "count_b": [0, 1, 0, 0, 7],
+                    "divisor": [0, 1, 0, 0, 5, 1],
+                    "sample_count": [0, 1, 0, 0, 24, 7],
+                    "mask0": [0, 1, 0, 1, 0],
+                    "mask1": [0, 1, 0, 1, 1],
+                    "mask19": [0, 1, 0, 1, 19],
+                    "mask20": [0, 1, 0, 1, 20],
+                    "mask21": [0, 1, 0, 1, 21],
+                },
+            },
+        )
+        parameter = next(
+            item
+            for item in view["parameters"]
+            if item["source_path"] == [0, 1, 0, 0, 24]
+        )
+        self.assertEqual(parameter["values"][0]["display"], "stored")
+        self.assertFalse(parameter["values"][0]["sequence_format_admitted"])
+        self.assertGreaterEqual(budget[0], 1 + 5)
+        self.assertGreaterEqual(budget[1], 1024 + 16)
+
+        plan_charge = report._charge_sequence_plan
+        before_charge = []
+
+        def observe_plan_charge(shared_budget, nodes, octets):
+            before_charge.append(tuple(shared_budget))
+            plan_charge(shared_budget, nodes, octets)
+
+        with patch.object(
+            report, "_charge_sequence_plan", side_effect=observe_plan_charge
+        ):
+            report.view_section(decoded, encoding="ascii", _budget=[0, 0])
+        self.assertTrue(before_charge)
+        prior_nodes, prior_octets = before_charge[0]
+        with self.assertRaisesRegex(report.ReportError, "sequence coordinate plan"):
+            report.view_section(
+                decoded,
+                encoding="ascii",
+                _budget=[
+                    report.MAX_NODES - prior_nodes - 1,
+                    report.MAX_BYTES - prior_octets - 1023,
+                ],
+            )
+        self.assertEqual(report.encode_section(decoded), wire)
+
     def test_normal_ddr3_sequence_admission_is_ordered_and_slot_bound(self):
         version = 0x1027
         root = list(
@@ -277,9 +371,17 @@ class ReportTests(unittest.TestCase):
         decoded = report.decode_section("DDRData", wire)
         self.assertEqual(report.encode_section(decoded), wire)
         headers = report.view_section(decoded, encoding="ascii")["ddr_headers"]
+        expected.sort(key=lambda row: row["source_path"])
+        actual = sorted(
+            (row for row in headers if "key_cycle_raw" in row),
+            key=lambda row: row["source_path"],
+        )
         self.assertEqual(
-            [row for row in headers if "key_cycle_raw" in row],
-            sorted(expected, key=lambda row: row["source_path"]),
+            [
+                {key: row[key] for key in expected_row}
+                for expected_row, row in zip(expected, actual, strict=True)
+            ],
+            expected,
         )
 
         root[7], root[20] = (), ()

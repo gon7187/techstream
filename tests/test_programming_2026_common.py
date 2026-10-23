@@ -7,6 +7,41 @@ from typing import Any
 from scripts.programming_2026_common import NativeRuntime2026, NotificationBool
 
 
+class SuzukiWaitRuntimeBoundaryTests(unittest.TestCase):
+    def test_standalone_wait_notification_remains_provider_only(self):
+        events = []
+        runtime = NativeRuntime2026(
+            lambda event, _remaining: events.append(event), clock=lambda: 0
+        )
+        runtime.call("notify_igoffon_wait", value=0xFFFFFFFF)
+        runtime.call("notify_igoffon_wait", cleanup=True, value=0)
+        self.assertEqual(
+            events,
+            [
+                {"operation": "notify_igoffon_wait", "value": 0xFFFFFFFF},
+                {"operation": "notify_igoffon_wait", "value": 0},
+            ],
+        )
+        self.assertIsNone(getattr(runtime._device_calls, "suzuki_wait_origin", None))
+
+    def test_arbitrary_scope_entry_and_unissued_origins_cannot_publish(self):
+        runtime = NativeRuntime2026(
+            lambda *_: self.fail("No provider call"), clock=lambda: 0
+        )
+        with (
+            self.assertRaisesRegex(ValueError, "selected Suzuki runner"),
+            runtime._suzuki_igoffon_wait_scope_2026(
+                object(), engine=object(), controller=object()
+            ),
+        ):
+            self.fail("Arbitrary caller entered selected scope")
+        for origin in (None, object(), 123, (object(), 1)):
+            with self.subTest(origin=origin), self.assertRaises(ValueError):
+                runtime._consume_suzuki_igoffon_wait_origin_58e20_2026(
+                    origin, engine=object()
+                )
+
+
 class NotificationTests(unittest.TestCase):
     def test_assign_notifies_without_change_and_disable_enable(self):
         events = []
@@ -325,7 +360,17 @@ class NativeControlContextTests(unittest.TestCase):
 
 
 def make_raw_control_fixture2026(
-    case, *, source, catalog, module_files, operation="prepare", events=(), paired=False
+    case,
+    *,
+    source,
+    catalog,
+    module_files,
+    operation="prepare",
+    events=(),
+    paired=False,
+    bind_frontend=False,
+    bind_persistence=False,
+    bind_file_sources=False,
 ):
     """Authored FILE/recorded primitives with authenticated original module bytes."""
     import hashlib
@@ -375,10 +420,20 @@ def make_raw_control_fixture2026(
         local_seconds_of_day=session.trace.native_local_seconds_of_day,
         local_milliseconds_of_day=session.trace.native_local_milliseconds_of_day,
     )
-    from scripts.programming_2026_common import NativeGeneralParameters2026
+    from scripts.programming_2026_common import (
+        NativeFrontendParameters2026,
+        NativeGeneralParameters2026,
+    )
 
+    frontend = (
+        NativeFrontendParameters2026.from_sources(catalog, encoded=True)
+        if bind_frontend
+        else None
+    )
     general = (
-        NativeGeneralParameters2026.from_sources(catalog)
+        frontend.general
+        if frontend is not None
+        else NativeGeneralParameters2026.from_sources(catalog)
         if "Parameter.ini" in catalog
         else None
     )
@@ -386,7 +441,52 @@ def make_raw_control_fixture2026(
         read_private_bytes(images / "CUW.dll"), general_parameters=general
     )
     engine.configure(struct.pack("<IIddII", 16, 0, 1, 2, 0, 0))
-    engine.load_cuw(source)
+    if frontend is not None:
+        engine.bind_frontend_parameters(frontend)
+    sources = None
+    if bind_file_sources:
+        from scripts.cuw_file_services import admit_file_sources_2026
+
+        sources = admit_file_sources_2026(
+            engine,
+            "input.json",
+            b'["fixture.cuw"]',
+            region=0,
+            source_files={"fixture.cuw": source},
+        )
+        engine.bind_file_sources(sources)
+    else:
+        engine.load_cuw(source)
+    if bind_persistence:
+        import tempfile
+
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+
+        persistence_root = tempfile.TemporaryDirectory()
+        case.addCleanup(persistence_root.cleanup)
+        if sources is None:
+            names, originals, count = ("fixture.cuw",), (source,), 0
+        else:
+            names, originals, count = sources.recovery_sources()
+        engine.bind_persistence(
+            CUWPersistence(
+                Path(persistence_root.name),
+                ReproInfoState(
+                    tuple(
+                        RecoveryCalibration(
+                            name, original, blank_ecu_flags=(False,) * 4
+                        )
+                        for name, original in zip(names, originals, strict=True)
+                    ),
+                    multi_calibration_file_num=count,
+                    loaded=False,
+                ),
+            )
+        )
     controller = ControlCommPhase2026(
         identity_2026(
             read_private_bytes(images / "TCUWControlCommPhase.dll"),
@@ -425,14 +525,20 @@ class RawControlStageMachineTests(unittest.TestCase):
         *,
         operation="prepare",
         contact="SIL",
+        kind="1",
         selector="",
         versions="0\n0\n0\n0",
         events=(),
         gateway="",
         alternate="",
+        getter="TCUWSilCIDGetter.dll",
         cpus=1,
         paired=False,
         dependencies=(),
+        diag_id=None,
+        bind_frontend=False,
+        bind_persistence=False,
+        bind_file_sources=False,
         writer="TCUWSilFlashWriter.dll",
         preparer="TCUWSilPrepareWriter.dll",
         parameter_values=None,
@@ -445,11 +551,20 @@ class RawControlStageMachineTests(unittest.TestCase):
 
         modern = contact in ("P5-Unified", "Phase6", "Ethernet")
         keys = (
-            ("1" + contact,)
+            (
+                kind
+                + contact
+                + ("02" if contact == "Phase6" and diag_id is not None else ""),
+                *(
+                    (kind + contact,)
+                    if contact == "Phase6" and diag_id is not None
+                    else ()
+                ),
+            )
             if modern
-            else tuple("1" + contact + str(i + 1) for i in range(cpus))
+            else tuple(kind + contact + str(i + 1) for i in range(cpus))
         )
-        names = (preparer, writer, "TCUWSilCIDGetter.dll")
+        names = (preparer, writer, getter)
         parameter_values = parameter_values or {}
         headers = (
             "ParamFileKeySystemProtocolMicon",
@@ -490,14 +605,40 @@ class RawControlStageMachineTests(unittest.TestCase):
                 "PasswordAddress",
                 "ByteOrder",
                 "FlagToDoIGOFFONAtCPUTypeChange",
+                "WaitTimeForIGOFFON",
+                "WaitTimeAfterBatteryDisconnected",
+                "WaitTimeAfterBatteryConnected",
+                "BatteryVoltageUpperThreshold",
+                "FlagToChangeProtocolAtSuccessGetCID",
             ),
-            tuple((key, "0", "0", "0", "00", "1", "0") for key in keys),
+            tuple(
+                (
+                    key,
+                    "0",
+                    "0",
+                    "0",
+                    "00",
+                    "1",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                )
+                for key in keys
+            ),
         )
         if modern:
+            node_fields = (
+                f"DiagID={diag_id}\nProtocol=02\nWakeUpTimeAfterReset=0\n"
+                if contact == "Phase6" and diag_id is not None
+                else ""
+            )
             text = (
-                "[Format]\nVersion=105\n[Vehicle]\nKindOfECU=1\nContactType="
+                f"[Format]\nVersion=105\n[Vehicle]\nKindOfECU={kind}\nContactType="
                 + contact
-                + f"\nNumberOfNode=1\n[Node01]\nRequiredSpecReproVer=02\nNumberOfCalibration={cpus}\n"
+                + f"\nNumberOfNode=1\n[Node01]\nRequiredSpecReproVer=02\n{node_fields}NumberOfCalibration={cpus}\n"
             )
         else:
             text = (
@@ -508,6 +649,16 @@ class RawControlStageMachineTests(unittest.TestCase):
         for i in range(cpus):
             text += f"[CPU{(11 if modern else 1) + i:02}]\nCPUType={i + 1}\nCPUImageName=image{i}.vbf\n"
         source = cuw(text, tuple(f"DATA{i}".encode() for i in range(cpus)))
+        if bind_frontend:
+            from tests.test_programming_replay import authored_classic_can40_inputs
+
+            _source, frontend_sources, _payloads = authored_classic_can40_inputs()
+            for name in ("CanIDTable.ini", "LogicalAddressTable.ini"):
+                catalog[name] = frontend_sources[name]
+            if contact == "Phase6" and diag_id is not None:
+                catalog["CanIDTable.ini"] = encoded_table(
+                    ("RequestCANID", "CalibrationType"), ((diag_id, "17"),)
+                )
         images = Path("runtime/no-car-21/recovered")
         return make_raw_control_fixture2026(
             self,
@@ -520,6 +671,9 @@ class RawControlStageMachineTests(unittest.TestCase):
             },
             operation=operation,
             paired=paired,
+            bind_frontend=bind_frontend,
+            bind_persistence=bind_persistence,
+            bind_file_sources=bind_file_sources,
             events=(
                 self.event("get_local_milliseconds_of_day", 1000),
                 *events,
@@ -585,6 +739,10 @@ class RawControlStageMachineTests(unittest.TestCase):
         for out in (False, True):
             with self.subTest(out=out):
                 engine, control, session = self.fixture(operation="get_cid")
+                from scripts.programming_2026_common import (
+                    _control_getter_output2026,
+                )
+
                 with (
                     patch.object(
                         ProgrammingReplay,
@@ -604,7 +762,244 @@ class RawControlStageMachineTests(unittest.TestCase):
                     self.assertEqual(
                         _control_getter_return_values2026(context), (b"CID",)
                     )
+                    self.assertIsNone(_control_getter_output2026(context))
                     self.assertEqual(engine.received_identifiers, ())
+
+    def test_getter_attempt_and_return_hooks_preserve_actual_order(self):
+        from unittest.mock import patch
+
+        from scripts.programming_2026_common import (
+            _record_control_getter_family_attempt2026,
+            _record_control_getter_family_return2026,
+        )
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture(
+            operation="get_cid", alternate="TCUWP5CanCIDGetter.dll"
+        )
+
+        def runner(stage, *_args):
+            alternate = stage._control_target2026.binding.alternate_cid
+            return lambda: {
+                "native_return": None,
+                "bool_out": bool(alternate),
+                "native_success": not bool(alternate),
+                "cids": (b"ALT",) if alternate else (),
+            }
+
+        with (
+            patch.object(ProgrammingReplay, "_runner", runner),
+            patch(
+                "scripts.programming_2026_common._record_control_getter_family_attempt2026",
+                wraps=_record_control_getter_family_attempt2026,
+            ) as attempts,
+            patch(
+                "scripts.programming_2026_common._record_control_getter_family_return2026",
+                wraps=_record_control_getter_family_return2026,
+            ) as returns,
+            engine.controller_execution(control, 0),
+        ):
+            control.execute(engine, session)
+
+        attempted_targets = tuple(call.args[0] for call in attempts.call_args_list)
+        returned_targets = tuple(call.args[0] for call in returns.call_args_list)
+        self.assertEqual(len(attempted_targets), 2)
+        self.assertEqual(len(returned_targets), 2)
+        self.assertTrue(
+            all(
+                started is returned
+                for started, returned in zip(attempted_targets, returned_targets)
+            )
+        )
+
+    def test_caught_alternate_cpass_keeps_raw_getter_but_withholds_typed_output(self):
+        from unittest.mock import patch
+
+        from scripts.programming_2026_common import (
+            NativePassThruException2026,
+            _control_getter_output2026,
+        )
+        from scripts.programming_replay import ProgrammingReplay
+
+        engine, control, session = self.fixture(
+            operation="get_cid", alternate="TCUWP5CanCIDGetter.dll"
+        )
+
+        def runner(stage, *_args):
+            if stage._control_target2026.binding.alternate_cid:
+                return lambda: (_ for _ in ()).throw(
+                    NativePassThruException2026(77, "authored-alternate", 1)
+                )
+            return lambda: {
+                "native_return": None,
+                "native_success": False,
+                "cids": (),
+            }
+
+        with (
+            patch.object(ProgrammingReplay, "_runner", runner),
+            engine.controller_execution(control, 0),
+        ):
+            result = control.execute(engine, session)
+            context = control.native_control_context2026(engine)
+            self.assertFalse(result["native_return"])
+            self.assertEqual(result["identifiers"], ())
+            self.assertIsNone(_control_getter_output2026(context))
+
+    def test_authenticated_cancid_module_issues_complete_typed_snapshot(self):
+        from scripts.programming_2026_common import _control_getter_output2026
+
+        payloads = (
+            b"\x49\0\x10\0\0\0",
+            b"\x49\x04\x01" + b"DEMO\0".ljust(16, b" "),
+        )
+        operations = (
+            ("connect", None, {"protocol": 6}),
+            ("set_timeout", None, {"milliseconds": 123}),
+            (
+                "start_flow_control_filter",
+                7,
+                {
+                    "request_address": b"\0\0\x01\0",
+                    "response_address": b"\0\0\x01\x08",
+                },
+            ),
+            ("get_timeout", 123, {}),
+            (
+                "write_messages",
+                1,
+                {"protocol": 6, "tx_flags": 0, "data": b"\0\0\x01\0\x09\0", "count": 1},
+            ),
+            ("wait", None, {"milliseconds": 0}),
+            (
+                "read_specified_can_message",
+                b"\0\0\x01\x08" + payloads[0],
+                {"address": b"\0\0\x01\x08", "count": 1, "frame": 2},
+            ),
+            ("set_timeout", None, {"milliseconds": 123}),
+            ("set_timeout", None, {"milliseconds": 123}),
+            ("stop_filter", None, {"identifier": 7}),
+            (
+                "start_flow_control_filter",
+                7,
+                {
+                    "request_address": b"\0\0\x01\0",
+                    "response_address": b"\0\0\x01\x08",
+                },
+            ),
+            ("get_timeout", 123, {}),
+            (
+                "write_messages",
+                1,
+                {
+                    "protocol": 6,
+                    "tx_flags": 0,
+                    "data": b"\0\0\x01\0\x09\x04",
+                    "count": 1,
+                },
+            ),
+            ("wait", None, {"milliseconds": 0}),
+            (
+                "read_specified_can_message",
+                b"\0\0\x01\x08" + payloads[1],
+                {"address": b"\0\0\x01\x08", "count": 1, "frame": 2},
+            ),
+            ("set_timeout", None, {"milliseconds": 123}),
+            ("set_timeout", None, {"milliseconds": 123}),
+            ("stop_filter", None, {"identifier": 7}),
+            ("disconnect", None, {}),
+        )
+
+        def trace_event(operation, value, values):
+            def encode(item):
+                if type(item) is bytes:
+                    return {"type": "bytes", "value": item.hex()}
+                if type(item) is dict:
+                    return {key: encode(nested) for key, nested in item.items()}
+                if type(item) in (tuple, list):
+                    return [encode(nested) for nested in item]
+                return item
+
+            if type(value) is bytes:
+                result = {"type": "bytes", "value": value.hex()}
+            elif value is None:
+                result = {"type": "none", "value": None}
+            else:
+                result = {"type": "int", "value": value}
+            return {
+                "kind": "action",
+                "request": encode({"operation": operation, **values}),
+                "result": result,
+                "elapsed_ms": 1,
+            }
+
+        events = tuple(trace_event(*item) for item in operations)
+        engine, control, session = self.fixture(
+            operation="get_cid",
+            getter="TCUWCanCIDGetter.dll",
+            selector="GetCanIDsFromParamForGetCID",
+            parameter_values={
+                "GetCANIDFunctionNameForGetCID": "GetCanIDsFromParamForGetCID",
+                "CanIDForGetCID": "0100/0108",
+                "ReceiveTimeoutBeforeGetCID": "123",
+            },
+            events=events,
+        )
+        with engine.controller_execution(control, 0):
+            result = control.execute(engine, session)
+            context = control.native_control_context2026(engine)
+            output = _control_getter_output2026(context)
+            self.assertIsNotNone(output)
+            assert output is not None
+            self.assertEqual(result["identifiers"], (b"DEMO",))
+            self.assertEqual(output.identifiers, (b"DEMO",))
+            self.assertIs(output.context, context)
+            self.assertIs(output.capture, context._capture)
+            self.assertIs(output.configuration, context._capture.configuration)
+            self.assertEqual(output.getter_mode, 0)
+            self.assertTrue(output.raw_al)
+            self.assertEqual(len(output.getter_targets), 1)
+            self.assertEqual(
+                output.getter_targets[0].module_binding.module_name,
+                "TCUWCanCIDGetter.dll",
+            )
+            self.assertEqual(
+                output.query_records34, tuple(engine._working_identifier_records)
+            )
+            self.assertEqual(len(output.query_records34), 34)
+            self.assertTrue(all(len(record) == 12 for record in output.query_records34))
+            self.assertEqual(len(output.communication_addresses), 1)
+            self.assertEqual(
+                output.communication_addresses, tuple(control.address_history)
+            )
+            self.assertEqual(output.hardware, b"")
+            self.assertEqual(
+                output.retained_bytes_9dc, b"\0" * output.configuration.cpu_maximum
+            )
+            self.assertEqual(
+                tuple(map(len, output.node_strings_9c8)),
+                (13,) * output.configuration.cpu_maximum,
+            )
+            self.assertEqual(
+                tuple(map(len, output.node_strings_9cc)),
+                (257,) * output.configuration.cpu_maximum,
+            )
+            self.assertEqual(
+                len(output.node_cells_9e0), output.configuration.cpu_maximum
+            )
+            self.assertTrue(
+                all(cells == (b"\0" * 14,) * 32 for cells in output.node_cells_9e0)
+            )
+            self.assertEqual(
+                output.node_dwords_a10, (0,) * output.configuration.cpu_maximum
+            )
+            self.assertEqual(output.tail_a14, b"\0" * 21)
+            self.assertEqual(
+                output.configured_bytes_9d8,
+                bytes(context._capture.configured_bits),
+            )
+        with self.assertRaises(ValueError):
+            _control_getter_output2026(context)
 
     def test_post_prepare_cpass_retains_saved_true_and_native_outputs(self):
         from unittest.mock import patch
@@ -798,12 +1193,26 @@ class RawControlStageMachineTests(unittest.TestCase):
         def runner(stage, *_args):
             slots.append(stage._control_target2026.entry_slot)
             if stage._control_target2026.binding.alternate_cid:
+                self.assertIsNone(session._phase6_getter_import2026)
                 return lambda: {
                     "native_return": None,
                     "bool_out": False,
                     "cids": (b"ALT",),
                 }
-            return lambda: {"native_return": None, "native_success": True, "cids": ()}
+
+            def primary():
+                # Model a valid empty P6 receipt before the native alternate
+                # attempt; the next issued getter stage must discard it.
+                session._phase6_getter_import2026 = type(
+                    "EmptyP6Receipt", (), {"identifiers": ()}
+                )()
+                return {
+                    "native_return": None,
+                    "native_success": True,
+                    "cids": (),
+                }
+
+            return primary
 
         with (
             patch.object(ProgrammingReplay, "_runner", runner),
@@ -812,9 +1221,107 @@ class RawControlStageMachineTests(unittest.TestCase):
             result = control.execute(engine, session)
             self.assertFalse(result["native_return"])
             self.assertEqual(result["identifiers"], (b"ALT",))
+            self.assertIsNone(session._phase6_getter_import2026)
             self.assertTrue(control.alternate_cid_used)
             self.assertIs(slots[0], slots[1])
             self.assertTrue(engine.native_control_alternate_cache2026)
+
+    def test_issued_phase6_getter_imports_counted_records_before_selection(self):
+        from unittest.mock import patch
+
+        from scripts import programming_2026_p6
+
+        engine, control, session = self.fixture(
+            operation="get_cid",
+            contact="Phase6",
+            kind="149",
+            getter="TCUWP6CanCIDGetter.dll",
+            paired=True,
+            dependencies=("TCUWControlCommPhase.dll",),
+            diag_id="12",
+            bind_frontend=True,
+            bind_persistence=True,
+            bind_file_sources=True,
+        )
+        session.context["observations"]["host"]["native2026"] = {
+            "programming_started_at": 0.0,
+            "initial_delay_seconds": 0,
+            "unresolved_retry_seconds": 0,
+            "check_dtcs": False,
+        }
+        session.bind_engine2026(engine)
+        session.bind_controller2026(control)
+        session.bind_runtime2026(control.runtime)
+        job = engine.bind_thread_job(control)
+        worker = job.worker
+        pair = engine.interface_pair
+        assert pair is not None
+        expected_records = (
+            b"\0" * 4 + b"12" + b"\0" * 6,
+            b"\0" * 4 + b"12" + b"\0" * 6,
+        )
+        original_import = worker.import_control_getter_return2026
+
+        def checked_outer_import(context):
+            receipt = worker._control_return_receipt2026[4]
+            initial_ids = engine.received_identifiers
+            initial_records = engine.identifier_records
+            initial_pair_issued = dict(pair._issued)
+            self.assertIsNone(pair._importing)
+            with patch.object(pair, "import_into", wraps=pair.import_into) as imports:
+                sequence = receipt.sequence
+                receipt.sequence = sequence + 1
+                try:
+                    with self.assertRaises(ValueError):
+                        original_import(context)
+                finally:
+                    receipt.sequence = sequence
+
+                owner = receipt.job
+                receipt.job = object()
+                try:
+                    with self.assertRaises(ValueError):
+                        original_import(context)
+                finally:
+                    receipt.job = owner
+
+                records = receipt.records
+                receipt.records = (b"invalid",) * len(receipt.identifiers)
+                try:
+                    with self.assertRaises(ValueError):
+                        original_import(context)
+                finally:
+                    receipt.records = records
+
+                self.assertEqual(imports.call_count, 0)
+                self.assertEqual(engine.received_identifiers, initial_ids)
+                self.assertEqual(engine.identifier_records, initial_records)
+                self.assertEqual(dict(pair._issued), initial_pair_issued)
+                self.assertIsNone(pair._importing)
+                original_import(context)
+                self.assertEqual(imports.call_count, 1)
+
+        with (
+            patch.object(
+                programming_2026_p6,
+                "get_phase6_cids",
+                return_value=({"cids": ("CID-A", "CID-B")},),
+            ),
+            patch.object(
+                worker,
+                "import_control_getter_return2026",
+                side_effect=checked_outer_import,
+            ),
+        ):
+            sequence = job.start(session)
+            report = job.result(15, sequence=sequence)
+
+        self.assertTrue(engine._wait_active_admission2026)
+        self.assertEqual(engine.received_identifiers, (b"CID-A", b"CID-B"))
+        self.assertEqual(engine.identifier_records, expected_records)
+        self.assertEqual(report["identifiers"], (b"CID-A", b"CID-B"))
+        self.assertTrue(report["native_return"])
+        self.assertIsNone(session._phase6_getter_import2026)
 
     def test_ordinary_getter_exports_snapshot_and_only_outer_getter_imports(self):
         from unittest.mock import patch
@@ -3612,6 +4119,55 @@ class FrontendParameterSourceTests(unittest.TestCase):
         bound.validate_source()
         with self.assertRaises(LookupError):
             bound.parameter("CanIDTableForMazda.ini")
+
+    def test_frontend_retains_empty_extra_resources_and_all_source_hashes(self):
+        import hashlib
+        from dataclasses import replace
+
+        from scripts.programming_2026_common import NativeFrontendParameters2026
+
+        sources = self.sources()
+        sources["P5-Unified03.ini"] = b""
+        sources["Another.ini"] = b"retained resource"
+        bound = NativeFrontendParameters2026.from_sources(sources, encoded=False)
+        self.assertEqual(dict(bound.sources), sources)
+        self.assertEqual(
+            dict(bound.source_sha256),
+            {name: hashlib.sha256(data).hexdigest() for name, data in sources.items()},
+        )
+        sources["Another.ini"] = b"changed caller resource"
+        bound.validate_source()
+        self.assertEqual(bound.sources["Another.ini"], b"retained resource")
+        with self.assertRaises(ValueError):
+            replace(bound, source_sha256={}).validate_source()
+        with self.assertRaises(ValueError):
+            replace(
+                bound, sources={**bound.sources, "Another.ini": b"forged"}
+            ).validate_source()
+
+    def test_frontend_rejects_ambiguous_or_non_win32_resource_basenames(self):
+        from scripts.programming_2026_common import NativeFrontendParameters2026
+
+        for name in (
+            "parameter.INI",
+            "",
+            ".",
+            "..",
+            "Ini\\P5-Unified.ini",
+            "Ini/P5-Unified.ini",
+            "extra.ini.",
+            "extra.ini ",
+            "C:extra.ini",
+            "extra?.ini",
+            "nonascii-é.ini",
+            "CON.ini",
+            "nul",
+            "COM1.ini",
+        ):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                NativeFrontendParameters2026.from_sources(
+                    {**self.sources(), name: b""}, encoded=False
+                )
 
     def test_encoded_tables_and_forged_decoded_state(self):
         from dataclasses import replace
