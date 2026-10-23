@@ -35,4 +35,8 @@ v12/v18 CARB profiles, 120 enhanced-readiness signals and 2,424 selected fields
 on advertised PIDs above `0x87`, using authored synthetic replies. This proves
 source-backed offline evaluation, not physical ECU behavior.
 
+This closes the selected enhanced-readiness consumer contract only. It does not
+close the broader OBD support, monitor, compound-value, or caller-integration
+review; those remain separate coverage obligations.
+
 Run `python -m unittest discover -s tests -p test_readiness.py`.

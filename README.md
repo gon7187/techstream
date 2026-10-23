@@ -8,12 +8,13 @@ An independent native Linux diagnostic workbench for Toyota/Lexus research, writ
 
 **This is an early implementation, not a complete replacement for Toyota Techstream. All physical vehicle communication remains `PHYSICAL_UNCONFIRMED`.** The desktop interface is currently in Russian.
 
-## Development checkpoint — 22 October 2026
+## Development checkpoint — 23 October 2026
 
-The no-car port is **work in progress**. Reviewed increments are integrated into [main](https://github.com/gon7187/techstream/tree/main). The development handoff below records the current scope, measured checks, known failures and missing integrations; the final software gate remains open.
+The no-car port is **work in progress**. This status is anchored to code checkpoint [`c2258c9`](https://github.com/gon7187/techstream/commit/c2258c929d7755c817a5bb661dd61bf5e6c0961b), with PR #9 integrated. Its full regression run passed **6,617 tests with 0 skips**. These are code-checkpoint results; documentation upkeep continues independently. The final software gate remains open.
 
 - [Current status, known defects and ordered roadmap](docs/development-handoff.md)
 - [Roadmap: implemented, missing and next](docs/ROADMAP.md)
+- [Dated code and native-source checkpoint](docs/reverse-checkpoint-2026-10-23.md)
 - [Implementation map and module responsibilities](docs/implementation-map.md)
 - [Reproducible checks and evidence boundaries](docs/verification.md)
 - [Repository graph and navigation guide](graphify-out/GRAPH_REPORT.md) · [interactive map](graphify-out/graph.html)
@@ -55,6 +56,8 @@ The demo generates authored synthetic resources. Its codes, names and values are
 | Calibration and recorder | CUW/S-record inspection, native transfer fragments, programming simulation, native VIM storage/DRS operations | Full family-specific programming and recorder coverage still under recovery |
 
 Toyota-specific byte codecs are separately documented in [native command recovery](docs/toyota-protocol.md); they do not infer vehicle support.
+
+The current native source inventory has **171 contracts: 6 implemented and 165 open**. Separately, six selected database contracts cover 32 exact export targets. The 49-row offline feature matrix has 39 open, 6 implemented and 4 physical-validation rows; these counts are not a completion percentage. See the [full-port matrix](docs/full-port.md) and [current handoff](docs/development-handoff.md).
 
 Run the [offline workflows and file tools](docs/offline-tools.md), or inspect the [feature matrix](docs/full-port.md), [architecture](docs/architecture.md), [offline session format](docs/offline-diagnostics.md) and [hardware validation plan](docs/hardware-validation.md). Adapter branding or a USB ID does not establish Toyota compatibility.
 

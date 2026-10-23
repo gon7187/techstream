@@ -7,7 +7,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Native active Init and actual replay are implemented; final reviewed caller/argument/instruction-resource integration remains open"
+      "remaining": "Native Init/replay exist; exact selected caller arguments and instruction-resource join remain unaccepted."
     },
     {
       "id": "application.export_preservation",
@@ -15,7 +15,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No full-row native export contract is independently accepted; reconcile source writer, caller, output identity and preservation on one pinned build."
     },
     {
       "id": "application.integration",
@@ -23,7 +23,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "Cross-module implementation is partial; prove the exact native caller-to-consumer route and error/cleanup behavior before row acceptance."
     },
     {
       "id": "application.programming_replay",
@@ -31,7 +31,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Complete imported CUW family/controller composition and2026 routes remain in progress"
+      "remaining": "Accepted: selected single-file getter → outer import → Phase6 G selection on an issued job, with authored producer traffic and stale/foreign/malformed receipt rejection before mutation. Open: extend to mixed-CPU getter → matching → prepare/write and prove consumer result; vendor getter and physical execution remain unverified."
     },
     {
       "id": "application.recorder_replay",
@@ -39,7 +39,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Native chronological DRS capture/export is implemented; selected VIN/series/protocol producer and full reader/controller reconciliation remain open"
+      "remaining": "DRS dispatch slots are source-resolved, but the internal profile identity is unknown; selected VIN/series/protocol producer and reader/controller join remain open."
     },
     {
       "id": "application.service_replay",
@@ -86,7 +86,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "Source analysis has resolved selected contracts only; enumerate remaining exact native callers/consumers and independent acceptance before closing this row."
     },
     {
       "id": "calibration.compatibility",
@@ -94,7 +94,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Exact source identity and native selectors are implemented; complete all-build/family joins remain under review"
+      "remaining": "CUW2026 no-car-5 getter identity is corrected; CUW18 layout and complete all-build/family joins remain unresolved."
     },
     {
       "id": "calibration.containers",
@@ -102,7 +102,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Ordinary and large2026 CUW parsing/metadata are implemented; exact all-format/caller closure remains under independent source review"
+      "remaining": "CUW2026 getter stride must not be applied to CUW18; recover exact per-build format and caller joins before family closure."
     },
     {
       "id": "calibration.module_recovery",
@@ -110,7 +110,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "132 protected module pairs are statically reconstructed; final decoder and complete computed-call source handoff parent gates await verification"
+      "remaining": "132 protected module pairs are reconstructed; final decoder and computed-call source handoff parent gates remain open."
     },
     {
       "id": "hardware.bus_timing",
@@ -150,7 +150,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this obd contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "obd.enhanced_readiness",
@@ -158,7 +158,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Original definition-driven readiness engine under static recovery; standard OBD bitmask is a separate service"
+      "remaining": "Original definition-driven readiness engine remains under recovery; standard OBD bitmask is a separate implemented service."
     },
     {
       "id": "obd.monitors",
@@ -166,7 +166,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this obd contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "obd.support",
@@ -174,7 +174,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this obd contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "obd.vehicle_information",
@@ -182,7 +182,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this obd contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "programming.native_plan",
@@ -206,7 +206,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this recorder contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "recorder.lifecycle",
@@ -265,7 +265,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this snapshot contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "snapshot.native_write",
@@ -273,7 +273,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this snapshot contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "snapshot.playback",
@@ -281,7 +281,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this snapshot contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "snapshot.report_views",
@@ -289,7 +289,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Binary TSE report field semantics and ordinary/native AllDTC XML query parity remain under independent recovery"
+      "remaining": "Binary TSE field semantics and ordinary/native AllDTC XML query parity remain unresolved; accepted KeyCycle/sequence admission does not close them."
     },
     {
       "id": "toyota.active_tests",
@@ -297,7 +297,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this toyota contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "toyota.dtc",
@@ -305,7 +305,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this toyota contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "toyota.freeze",
@@ -313,7 +313,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this toyota contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "toyota.health",
@@ -321,7 +321,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this toyota contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "toyota.live",
@@ -329,7 +329,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this toyota contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "toyota.monitor_runtime",
@@ -337,7 +337,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Normal P3/P4/P5/PSA/DK/DLC12/Dual/instrument lifecycles, support and concrete native lower receive composition remain under source and integration review"
+      "remaining": "P3 receiver resolves through virtual +0x58 to the J2534 implementation; external Phase3 Run caller and full normal P3/P4/P5/PSA/DK/DLC12/Dual composition remain open."
     },
     {
       "id": "transport.firmware_iso",
@@ -345,7 +345,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this transport contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "transport.firmware_maintenance",
@@ -398,7 +398,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this transport contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "transport.kline",
@@ -406,7 +406,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this transport contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "transport.raw_can",
@@ -414,7 +414,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this transport contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "utility.bindings",
@@ -422,7 +422,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Selected utility providers are implemented; final all-caller native association review remains open"
+      "remaining": "Ordinary source-bound DCM45 recorded replay reaches open_native_utility; live CGW parity and all-caller native association remain open."
     },
     {
       "id": "utility.csdf",
@@ -537,7 +537,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this vehicle contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "vehicle.command_selection",
@@ -545,7 +545,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Selected metadata schemas are implemented; final consumer reviews and native source-claim binding remain open"
+      "remaining": "Six selected database contracts bind to 32 exact version-18 exports; other selectors, tables and source-claim consumers remain open."
     },
     {
       "id": "vehicle.exceptions",
@@ -553,7 +553,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this vehicle contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "vehicle.options",
@@ -561,7 +561,7 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this vehicle contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     },
     {
       "id": "vehicle.pid_support",
@@ -569,14 +569,15 @@
       "implementation": [],
       "tests": [],
       "evidence": [],
-      "remaining": "Implementation and independent native-contract verification in progress"
+      "remaining": "No exact full-row source/consumer acceptance is recorded for this vehicle contract; identify the native caller, arguments, consumer, negative cases and cleanup, then independently review the pinned path."
     }
   ],
   "unresolved_software": [
-    "The canonical native artifact/export/business inventory must pass in addition to this coarse workflow registry",
-    "Remaining legacy executable and2026 programming operations and complete imported controller/recovery routes",
-    "Native monitor constructor, support/cache, LSB and direct lower send/receive plus full Dual/recorder producer integration",
-    "DDR/ADS/saved-log acquisition and timeline materialization, native TSE field semantics and XML query parity",
-    "Final rendered desktop integration, original corpus/version review, fresh-clone checks and public Git delivery"
+    "Extend the accepted P6 selected single-file getter → outer import → Phase6 G actual-job path, including stale/foreign/malformed receipt negatives with authored producer traffic, to mixed-CPU getter → matching → prepare/write on the same job/context; vendor getter and physical execution remain unverified.",
+    "Complete executable legacy/2026 programming and imported recovery controllers, including source-issued worker/reissue context and gateway/pool cardinality.",
+    "Integrate recorder VIN/series/protocol producers with reader/controller; close monitor constructors, support/cache, LSB and lower send/receive through Dual/recorder consumers.",
+    "Resolve remaining active/system producers, MultiMon/mixed-provider/queue, UtilityEx callers, ADS/DDR/saved-log acquisition and timeline, TSE field semantics/XML parity, enhanced readiness, and calibration/database module audits.",
+    "Re-run public unit, offline workflow, GTK normal/compact and CI checks on a fresh clone of the then-current main before claiming a software gate; current measured code checkpoint is c2258c929d7755c817a5bb661dd61bf5e6c0961b.",
+    "Hardware remains a separate future gate: adapter USB/firmware identity and bounded read-only ECU/vehicle observations are absent; status is PHYSICAL_UNCONFIRMED."
   ]
 }

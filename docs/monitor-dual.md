@@ -71,6 +71,8 @@ zero, then restore the monitor target. A timed active-test wait permits monitor
 traffic while its native deadline has not elapsed. The third IDMap argument is
 retained as a raw field; `50`/`1000` are not scheduler periods.
 
+The original worker selects among three event slots in index order, skips states 4/5 and state 3 until its due tick, and retries only slot 2. On exit it attempts DstiOsc stop, dynamic-DID clear, conditional D1, then unconditional `Disconnect(0)`. The host runtime already bounds stop/close cleanup and releases the channel; its target rotation after a complete request cycle is a host policy, not proof of native event-slot fairness or physical scheduling.
+
 Packets remain separate by target. `DualPacket.native_bytes` contains the native
 little-endian timestamp DWORD and packet payload. There is no timestamp
 alignment, interpolation or conversion between ECUs. `DualRing` refuses

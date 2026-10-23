@@ -12,6 +12,12 @@ binding records. Reports omit metadata values, keys, signatures and firmware.
 Original section dictionaries are immutable and remain available as `sections`.
 `vehicle` and CPU values contain the recovered historical name conversions.
 
+The `GetCPUType` dossier historically grouped under no-car-5 is for the exact
+CUW2026 `TCUWCalibrationFile.dll` identity (SHA-256
+`3fb44c9ac011d5be1affd04305a8455c113b107655cc250e31ff937dd5d72950`,
+FileVersion `1.0.0025.0`). Its `0xae9c` CPU-record stride is CUW2026 evidence;
+it does not establish the registered CUW18 layout, which remains unresolved.
+
 The native Format.Version values are literal integers, not an ordinal remapping:
 `2,3,4,5,6,7,8,9,10,12,40,101,103,104,105,106,107,206,209,300,400,500`.
 The outer byte versions are separately checked against
