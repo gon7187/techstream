@@ -76,6 +76,12 @@ by an injected Python provider.
 explicit immutable bytes and a bounded module basename, allowing an imported
 container to share the same export, version and source-hash checks.
 
+The indexed `GetCPUType` layout evidence from no-car-5 belongs to the CUW2026
+calibration DLL, not CUW18. CUW2026 uses stride `0xae9c`; the registered CUW18
+DLL (`1.0.0019.0`) has no locally verified record layout. Do not select a CPU
+record stride from the old diff's `v18` label; require exact calibration identity
+and parser provenance before indexing.
+
 `parse_version_resource(resource_bytes)` is available for callers that already
 have an RT_VERSION payload. It follows VarFileInfo/Translation order and selects
 the corresponding StringFileInfo/FileVersion string. It does not substitute the

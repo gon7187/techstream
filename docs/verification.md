@@ -2,7 +2,23 @@
 
 В проекте несколько уровней проверки. Зелёный синтетический тест подтверждает только авторский путь и данные, которые он запускал. Он не доказывает такое же поведение OEM-программы, адаптера, ЭБУ или автомобиля.
 
-## Контрольная точка 22 октября 2026 — VBF, ABS29, MultiMon и TSE
+## Текущая контрольная точка 23 октября 2026
+
+Кодовый checkpoint — `main` `c2258c929d7755c817a5bb661dd61bf5e6c0961b`, PR #9 merged. Локальный private unittest прогон tested code tree feature `8aa0c3b8fc83c4f5b68f00277df8d0ea3165d77a` (**тот же код tree, позднее merged в main**) дал **6 617 тестов, 0 failures, 0 errors, 0 skips за 215,121 с**. Отдельно: PR CI — **10/10 checks PASS**; main public CI — зелёный. Последующие изменения status-документов не входили в этот прогон.
+
+| Проверка | Результат | Граница |
+| --- | --- | --- |
+| Локальный private unittest на tested code tree | **6 617, 0 failures, 0 errors, 0 skips**, 215,121 с | Feature `8aa0c3b8fc83c4f5b68f00277df8d0ea3165d77a`; код tree совпадает с merged main `c2258c929d7755c817a5bb661dd61bf5e6c0961b` |
+| PR #9 CI | **10 checks PASS** | Отдельные проверки PR candidate |
+| Main public CI | PASS | Публичные проверки main; отдельно от локального private прогона |
+| PR delivery | PR #9 merged в main | SHA выше; feature commit `8aa0c3b8fc83c4f5b68f00277df8d0ea3165d77a` |
+| Hardware/OEM execution | Не выполнялась | `PHYSICAL_UNCONFIRMED`; vendor binaries не запускались |
+
+Scoped additions в этом checkpoint: P6 selected single-file getter → outer import → Phase6 G selection с authored CID traffic и stale/foreign/malformed отказами до mutation; D2A1 late cleanup; same-job recovery callback re-entry; source review шести database contracts/32 exports; bounded DRS/P3/VBF/calibration/TechVim/utility findings. Эти данные и ограничения описаны в [reverse checkpoint](reverse-checkpoint-2026-10-23.md) и [selected database review](native-selected-review.md). P6 следующий открытый шаг — mixed-CPU prepare/write; полный TechVim controller и все broad families остаются открыты.
+
+Native inventory: **2 454 PE, 3 407 aliases, 146 011 exports; 148 433 open targets / 165 open contracts**, включая platform/runtime dependencies; это не feature-gap count. Отдельно coarse workflow registry: **49 rows, 39 open, 6 implemented, 4 physical-unconfirmed**. Этот registry не пересчитан по реализации, его statuses/bindings сохраняют прежний контрактный смысл.
+
+## Историческая контрольная точка 22 октября 2026 — VBF, ABS29, MultiMon и TSE
 
 Продолжение после `6d954d0` (PR #7). Полный локальный прогон зафиксирован на замороженных хешах кода и тестов; частные OEM-образы использовались только как данные. Выполнялись авторские Python-компоненты, фикстуры и replay, без OEM/Wine/JVM, адаптера или автомобиля.
 
@@ -20,7 +36,7 @@
 
 Mapped-group `141`/D30C и внешний VBF ещё не соединены через настоящие CID getter/cache/JudgeFlashable producers; worker reissue остаётся отдельным открытым сценарием. Это программные пробелы. Полный набор из 171 software obligations, полная запись ЭБУ и физическая совместимость не приняты. Снимок графа и его исходные хеши указаны отдельно в `graphify-out/source-manifest.json`.
 
-## Предыдущая контрольная точка 22 октября 2026 — POWER, CUW и RC
+## Историческая контрольная точка 22 октября 2026 — POWER, CUW и RC
 
 Код и тесты пакета закреплены в [`c6613af`](https://github.com/gon7187/techstream/commit/c6613afce6e491d34ba95765c05fe4d79943f9d7), продолжение после `e0513f6`. Статус интеграции и проверки точного head доступны в [PR #7](https://github.com/gon7187/techstream/pull/7/checks).
 
@@ -38,7 +54,7 @@ RC-проверки проходят через публичный EB facade, su
 
 Первый изолированный запуск на том же коде дал четыре shell failure: окружение не содержало `/bin/sh`. После исправления mount-набора весь suite прошёл; продуктовые файлы для этого не менялись.
 
-## Предыдущая контрольная точка 22 октября 2026 — PR #6
+## Историческая контрольная точка 22 октября 2026 — PR #6
 
 Её incremental acceptance привязана к frozen source pins: `techstream.py` SHA256 `a16a49b4e36f0eeee53a60a5bef28e07df66b62e635f0f119fad8d735b9210d5`, `.github/workflows/ci.yml` SHA256 `520166b5e4c27401131ea7875c3cbae7f7a7988ee12ba2b91ec758ce02323972`. Это file pins, не commit SHA.
 
@@ -104,15 +120,15 @@ xvfb-run -a dbus-run-session -- python3 techstream.py --demo --smoke-test
 
 ## Как читать результаты контрольной точки
 
-- **Текущий результат** привязан к exact source/test/dependency pins последнего handoff. Если один из файлов изменился — повторить соответствующую узкую проверку.
+- **Текущий измеренный кодовый результат** — checkpoint `c2258c929d7755c817a5bb661dd61bf5e6c0961b` выше. Последующие документные изменения не были частью этого запуска.
 - **Исторический pass** относится к прежнему снимку; это контекст, а не нынешний зелёный статус.
 - **Проверка владельца** подтверждает только перечисленную область. Для независимого принятия нужен отдельный reviewer на том же замороженном candidate.
 - **Skipped/unrun** означает неизвестный результат, а не pass. Это включает проверки, код которых написан, но не запускался до паузы.
 - **Red/error** остаётся активной проблемой, пока исправление не проверено по исходному контракту. Сохранять красный вывод как свидетельство.
 - **Source omission** или неучтённый export/module означает открытый контракт; это не безопасное исключение и не утверждение о физическом оборудовании.
-- **Открытый gate** означает, что работа ещё нужна, даже если многие leaf-тесты зелёные. Полная closure G1–G6 остаётся открытой; отдельные subgate уже PASS, включая G2 offline workflow check. Исторические CI и публичные прогоны относятся к указанным снимкам; текущий пакет продолжает `6d954d0`, предыдущий закреплён в `c6613af` и PR #7, более ранний — в `0f99a6c` и PR #6.
+- **Открытый gate** означает, что работа ещё нужна, даже если многие leaf-тесты зелёные. Полный no-car software scope остаётся открытым; закрытие отдельного subgate не означает закрытие всего семейства. Секции, помеченные «Историческая контрольная точка», описывают только указанные там снимки и не являются текущим результатом.
 
-Актуальные красные и ожидающие проверки перечислены в [handoff разработки](development-handoff.md#известные-красные-и-открытые-места). Локальные `analysis/evidence/no-car-*/` содержат команды, снимки и ограничения; это частные необязательные свидетельства, не требование публичной сборки.
+Актуальные открытые шаги перечислены в [handoff разработки](development-handoff.md#приоритетный-порядок-продолжения). Локальные `analysis/evidence/no-car-*/` содержат команды, снимки и ограничения; это частные необязательные свидетельства, не требование публичной сборки.
 
 ## Интерпретация и безопасность
 

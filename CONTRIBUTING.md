@@ -22,3 +22,7 @@ Explain the concrete problem, resulting behavior and checks performed. Keep unre
 Do not submit proprietary installers, extracted databases, original manuals, keys, activation code or copied vendor source. A citation or a short description of an observed format is preferable to redistributing the underlying material. Contributions must be material you have the right to publish under the project license.
 
 Before attaching a trace, remove VINs, serial numbers, personal paths, account identifiers, tokens and customer information. Prefer a minimal synthetic reproducer. See [Security](SECURITY.md) for private reporting and [hardware validation](docs/hardware-validation.md) for evidence requirements. Never make CI access a vehicle or perform writes to a real ECU.
+
+## Status and graph maintenance
+
+When accepted behavior, evidence, or coverage changes, update the [development handoff](docs/development-handoff.md), [roadmap](docs/ROADMAP.md), [feature matrix](docs/full-port.md), and affected documentation with remaining work and evidence boundaries. Then regenerate the graph from the finalized public source snapshot; record exact file hashes for reviewed status claims and get an independent review against those files. Preserve unknowns and physical-validation status, and close a capability only with evidence, not implementation presence. For delegated documentation or graph work, select Luna workers explicitly and give each a file-level scope; the parent verifies the result against the final snapshot.
