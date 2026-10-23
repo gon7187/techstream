@@ -36,6 +36,7 @@ from scripts.j2534_2026 import (
     PrimitiveResult,
 )
 from scripts.programming_2026_common import NativeRuntime2026
+from tests.private_evidence import require_private
 from tests.test_calibration_2026 import cuw, logical_text
 from tests.test_cuw_engine_worker import calibration, make_controller
 from tests.test_j2534_2026 import LiveOSProvider
@@ -123,7 +124,48 @@ class RetryControllerTests(unittest.TestCase):
         self.retry = self.engine.bind_retry_controller()
         self.addCleanup(self.engine.close)
 
+    def test_prepare_prefix_retains_real_modal_result_and_clears_checkpoint(self):
+        from scripts.cuw_online import OnlineKeyController2026
+        from tests.test_cuw_online import configuration
+
+        online = OnlineKeyController2026(self.worker, configuration())
+        online.start(bytes(16))
+        with self.engine.controller_execution(self.control, 0):
+            self.retry.callback3()
+            self.retry.record_callback30(7)
+        self.assertEqual(self.retry.result, 1)
+        self.runtime.local_milliseconds_of_day = lambda: 54321
+        with self.engine.controller_execution(self.control, 1):
+            self.assertEqual(self.retry.result, 1)
+            self.assertEqual(self.retry._checkpoint_byte, 0)
+            self.assertEqual(self.retry.source_state.resume_milliseconds_d314, 54321)
+            self.assertEqual(self.engine._native_prepare_d314_2026, 54321)
+
+    def test_lazy_retry_constructor_preserves_actual_prepare_clock(self):
+        engine = CUWEngine2026(Path("runtime/no-car-21/recovered/CUW.dll").read_bytes())
+        self.addCleanup(engine.close)
+        engine.configure(struct.pack("<IIddII", 4, 0, 0, 0, 0, 0))
+        engine.load_cuw(calibration())
+        runtime = NativeRuntime2026(
+            lambda *_args, **_kw: None, local_milliseconds_of_day=lambda: 23456
+        )
+        control = make_controller(runtime)
+        engine.bind_worker(control)
+        self.assertIsNone(engine._retry_controller)
+        self.assertEqual(engine._native_prepare_d314_2026, 0)
+        with engine.controller_execution(control, 1):
+            pass
+        retry = engine.bind_retry_controller()
+        self.assertEqual(retry.source_state.resume_milliseconds_d314, 23456)
+        self.assertEqual(engine._native_prepare_d314_2026, 23456)
+
     def test_actual_failed_dh_export_consumes_input_and_retained_prepare_retry(self):
+        require_private(
+            "runtime/no-car-119/verify_failed_dh_retry.py",
+            "runtime/no-car-119/dh_retry_fixture.py",
+            "runtime/no-car-119/verify_failed_sonar_retry.py",
+            "runtime/no-car-119/sonar_retry_fixture.py",
+        )
         spec = importlib.util.spec_from_file_location(
             "private119_failed_dh", "runtime/no-car-119/verify_failed_dh_retry.py"
         )
@@ -145,6 +187,10 @@ class RetryControllerTests(unittest.TestCase):
                 self.assertTrue(receipt["exact_final_trace"])
 
     def test_actual_failed_sonar_export_consumes_captured_query_input(self):
+        require_private(
+            "runtime/no-car-119/verify_failed_sonar_retry.py",
+            "runtime/no-car-119/sonar_retry_fixture.py",
+        )
         spec = importlib.util.spec_from_file_location(
             "private119_failed_sonar", "runtime/no-car-119/verify_failed_sonar_retry.py"
         )
@@ -165,8 +211,12 @@ class RetryControllerTests(unittest.TestCase):
                 self.assertTrue(receipt["exact_final_trace"])
 
     def test_external_native_version_fault_acknowledges_actual_parked_child(self):
+        require_private(
+            "runtime/no-car-next-20261022/retry-regressions/prepare_ack.py",
+        )
         spec = importlib.util.spec_from_file_location(
-            "private119_prepare_ack", "runtime/no-car-119/verify_prepare_ack.py"
+            "retry_regression_prepare_ack",
+            "runtime/no-car-next-20261022/retry-regressions/prepare_ack.py",
         )
         assert spec is not None and spec.loader is not None
         proof = importlib.util.module_from_spec(spec)
@@ -174,13 +224,17 @@ class RetryControllerTests(unittest.TestCase):
         for delayed in (False, True):
             with self.subTest(delayed=delayed):
                 suffix = "delayed" if delayed else "parked"
-                path = Path(f"runtime/no-car-119/prepare-ack-{suffix}-sdk.json")
+                path = Path(
+                    f"runtime/no-car-next-20261022/retry-regressions/prepare-ack-{suffix}-sdk.json"
+                )
                 if not path.is_file():
                     self.skipTest("Private authored native SDK capture unavailable")
                 _, receipt = proof.exercise(
                     json.loads(path.read_bytes()), delayed=delayed
                 )
                 self.assertEqual(receipt["handshake"], [1, 2])
+                self.assertTrue(receipt["ordinary_prepare_receipt_consumed"])
+                self.assertEqual(receipt["canonical_prepare_clock"], 1000)
                 self.assertTrue(receipt["actual_child_still_alive"])
                 self.assertTrue(receipt["actual_child_waiting_for_resume"])
                 self.assertEqual(receipt["captured_retry_inputs"], 0)
@@ -196,6 +250,7 @@ class RetryControllerTests(unittest.TestCase):
         with self.engine.controller_execution(self.control, 0):
             self.retry._wait_worker_resume()
         self.assertEqual(self.retry.source_state.resume_milliseconds_d314, 123)
+        self.assertEqual(self.engine._native_prepare_d314_2026, 123)
         self.assertEqual(self.retry._checkpoint_byte, 0)
         self.assertEqual(self.retry.inputs, ())
 
@@ -279,7 +334,11 @@ class RetryControllerTests(unittest.TestCase):
 
         session.trace.native_local_milliseconds_of_day = clock_fault
         control.runtime.local_milliseconds_of_day = clock_fault
+        session.bind_runtime2026(control.runtime)
+        session.bind_engine2026(engine)
+        session.bind_controller2026(control)
         job.start(session)
+        self.assertTrue(engine.native_receiving_cfe2_2026)
         with self.assertRaises(ValueError) as caught:
             job.result(2)
         self.assertIs(caught.exception, fault)
@@ -731,6 +790,11 @@ class RetryControllerTests(unittest.TestCase):
             Path("runtime/no-car-21/recovered/CUW.dll").read_bytes()
         )
         self.engine.configure(struct.pack("<IIddII", 4, 0, 5.0, 13.0, 0, 0))
+        from tests.test_cuw_file_services import PublicFileTests
+
+        self.engine.bind_frontend_parameters(
+            PublicFileTests.frontend_parameters(include_empty_can_id=True)
+        )
         issued = admit_file_sources_2026(
             self.engine,
             "input.json",
@@ -797,6 +861,11 @@ class RetryControllerTests(unittest.TestCase):
             Path("runtime/no-car-21/recovered/CUW.dll").read_bytes()
         )
         self.engine.configure(struct.pack("<IIddII", 4, 0, 0, 0, 0, 0))
+        from tests.test_cuw_file_services import PublicFileTests
+
+        self.engine.bind_frontend_parameters(
+            PublicFileTests.frontend_parameters(include_empty_can_id=True)
+        )
         issued = admit_file_sources_2026(
             self.engine,
             "direct.scuw",
@@ -1200,6 +1269,14 @@ class RetryControllerTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(len(failures), 1)
         self.assertEqual(self.retry.inputs, ())
+        self.runtime.cancelled = lambda: False
+        self.runtime.local_milliseconds_of_day = lambda: 65432
+        with self.engine.controller_execution(self.control, 1):
+            state = self.retry.source_state
+            self.assertFalse(state.battery_above_threshold598)
+            self.assertEqual(state.battery_voltage5a0, 0.0)
+            self.assertFalse(state.battery_query5a8)
+            self.assertEqual(state.resume_milliseconds_d314, 65432)
 
     def test_owned_recovery_bypass_has_no_query_or_user_input(self):
         source = calibration()

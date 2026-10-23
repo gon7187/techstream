@@ -670,8 +670,9 @@ class Calibration2026Tests(unittest.TestCase):
             )
 
         for hardware in (b"", b"OTHER-WRONG"):
-            with self.assertRaisesRegex(ValueError, "target hardware"):
-                select((b"OLD",), hardware)
+            rejected = select((b"OLD",), hardware)
+            self.assertEqual(rejected.authored_target_indices, (-1,))
+            self.assertEqual(rejected.unmatched_identifiers, ())
         result = select((), b"HW123")
         self.assertEqual(
             (result.target_indices, result.authored_target_indices), ((0,), (0,))
@@ -692,24 +693,584 @@ class Calibration2026Tests(unittest.TestCase):
             ).target_indices,
             (0,),
         )
-        with self.assertRaisesRegex(ValueError, "target hardware"):
-            native2026_select_received_cids(
-                native2026_metadata(
-                    parse_cuw_2026(
-                        cuw(
-                            text.replace(
-                                "NumberOfTargetHardwares=2", "NumberOfTargetHardwares=0"
-                            )
+        no_hardware = native2026_select_received_cids(
+            native2026_metadata(
+                parse_cuw_2026(
+                    cuw(
+                        text.replace(
+                            "NumberOfTargetHardwares=2", "NumberOfTargetHardwares=0"
                         )
                     )
-                ),
-                (b"OLD",),
-                (bytes(12),),
+                )
+            ),
+            (b"OLD",),
+            (bytes(12),),
+            general,
+            configuration=config,
+            shrink_flag=False,
+            received_hardware=b"HW123",
+        )
+        self.assertEqual(no_hardware.authored_target_indices, (-1,))
+        self.assertEqual(no_hardware.unmatched_identifiers, ())
+
+    def test_cid_match_false_preserves_reached_native_footprints(self):
+        from scripts.calibration_2026 import (
+            native2026_match_received_cids,
+            native2026_unrebuilt_selection,
+        )
+        from scripts.cuw_2026 import configure_2026
+        from scripts.programming_2026_common import NativeGeneralParameters2026
+
+        text = cpu_text(40) + (
+            "NewCID=NEW1\nNumberOfTargets=1\n01_TargetCalibration=OLD1\n"
+            "NumberOfTargetHardwares=1\n01_TargetHardware=HW\n"
+        )
+        metadata = native2026_metadata(parse_cuw_2026(cuw(text)))
+        general = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": b"ParamFileKeySystemProtocolMicon,Unrelated\r\n149P5-Unified311,1\r\n"
+            },
+            encoded=False,
+        )
+        config = configure_2026(struct.pack("<IIddII", 4, 0, 0.0, 0.0, 0, 0))
+
+        def match(source, cids, *, hardware=b"HW", configuration=config):
+            return native2026_match_received_cids(
+                source,
+                cids,
+                (bytes(12),) * len(cids),
+                general,
+                configuration=configuration,
+                shrink_flag=True,
+                received_hardware=hardware,
+                configured_cpu_flags=(False,) * configuration.cpu_maximum,
+            )
+
+        mismatch = match(metadata, (b"OLD1",), hardware=b"WRONG")
+        self.assertFalse(mismatch.check_target)
+        self.assertEqual(mismatch.authored_target_indices, (-1,))
+        self.assertEqual(mismatch.unmatched_identifiers, ())
+        self.assertEqual(mismatch.unmatched_companions, ())
+        self.assertIs(
+            native2026_unrebuilt_selection(mismatch).rebuilt_metadata, metadata
+        )
+        with self.assertRaisesRegex(ValueError, "Issued"):
+            native2026_unrebuilt_selection(dataclasses.replace(mismatch))
+        for invalid_hardware in ("HW", b"HW\0"):
+            with self.assertRaises(ValueError):
+                match(metadata, (b"OLD1",), hardware=invalid_hardware)  # pyright: ignore[reportArgumentType]
+        with self.assertRaisesRegex(ValueError, "Issued"):
+            match(dataclasses.replace(metadata), (b"OLD1",))
+        with self.assertRaisesRegex(ValueError, "counts differ"):
+            native2026_match_received_cids(
+                metadata,
+                (b"OLD1",),
+                (),
+                general,
+                configuration=config,
+                shrink_flag=True,
+                received_hardware=b"WRONG",
+            )
+
+        ordinary_text = (
+            text.replace("authored.vbf", "authored.hex").replace(
+                "NumberOfCalibration=1", "NumberOfCalibration=2"
+            )
+            + "[CPU02]\nCPUImageName=two.hex\nCPUType=312\nNewCID=NEW2\nNumberOfTargets=1\n01_TargetCalibration=OLD2\n"
+        )
+        ordinary = native2026_metadata(
+            parse_cuw_2026(cuw(ordinary_text, (b"one", b"two")))
+        )
+        short = match(ordinary, (b"OLD1",))
+        self.assertFalse(short.check_target)
+        self.assertEqual(short.authored_target_indices, (0, -1))
+        self.assertEqual(short.unmatched_identifiers, (b"NEW2",))
+        d4f8 = configure_2026(struct.pack("<IIddII", 4, 0, 0.0, 0.0, 1, 0))
+        skipped = match(ordinary, (b"OLD1", b"OLD2"), configuration=d4f8)
+        self.assertFalse(skipped.check_target)
+        self.assertEqual(skipped.authored_target_indices, (-1, -1))
+        self.assertEqual(skipped.unmatched_identifiers, (b"NEW1", b"NEW2"))
+        blank = native2026_metadata(
+            parse_cuw_2026(
+                cuw(
+                    ordinary_text + "[KindOfCal]\nIsControlledBySCC=1\nIsBlankECU=1\n",
+                    (b"one", b"two"),
+                )
+            )
+        )
+        skipped = match(blank, (b"OLD1", b"OLD2"))
+        self.assertFalse(skipped.check_target)
+        self.assertEqual(skipped.authored_target_indices, (-1, -1))
+        self.assertEqual(skipped.unmatched_identifiers, (b"NEW1", b"NEW2"))
+
+    def test_cid_match_hardware_shortcut_uses_live_not_selected_vector(self):
+        from scripts.calibration_2026 import native2026_match_received_cids
+        from scripts.cuw_2026 import configure_2026
+        from scripts.programming_2026_common import NativeGeneralParameters2026
+
+        text = cpu_text(40) + (
+            "NewCID=NEW\nNumberOfTargets=1\n01_TargetCalibration=OLD\n"
+            "NumberOfTargetHardwares=1\n01_TargetHardware=HW\n"
+        )
+        metadata = native2026_metadata(parse_cuw_2026(cuw(text)))
+        general = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": b"ParamFileKeySystemProtocolMicon,Unrelated\r\n149P5-Unified311,1\r\n"
+            },
+            encoded=False,
+        )
+        config = configure_2026(struct.pack("<IIddII", 4, 0, 0.0, 0.0, 0, 0))
+
+        def match(selected, live):
+            return native2026_match_received_cids(
+                metadata,
+                selected,
+                (bytes(12),) * len(selected),
+                general,
+                configuration=config,
+                shrink_flag=True,
+                received_hardware=b"HW",
+                live_received_identifiers=live,
+            )
+
+        actual_empty = match((b"UNMATCHED",), ())
+        self.assertTrue(actual_empty.check_target)
+        self.assertEqual(actual_empty.authored_target_indices, (0,))
+        self.assertEqual(actual_empty.unmatched_identifiers, ())
+        selected_empty = match((), (b"LIVE",))
+        self.assertFalse(selected_empty.check_target)
+        self.assertEqual(selected_empty.authored_target_indices, (-1,))
+        self.assertEqual(selected_empty.unmatched_identifiers, (b"NEW",))
+        for invalid in ([b"LIVE"], ("LIVE",), (b"LIVE\0",)):
+            with self.assertRaisesRegex((TypeError, ValueError), "live|CID"):
+                match((), invalid)
+
+    def test_cid_match_configured_bits_use_native_node_association(self):
+        from scripts.calibration_2026 import native2026_match_received_cids
+        from scripts.cuw_2026 import configure_2026
+        from scripts.programming_2026_common import NativeGeneralParameters2026
+
+        text = cpu_text(40).replace("authored.vbf", "authored.hex").replace(
+            "NumberOfCalibration=1", "NumberOfCalibration=2"
+        ) + (
+            "NewCID=NEW1\nNumberOfTargets=1\n01_TargetCalibration=OLD1\n"
+            "[CPU02]\nCPUImageName=two.hex\nCPUType=312\nNewCID=NEW2\n"
+            "NumberOfTargets=1\n01_TargetCalibration=OLD2\n"
+            "[KindOfCal]\nIsControlledBySCC=1\nIsBlankECU=1\n"
+        )
+        metadata = native2026_metadata(parse_cuw_2026(cuw(text, (b"one", b"two"))))
+        general = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": b"ParamFileKeySystemProtocolMicon,Unrelated\r\n149P5-Unified311,1\r\n"
+            },
+            encoded=False,
+        )
+        config = configure_2026(struct.pack("<IIddII", 4, 0, 0.0, 0.0, 0, 0))
+
+        def match(flags):
+            return native2026_match_received_cids(
+                metadata,
+                (),
+                (),
                 general,
                 configuration=config,
                 shrink_flag=False,
-                received_hardware=b"HW123",
+                configured_cpu_flags=flags,
             )
+
+        with self.assertRaisesRegex(ValueError, "Actual per-FILE"):
+            match(None)
+        for flags in ((False,), (0,) * 4, [False] * 4):
+            with self.assertRaisesRegex(ValueError, "Boolean flags"):
+                match(flags)
+        configured = match((True, False, False, False))
+        self.assertTrue(configured.check_target)
+        self.assertEqual(configured.authored_target_indices, (0, 0))
+        self.assertEqual(configured.unmatched_identifiers, ())
+        wrong_node = match((False, True, False, False))
+        self.assertFalse(wrong_node.check_target)
+        self.assertEqual(wrong_node.authored_target_indices, (-1, -1))
+        self.assertEqual(wrong_node.unmatched_identifiers, (b"NEW1", b"NEW2"))
+
+    def test_cid_match_configured_member_is_distinct_from_current_whole(self):
+        from scripts.calibration_2026 import native2026_match_received_cids
+        from scripts.cuw_2026 import configure_2026
+        from scripts.programming_2026_common import NativeGeneralParameters2026
+
+        text = (
+            cpu_text(40)
+            .replace("authored.vbf", "authored.hex")
+            .replace("ContactType=P5-Unified", "ContactType=CAN")
+            + "NewCID=WHOLE_NEW\nNumberOfTargets=1\n01_TargetCalibration=OLD\n"
+        )
+        whole = native2026_metadata(parse_cuw_2026(cuw(text)))
+        member = native2026_metadata(
+            parse_cuw_2026(
+                cuw(
+                    text.replace("WHOLE_NEW", "MEMBER_NEW")
+                    + "[KindOfCal]\nIsControlledBySCC=1\nIsBlankECU=1\n"
+                )
+            )
+        )
+        general = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": b"ParamFileKeySystemProtocolMicon,Unrelated\r\n149CAN311,1\r\n"
+            },
+            encoded=False,
+        )
+        config = configure_2026(struct.pack("<IIddII", 4, 0, 0.0, 0.0, 0, 0))
+
+        def match(source, indexed, cids=(b"OLD",), flags=(True, False, False, False)):
+            return native2026_match_received_cids(
+                source,
+                cids,
+                (bytes(12),) * len(cids),
+                general,
+                configuration=config,
+                shrink_flag=True,
+                configured_cpu_flags=flags,
+                configured_metadata=indexed,
+            )
+
+        skipped = match(whole, member)
+        self.assertFalse(skipped.check_target)
+        self.assertEqual(skipped.authored_target_indices, (-1,))
+        self.assertEqual(skipped.unmatched_identifiers, (b"WHOLE_NEW",))
+        direct = match(whole, None)
+        self.assertTrue(direct.check_target)
+        self.assertEqual(direct.authored_target_indices, (0,))
+        controlled = native2026_metadata(
+            parse_cuw_2026(
+                cuw(text + "[KindOfCal]\nIsControlledBySCC=1\nIsBlankECU=0\n")
+            )
+        )
+        retained = match(controlled, whole, (b"UNMATCHED",))
+        self.assertTrue(retained.check_target)
+        self.assertEqual(retained.authored_target_indices, (0,))
+        self.assertEqual(retained.unmatched_identifiers, ())
+        with self.assertRaisesRegex(ValueError, "Issued"):
+            match(whole, dataclasses.replace(member))
+        with self.assertRaisesRegex(ValueError, "Actual per-FILE"):
+            match(whole, member, flags=None)
+        # 4b0f0 returns before CPU lookup for a non-SCC/non-Phase6 table FILE.
+        larger_text = text.replace("NumberOfCalibration=1", "NumberOfCalibration=2")
+        larger_text += "[CPU02]\nCPUImageName=two.hex\nCPUType=312\nNewCID=WHOLE_TWO\nNumberOfTargets=1\n01_TargetCalibration=OLD2\n"
+        larger = native2026_metadata(parse_cuw_2026(cuw(larger_text, (b"one", b"two"))))
+        self.assertTrue(match(larger, whole, (b"OLD", b"OLD2")).check_target)
+        with self.assertRaisesRegex(ValueError, "index|absent"):
+            match(larger, member, (b"OLD", b"OLD2"))
+
+    def _current_rebuild_input(self, version=8, *, third=False, duplicate=False):
+        from scripts.cuw_2026 import configure_2026
+        from scripts.programming_2026_common import NativeGeneralParameters2026
+
+        count = 3 if third else 2
+        text = (
+            cpu_text(version)
+            .replace("authored.vbf", "authored.hex")
+            .replace("ContactType=P5-Unified", "ContactType=CAN")
+            .replace("NumberOfCalibration=1", f"NumberOfCalibration={count}")
+        )
+        text += (
+            "NewCID=M16C\nNumberOfTargets=1\n01_TargetCalibration=OLD1\n"
+            "[CPU02]\nCPUImageName=two.hex\nCPUType=312\nNewCID=FOREST\n"
+            "NumberOfTargets=1\n01_TargetCalibration=OLD2\n"
+        )
+        if third:
+            text += "[CPU03]\nCPUImageName=three.hex\nCPUType=313\nNewCID=EXTRA\nNumberOfTargets=1\n01_TargetCalibration=OLD3\n"
+        if duplicate:
+            text = text.replace("NewCID=FOREST", "NewCID=M16C")
+        payloads = tuple(
+            srecord(1, 0, value) + b"\n" + srecord(7, 0)
+            for value in (b"FIRST", b"SECON", b"THIRD")[:count]
+        )
+        # Version9 with no indexed files reaches the native36800 rebuild gate.
+        if version == 9:
+            payloads = ()
+        metadata = native2026_metadata(parse_cuw_2026(cuw(text, payloads)))
+        general = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": (
+                    b"ParamFileKeySystemProtocolMicon,M16CTypeFlag,FORESTTypeFlag,PasswordAddress,ByteOrder,FlagToHoldSFormatRecords\r\n"
+                    b"149CAN311,0,0,00,1,0\r\n149CAN312,0,0,00,1,0\r\n149CAN313,0,0,00,1,0\r\n"
+                )
+            },
+            encoded=False,
+        )
+        configuration = configure_2026(struct.pack("<IIddII", 4, 0, 0.0, 0.0, 0, 0))
+        return metadata, general, configuration
+
+    def test_current_cid_rebuild_without_prior_match_publishes_source_steps(self):
+        from scripts.calibration_2026 import (
+            NativeCIDRebuildComplete2026,
+            NativeCIDRebuildMetadata2026,
+            NativeCIDRebuildOffset2026,
+            NativeCIDRebuildTargets2026,
+            NativeCIDRebuildTargetStore2026,
+            native2026_rebuild_current_cids_steps,
+        )
+
+        metadata, general, configuration = self._current_rebuild_input()
+        steps = list(
+            native2026_rebuild_current_cids_steps(
+                metadata,
+                (-1,) * 4,
+                (),
+                (),
+                general,
+                configuration=configuration,
+            )
+        )
+        self.assertEqual(steps[0], NativeCIDRebuildOffset2026(0))
+        self.assertEqual(steps[1], NativeCIDRebuildTargets2026((-1,) * 4))
+        projections = [
+            step for step in steps if isinstance(step, NativeCIDRebuildMetadata2026)
+        ]
+        self.assertEqual(
+            [step.operation for step in projections],
+            ["16ae0", "19300", "17280", "17280"],
+        )
+        stores = [
+            step for step in steps if isinstance(step, NativeCIDRebuildTargetStore2026)
+        ]
+        self.assertEqual(
+            stores,
+            [
+                NativeCIDRebuildTargetStore2026(0, 1),
+                NativeCIDRebuildTargetStore2026(1, 1),
+            ],
+        )
+        complete = steps[-1]
+        assert isinstance(complete, NativeCIDRebuildComplete2026)
+        result = complete.selection
+        self.assertEqual(
+            (result.ordered_to_authored, result.target_indices, result.cpu_offset),
+            ((0, 1), (1, 1), 0),
+        )
+        self.assertEqual(result.authored_target_indices, (-1, -1))
+        self.assertEqual(result.unmatched_identifiers, ())
+        self.assertEqual(
+            native2026_cpu_targets(result.rebuilt_metadata, 0)[1].password,
+            int.from_bytes(b"FIRS", "big"),
+        )
+        self.assertEqual(native2026_archive(result.rebuilt_metadata).data, b"FIRST")
+        self.assertEqual(len(native2026_cpu_targets(metadata, 0)), 1)
+        for source, targets, unmatched, companions, parameters in (
+            (dataclasses.replace(metadata), (-1,) * 4, (), (), general),
+            (metadata, (-1,), (), (), general),
+            (metadata, (True, -1, -1, -1), (), (), general),
+            (metadata, (-1,) * 4, (b"bad\0",), (), general),
+            (metadata, (-1,) * 4, (), (), None),
+        ):
+            with self.assertRaises((TypeError, ValueError)):
+                next(
+                    native2026_rebuild_current_cids_steps(
+                        source,
+                        targets,
+                        unmatched,
+                        companions,
+                        parameters,
+                        configuration=configuration,
+                    )
+                )
+
+    def test_current_cid_rebuild_faults_retain_reached_offset_and_projection(self):
+        from scripts.calibration_2026 import (
+            NativeCIDRebuildMetadata2026,
+            NativeCIDRebuildOffset2026,
+            NativeCIDRebuildTargets2026,
+            native2026_rebuild_current_cids_steps,
+        )
+        from scripts.programming_2026_common import (
+            NativeCallbackLookupError,
+            NativeGeneralParameters2026,
+        )
+
+        metadata, _, configuration = self._current_rebuild_input(third=True)
+        general = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": (
+                    b"ParamFileKeySystemProtocolMicon,M16CTypeFlag,FORESTTypeFlag\r\n"
+                    b"149CAN311,1,0\r\n149CAN312,0,1\r\n"
+                )
+            },
+            encoded=False,
+        )
+        iterator = native2026_rebuild_current_cids_steps(
+            metadata,
+            (0, -1, 0, -1),
+            (b"FOREST",),
+            (),
+            general,
+            configuration=configuration,
+        )
+        self.assertEqual(next(iterator), NativeCIDRebuildOffset2026(0))
+        self.assertEqual(next(iterator), NativeCIDRebuildOffset2026(1))
+        with self.assertRaises(NativeCallbackLookupError) as failure:
+            next(iterator)
+        self.assertEqual(failure.exception.code, 2)
+
+        metadata, _, configuration = self._current_rebuild_input()
+        general = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": (
+                    b"ParamFileKeySystemProtocolMicon,M16CTypeFlag\r\n149CAN311,0\r\n149CAN312,0\r\n"
+                )
+            },
+            encoded=False,
+        )
+        iterator = native2026_rebuild_current_cids_steps(
+            metadata, (-1,) * 4, (), (), general, configuration=configuration
+        )
+        self.assertIsInstance(next(iterator), NativeCIDRebuildOffset2026)
+        self.assertIsInstance(next(iterator), NativeCIDRebuildTargets2026)
+        reordered = next(iterator)
+        pruned = next(iterator)
+        assert isinstance(reordered, NativeCIDRebuildMetadata2026)
+        assert isinstance(pruned, NativeCIDRebuildMetadata2026)
+        self.assertEqual(reordered.operation, "16ae0")
+        self.assertEqual(pruned.operation, "19300")
+        with self.assertRaises(NativeCallbackLookupError):
+            next(iterator)
+        self.assertEqual(native2026_cpu_count(pruned.metadata), 2)
+        self.assertEqual(native2026_archive(pruned.metadata).data, b"FIRST")
+
+    def test_current_cid_rebuild_duplicate_copy_direction_is_source_specific(self):
+        from scripts.calibration_2026 import (
+            NativeCIDRebuildMetadata2026,
+            native2026_rebuild_current_cids_steps,
+        )
+
+        for version, expected_types in ((8, ("312",)), (9, ("312",))):
+            with self.subTest(version=version):
+                metadata, general, configuration = self._current_rebuild_input(
+                    version, duplicate=True
+                )
+                iterator = native2026_rebuild_current_cids_steps(
+                    metadata,
+                    (0, 0, -1, -1),
+                    (),
+                    (),
+                    general,
+                    configuration=configuration,
+                )
+                for step in iterator:
+                    if isinstance(step, NativeCIDRebuildMetadata2026):
+                        self.assertEqual(
+                            step.operation, "16fb0" if version == 9 else "16ae0"
+                        )
+                        self.assertEqual(
+                            tuple(
+                                native2026_cpu_type(step.metadata, index)
+                                for index in range(native2026_cpu_count(step.metadata))
+                            ),
+                            expected_types,
+                        )
+                        projection = step.metadata.runtime_projection
+                        assert projection is not None
+                        # 16fb0 image copy is first-old; final0d2f0 CPU copy
+                        # is independently last-old, including duplicate holes.
+                        self.assertEqual(
+                            native2026_cpu_type(
+                                projection.contexts[0],
+                                native2026_global_cpu_index(projection.contexts[0]),
+                            ),
+                            "311" if version == 9 else "312",
+                        )
+                        break
+                else:
+                    self.fail("Missing actual source reorder projection")
+
+    def test_current_and_registered_rebuild_keep_actual_capacity_boundary(self):
+        from scripts.calibration_2026 import (
+            NativeCIDRebuildOffset2026,
+            NativeCIDRebuildTargets2026,
+            native2026_match_received_cids,
+            native2026_rebind_cid_match,
+            native2026_rebuild_current_cids_steps,
+            native2026_rebuild_received_cids,
+        )
+
+        metadata, general, configuration = self._current_rebuild_input()
+        raw = metadata.source_container
+        assert raw is not None
+        # An active CPUType keeps this row populated despite its empty NewCID.
+        text = (
+            cpu_text(8)
+            .replace("authored.vbf", "authored.hex")
+            .replace("ContactType=P5-Unified", "ContactType=CAN")
+            + "NewCID=\nNumberOfTargets=1\n01_TargetCalibration=OLD\n"
+        )
+        metadata = native2026_metadata(
+            parse_cuw_2026(
+                cuw(text, (srecord(1, 0, b"FIRST") + b"\n" + srecord(7, 0),))
+            )
+        )
+        self.assertEqual(native2026_cpu_count(metadata), 1)
+        match = native2026_match_received_cids(
+            metadata,
+            (b"OLD",),
+            (bytes(12),),
+            general,
+            configuration=configuration,
+            shrink_flag=True,
+        )
+        self.assertEqual((match.authored_cpu_count, match.cpu_maximum), (1, 4))
+        rebound = native2026_rebind_cid_match(
+            match, native2026_with_cpu_type(metadata, 0, "311")
+        )
+        self.assertEqual(rebound.cpu_maximum, 4)
+        with self.assertRaisesRegex(ValueError, "unused CPU capacity"):
+            native2026_rebuild_received_cids(metadata, match, general)
+        with self.assertRaisesRegex(ValueError, "Issued native CID match"):
+            native2026_rebuild_received_cids(
+                metadata, dataclasses.replace(match, cpu_maximum=1), general
+            )
+        iterator = native2026_rebuild_current_cids_steps(
+            metadata, (0, -1, -1, -1), (), (), general, configuration=configuration
+        )
+        self.assertEqual(next(iterator), NativeCIDRebuildOffset2026(0))
+        self.assertEqual(next(iterator), NativeCIDRebuildTargets2026((0, -1, -1, -1)))
+        with self.assertRaisesRegex(ValueError, "unused CPU capacity"):
+            next(iterator)
+
+    def test_current_cid_rebuild_reorder_precedes_logical_pruning(self):
+        from scripts.calibration_2026 import (
+            NativeCIDRebuildMetadata2026,
+            native2026_node_logical_block_count,
+            native2026_rebuild_current_cids_steps,
+        )
+        from scripts.cuw_2026 import configure_2026
+        from scripts.programming_2026_common import NativeGeneralParameters2026
+
+        text = logical_text(209, method="00").replace(
+            "NumberOfLogicalBlock=1", "NumberOfLogicalBlock=2"
+        )
+        text += "[LogicalBlock102]\nNewCID=authored-new\nNumberOfTargets=1\n01_TargetCalibration=SECOND\nReproMethod=00\n[ReproData102]\nStartAddress=2000\nLength=08\n"
+        metadata = native2026_metadata(parse_cuw_2026(cuw(text, (b"FIRST", b"SECOND"))))
+        general = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": b"ParamFileKeySystemProtocolMicon,M16CTypeFlag\r\nP5-Unified,0\r\n"
+            },
+            encoded=False,
+        )
+        configuration = configure_2026(struct.pack("<IIddII", 4, 0, 0.0, 0.0, 0, 0))
+        steps = list(
+            native2026_rebuild_current_cids_steps(
+                metadata, (0, -1, -1, -1), (), (), general, configuration=configuration
+            )
+        )
+        projections = [
+            step for step in steps if isinstance(step, NativeCIDRebuildMetadata2026)
+        ]
+        self.assertEqual([step.operation for step in projections], ["16ae0", "19300"])
+        self.assertEqual(
+            [
+                native2026_node_logical_block_count(step.metadata)
+                for step in projections
+            ],
+            [2, 1],
+        )
 
     def test_native_node_export_logical_count_is_not_deduplicated_cpu_count(self):
         from scripts.calibration_2026 import (

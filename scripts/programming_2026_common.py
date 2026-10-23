@@ -10,6 +10,7 @@ import hmac
 import math
 import re
 import struct
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -41,7 +42,10 @@ from scripts.native_modules import NativeModuleIdentity, identify_native_module
 from scripts.programming import NativeTransportError
 
 if TYPE_CHECKING:
+    from scripts.cuw_2026 import EngineConfiguration2026
+    from scripts.cuw_engine_worker import ControlFileCapture2026
     from scripts.cuw_parameter_pool import ControlParameterPool2026
+    from scripts.j2534_2026 import NativeCommunicationAddress
 
 DIAG_COMM_PROTOCOL_CANFD = "02"
 DIAG_COMM_PROTOCOL_ETHERNET = "03"
@@ -66,6 +70,28 @@ def _system_local_milliseconds_of_day() -> int:
 
 def _system_local_seconds_of_day() -> int:
     return _system_local_milliseconds_of_day() // 1000
+
+
+@dataclass(frozen=True)
+class _SuzukiWaitScope2026:
+    stage: object
+    engine: object
+    controller: object
+    module: object
+    selection: object
+    runner_context: object
+    runner: object
+    entry_frame: object
+    target: object
+    export: str | None
+    helper_lease: object
+    thread: int
+
+
+@dataclass(frozen=True)
+class _SuzukiWaitOrigin2026:
+    scope: _SuzukiWaitScope2026
+    value: int
 
 
 class NativeRuntime2026:
@@ -158,6 +184,203 @@ class NativeRuntime2026:
             yield
         finally:
             self._thread_job_host = previous
+
+    @contextmanager
+    def _suzuki_igoffon_wait_scope_2026(self, stage, *, engine, controller):
+        """Only the actual selected replay runner can issue a58e20 origin."""
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.programming_2026_suzuki_fhi import (
+            _MAIN_MODULES,
+            NativeFamilyContext2026,
+        )
+        from scripts.programming_replay import ProgrammingReplay
+
+        # contextlib.__enter__ resumes this generator directly from run_bound.
+        caller = sys._getframe(2)
+        module = caller.f_locals.get("module")
+        selection = caller.f_locals.get("selection")
+        if (
+            caller.f_code is not ProgrammingReplay.run_bound2026.__code__
+            or caller.f_locals.get("self") is not stage
+            or not callable(caller.f_locals.get("runner"))
+            or type(stage) is not ProgrammingReplay
+            or type(engine) is not CUWEngine2026
+            or type(controller) is not ControlCommPhase2026
+            or stage._engine2026 is not engine
+            or stage._controller2026 is not controller
+            or stage._runtime2026 is not self
+            or controller.runtime is not self
+            or engine._controller_execution is not controller
+            or selection is not stage._executed_selection2026
+            or module is None
+            or stage.modules.get(module.name) is not module
+            or _MAIN_MODULES.get(module.name, (None, ""))[1]
+            not in ("suzuki", "suzuki_usb")
+            or getattr(self._device_calls, "suzuki_wait_scope", None) is not None
+        ):
+            raise ValueError("Actual selected Suzuki runner entry required")
+        data = stage._module_files.get(module.name)
+        if (
+            type(data) is not bytes
+            or hashlib.sha256(data).hexdigest() != module.sha256
+            or module.native_identity
+            != identify_native_module(module.sha256, module.name)
+        ):
+            raise ValueError("Selected Suzuki module source changed")
+        runner = caller.f_locals["runner"]
+        contexts = tuple(
+            cell.cell_contents
+            for cell in (getattr(runner, "__closure__", None) or ())
+            if type(cell.cell_contents) is NativeFamilyContext2026
+        )
+        if (
+            len(contexts) != 1
+            or contexts[0].selection != selection
+            or contexts[0].container is not stage.container
+            or contexts[0].identity != module.native_identity
+            or contexts[0].controller_state is not engine.suzuki_state
+        ):
+            raise ValueError("Actual bound Suzuki runner context required")
+        target = stage._control_target2026
+        if target is not None:
+            stage._validate_control_stage2026()
+            _control_export_dispatch2026(target, cast(str, stage._control_export2026))
+        engine._require_owned_phase()
+        scope = _SuzukiWaitScope2026(
+            stage,
+            engine,
+            controller,
+            module,
+            selection,
+            contexts[0],
+            runner,
+            caller,
+            target,
+            stage._control_export2026,
+            controller._native_control_export_lease2026,
+            threading.get_ident(),
+        )
+        self._device_calls.suzuki_wait_scope = scope
+        self._device_calls.suzuki_wait_origin = None
+        try:
+            yield
+        finally:
+            self._device_calls.suzuki_wait_origin = None
+            self._device_calls.suzuki_wait_scope = None
+
+    def _validate_suzuki_wait_scope_2026(self, scope) -> None:
+        stage, engine, controller = scope.stage, scope.engine, scope.controller
+        if (
+            getattr(self._device_calls, "suzuki_wait_scope", None) is not scope
+            or scope.thread != threading.get_ident()
+            or stage._engine2026 is not engine
+            or stage._controller2026 is not controller
+            or stage._runtime2026 is not self
+            or controller.runtime is not self
+            or engine._controller_execution is not controller
+            or stage._executed_selection2026 is not scope.selection
+            or scope.entry_frame.f_locals.get("self") is not stage
+            or scope.entry_frame.f_locals.get("runner") is not scope.runner
+            or scope.runner_context.container is not stage.container
+            or scope.runner_context.selection != scope.selection
+            or scope.runner_context.controller_state is not engine.suzuki_state
+            or stage.modules.get(scope.module.name) is not scope.module
+            or stage._control_target2026 is not scope.target
+            or stage._control_export2026 != scope.export
+            or controller._native_control_export_lease2026 is not scope.helper_lease
+        ):
+            raise ValueError("Suzuki callback scope source or owner changed")
+        data = stage._module_files.get(scope.module.name)
+        if (
+            type(data) is not bytes
+            or hashlib.sha256(data).hexdigest() != scope.module.sha256
+        ):
+            raise ValueError("Suzuki callback module bytes changed")
+        if scope.target is not None:
+            stage._validate_control_stage2026()
+            _control_export_dispatch2026(scope.target, scope.export)
+        engine._require_owned_phase()
+
+    def _publish_scoped_suzuki_wait_2026(self, values) -> None:
+        from scripts.programming_2026_suzuki_fhi import (
+            execute_context,
+            first_suzuki_usb_write,
+            prepare_suzuki_uds,
+        )
+
+        scope = getattr(self._device_calls, "suzuki_wait_scope", None)
+        if scope is None:
+            return
+        producer = sys._getframe(2)
+        if (
+            producer.f_code
+            not in (
+                first_suzuki_usb_write.__code__,
+                prepare_suzuki_uds.__code__,
+            )
+            or producer.f_locals.get("runtime") is not self
+            or producer.f_locals.get("identity") != scope.module.native_identity
+            or set(values) != {"value"}
+            or type(values["value"]) is not int
+            or not 0 <= values["value"] <= 0xFFFFFFFF
+            or getattr(self._device_calls, "suzuki_wait_origin", None) is not None
+        ):
+            raise ValueError("Exact noncleanup Suzuki wait callback required")
+        frame = producer.f_back
+        selected_context = None
+        for _ in range(32):
+            if frame is None:
+                break
+            if frame is scope.entry_frame:
+                break
+            if frame.f_code is NativeRuntime2026.call.__code__:
+                raise ValueError("Reentrant provider cannot issue Suzuki wait callback")
+            if frame.f_code is execute_context.__code__:
+                runner_frame = frame.f_back
+                if (
+                    selected_context is not None
+                    or frame.f_locals.get("context") is not scope.runner_context
+                    or frame.f_locals.get("runtime") is not self
+                    or runner_frame is None
+                    or runner_frame.f_code is not scope.runner.__code__
+                    or runner_frame.f_locals.get("context") is not scope.runner_context
+                    or runner_frame.f_locals.get("runtime") is not self
+                    or runner_frame.f_back is not scope.entry_frame
+                ):
+                    raise ValueError(
+                        "Suzuki callback belongs to another selected context"
+                    )
+                selected_context = frame
+            frame = frame.f_back
+        else:
+            raise ValueError("Suzuki callback exceeds bounded selected producer stack")
+        if frame is not scope.entry_frame or selected_context is None:
+            raise ValueError("Actual selected Suzuki producer invocation required")
+        self._validate_suzuki_wait_scope_2026(scope)
+        origin = _SuzukiWaitOrigin2026(scope, values["value"])
+        self._device_calls.suzuki_wait_origin = origin
+        try:
+            scope.engine._publish_suzuki_igoffon_wait_58e20_2026(origin)
+            if self._device_calls.suzuki_wait_origin is not None:
+                raise ValueError("Engine did not consume Suzuki wait callback")
+        finally:
+            self._device_calls.suzuki_wait_origin = None
+
+    def _consume_suzuki_igoffon_wait_origin_58e20_2026(self, origin, *, engine) -> int:
+        publisher = sys._getframe(2)
+        if (
+            type(origin) is not _SuzukiWaitOrigin2026
+            or getattr(self._device_calls, "suzuki_wait_origin", None) is not origin
+            or origin.scope.engine is not engine
+            or publisher.f_code
+            is not NativeRuntime2026._publish_scoped_suzuki_wait_2026.__code__
+            or publisher.f_locals.get("self") is not self
+            or publisher.f_locals.get("origin") is not origin
+        ):
+            raise ValueError("Exact pending Suzuki wait callback origin required")
+        self._validate_suzuki_wait_scope_2026(origin.scope)
+        self._device_calls.suzuki_wait_origin = None
+        return origin.value
 
     @contextmanager
     def engine_device_calls(self, engine):
@@ -562,6 +785,8 @@ class NativeRuntime2026:
                 raise ValueError("Host primitive call budget exceeded")
         started = self.clock()
         try:
+            if not cleanup and operation == "notify_igoffon_wait":
+                self._publish_scoped_suzuki_wait_2026(values)
             # CONTROL's native callback10/11 publishes the complete worker-owned
             # vector before the provider observes the corresponding notification.
             # The ordinary runtime path remains unchanged outside an authenticated
@@ -4388,6 +4613,7 @@ class ControlCommPhase2026:
         pool = self._control_pool2026()
         pool.load_for(engine, self, "get_cid")
         target = self._control_target2026(engine, 0, "get_cid")
+        _record_control_getter_family_attempt2026(target)
         report = self._control_call2026(
             engine, session, target, "StartGetCID", "6f20", reports
         )
@@ -4399,6 +4625,7 @@ class ControlCommPhase2026:
             alternate = target._alternate_getter2026()
             if alternate is not None:
                 engine.dh_state.record_native_error(None, 0, 0)
+                _record_control_getter_family_attempt2026(alternate)
                 report = self._control_call2026(
                     engine, session, alternate, "StartGetCID", "6f20", reports
                 )
@@ -5753,6 +5980,65 @@ def _validate_pooled_binding2026(binding, container, operation) -> None:
         raise ValueError("Pooled binding catalog identity changed")
 
 
+def _control_dh_file_view2026(selection, state):
+    """Resolve classic DH's retained FILE only inside its actual CONTROL export."""
+    from scripts.cuw_2026 import DHControllerState2026
+
+    if type(state) is not DHControllerState2026 or not isinstance(
+        selection, NativeParameterBinding2026
+    ):
+        raise TypeError("Exact native parameter binding and engine DH state required")
+    engine = state.engine
+    target = engine._controller_export_target2026
+    pooled = _pooled_binding_state2026(selection)
+    if target is None and pooled is None:
+        if getattr(selection, "_pool_issued", False):
+            raise ValueError("Pooled DH binding has expired")
+        return None
+    if type(target) is not NativeControlExportTarget2026 or pooled is None:
+        raise ValueError("Actual pooled DH CONTROL dispatch required")
+    controller = pooled["controller"]
+    engine._require_owned_phase()
+    target.validate(engine, controller)
+    _validate_pooled_binding2026(
+        selection, selection.metadata.source_container, selection.operation
+    )
+    runtime = controller.runtime
+    active = getattr(runtime._device_calls, "control_export", None)
+    if (
+        state is not engine.dh_state
+        or pooled["engine"] is not engine
+        or target.binding is not selection
+        or pooled["context"] is not target._context
+        or pooled["capture"] is not target._context._capture
+        or pooled["index"] != target.cpu_index
+        or selection.metadata != target.metadata
+        or engine.worker.controller is not controller
+        or engine.worker.runtime is not runtime
+        or engine._controller_execution is not controller
+        or type(active) is not tuple
+        or len(active) != 3
+        or active[0] is not engine
+        or active[1] is not controller
+        or active[2] is not target
+    ):
+        raise ValueError("DH selection differs from its active CONTROL FILE")
+    lease = controller._native_control_export_lease2026
+    record = _NATIVE_CONTROL_HELPER_LEASES_2026.get(id(lease))
+    if record is None or record[0] is not lease:
+        raise ValueError("Actual classic DH helper lease required")
+    export = record[1]["export"]
+    receipt = _control_export_dispatch2026(target, export)
+    allowed = {
+        ("TCUWCanDHPrepareWriter.dll", "StartPrepareWrite"): ("8990", "9370"),
+        ("TCUWCanDHFlashWriter.dll", "StartFlashWrite"): ("4c10", "5c30"),
+        ("TCUWCanDHFlashWriter.dll", "PrepareRetry"): ("4c10", "5c30"),
+    }
+    if record[1]["helper"] not in allowed.get((receipt["module"], export), ()):
+        raise ValueError("Mixed FILE view requires its exact classic DH export")
+    return target.metadata, target.cpu_index
+
+
 def _binding_from_control_pool2026(
     engine, controller, pool, index: int, operation: str
 ) -> NativeParameterBinding2026:
@@ -6049,6 +6335,33 @@ class NativeControlExportTarget2026:
         return self._context.target_index
 
 
+@dataclass(frozen=True, eq=False)
+class NativeControlGetterOutput2026:
+    """Immutable raw 6f20 output bound to one actual CONTROL helper entry."""
+
+    context: NativeControlContext2026
+    entry_lease: object
+    capture: "ControlFileCapture2026"
+    getter_targets: tuple[NativeControlExportTarget2026, ...]
+    configuration: "EngineConfiguration2026"
+    getter_mode: int
+    raw_al: bool
+    identifiers: tuple[bytes, ...]
+    query_records34: tuple[bytes, ...]
+    hardware: bytes
+    node_strings_9c8: tuple[bytes, ...]
+    node_strings_9cc: tuple[bytes, ...]
+    node_strings_9d0: tuple[bytes, ...]
+    node_strings_9d4: tuple[bytes, ...]
+    configured_bytes_9d8: bytes
+    retained_bytes_9dc: bytes
+    node_cells_9e0: tuple[tuple[bytes, ...], ...]
+    node_dwords_a10: tuple[int, ...]
+    tail_a14: bytes
+    tail_a29: bytes
+    communication_addresses: tuple["NativeCommunicationAddress", ...]
+
+
 def _control_export_dispatch2026(target, export: str):
     """Expose dispatch metadata only inside the actual raw helper export lease."""
     from scripts.cuw_2026 import CUWEngine2026
@@ -6166,6 +6479,29 @@ def _control_alternate_getter_byte2026(target, report):
     return value
 
 
+def _record_control_getter_family_attempt2026(target):
+    """Record a family target immediately before its actual6f20 invocation."""
+    if type(target) is not NativeControlExportTarget2026:
+        raise TypeError("Exact issued getter target required")
+    engine, controller = target._engine, target._controller
+    target.validate(engine, controller)
+    entry_lease = _control_helper_entry2026(target._context)
+    entry = _NATIVE_CONTROL_HELPER_ENTRIES_2026[id(entry_lease)][1]
+    if (
+        entry["helper"] != "6f20"
+        or target.binding.operation != "get_cid"
+        or controller._native_control_export_lease2026 is not None
+        or engine._controller_export_target2026 is not None
+        or target._context is not entry["context"]
+    ):
+        raise ValueError("Actual pre-invocation6f20 target required")
+    attempts = entry.setdefault("getter_attempts", [])
+    returns = entry.setdefault("getter_returns", [])
+    if len(attempts) != len(returns):
+        raise ValueError("Previous getter target has no actual return")
+    attempts.append(target)
+
+
 def _record_control_getter_family_return2026(target, report):
     """Save primary or alternate getter param7 before post-export callbacks."""
     if type(target) is not NativeControlExportTarget2026:
@@ -6187,6 +6523,16 @@ def _record_control_getter_family_return2026(target, report):
     ):
         raise ValueError("Actual active6f20 getter return boundary required")
     entry["getter_al"] = _control_alternate_getter_byte2026(target, report)
+    attempts = entry.get("getter_attempts", ())
+    returns = entry.setdefault("getter_returns", [])
+    if (
+        type(attempts) is not list
+        or type(returns) is not list
+        or len(attempts) != len(returns) + 1
+        or attempts[len(returns)] is not target
+    ):
+        raise ValueError("Getter return does not match its actual ordered attempt")
+    returns.append(target)
 
 
 def _control_helper_entry2026(context: NativeControlContext2026):
@@ -6385,6 +6731,116 @@ def _control_has_ordinary_getter_return2026(context: NativeControlContext2026) -
     return True
 
 
+def _control_getter_output2026(
+    context: NativeControlContext2026,
+) -> NativeControlGetterOutput2026 | None:
+    """Return only the output issued by this exact live getter context."""
+    if type(context) is not NativeControlContext2026:
+        raise TypeError("Exact active CONTROL context required")
+    context.validate(context._engine, context._controller)
+    record = _NATIVE_CONTROL_GETTER_RESULTS_2026.get(id(context))
+    if record is None:
+        return None
+    if record[0] is not context or len(record) != 4:
+        raise ValueError("CONTROL getter output lineage is stale or malformed")
+    output = record[3]
+    if output is not None and (
+        type(output) is not NativeControlGetterOutput2026
+        or output.context is not context
+    ):
+        raise ValueError("CONTROL getter typed output is foreign")
+    return output
+
+
+def _control_getter_mode2026(capture) -> int:
+    """Mirror3cb90's captured +39c/SCC/contact getter-mode selection."""
+    from scripts.cuw_engine_worker import ControlFileCapture2026
+
+    if type(capture) is not ControlFileCapture2026:
+        raise TypeError("Actual source-issued getter capture required")
+    contact = capture.metadata.vehicle.get("contacttype", "")
+    if capture.sequence_changed_39c:
+        return 2
+    return int(
+        (
+            capture.metadata.is_controlled_by_scc
+            and contact in ("P5-Unified", "Phase6", "Ethernet")
+        )
+        or contact == "Phase6"
+    )
+
+
+def _build_native_control_getter_output2026(context, entry_lease, raw_al, identifiers):
+    """Freeze only the complete, source-authenticated CanCID getter footprint."""
+    from scripts.cuw_engine_worker import ControlFileCapture2026
+    from scripts.j2534_2026 import NativeCommunicationAddress
+
+    entry_record = _NATIVE_CONTROL_HELPER_ENTRIES_2026.get(id(entry_lease))
+    if entry_record is None or entry_record[0] is not entry_lease:
+        raise ValueError("Live getter entry required to freeze native output")
+    entry = entry_record[1]
+    attempts, returns = entry.get("getter_attempts"), entry.get("getter_returns")
+    capture = context._capture
+    if (
+        type(capture) is not ControlFileCapture2026
+        or type(attempts) is not list
+        or type(returns) is not list
+        or not attempts
+        or len(attempts) != len(returns)
+        or any(started is not returned for started, returned in zip(attempts, returns))
+        or any(
+            type(target) is not NativeControlExportTarget2026
+            or target._context is not context
+            or target.module_binding.module_name != "TCUWCanCIDGetter.dll"
+            for target in attempts
+        )
+    ):
+        return None
+
+    mode = _control_getter_mode2026(capture)
+    configuration = capture.configuration
+    maximum = configuration.cpu_maximum
+    records = tuple(context._engine._working_identifier_records)
+    addresses = tuple(context._controller.address_history)
+    if (
+        len(records) != 34
+        or any(type(record) is not bytes or len(record) != 12 for record in records)
+        or any(type(address) is not NativeCommunicationAddress for address in addresses)
+    ):
+        raise ValueError("Actual bounded CanCID output state required")
+
+    # The authenticated CanCID body writes only query records/CIDs/addresses.
+    # These other output buffers are the explicit59ab0 zero initializers.
+    output = NativeControlGetterOutput2026(
+        context=context,
+        entry_lease=entry_lease,
+        capture=capture,
+        getter_targets=tuple(attempts),
+        configuration=configuration,
+        getter_mode=mode,
+        raw_al=raw_al,
+        identifiers=identifiers,
+        query_records34=records,
+        hardware=b"",
+        node_strings_9c8=(b"\0" * 13,) * maximum,
+        node_strings_9cc=(b"\0" * 257,) * maximum,
+        node_strings_9d0=(b"\0" * 101,) * maximum,
+        node_strings_9d4=(b"\0" * 31,) * maximum,
+        configured_bytes_9d8=(
+            b"\0" * maximum if mode == 1 else bytes(capture.configured_bits)
+        ),
+        retained_bytes_9dc=b"\0" * maximum,
+        node_cells_9e0=tuple(
+            tuple(b"\0" * 14 for _ in range(32)) for _ in range(maximum)
+        ),
+        node_dwords_a10=(0,) * maximum,
+        tail_a14=b"\0" * 21,
+        tail_a29=b"\0" * 21,
+        communication_addresses=addresses,
+    )
+    return output
+
+
 def _record_control_getter_result2026(context, entry_lease, raw_al, identifiers):
     """Retain the actual 6f20 return byte and final vector for outer 5a050."""
     from scripts.cuw_engine_worker import ControlFileCapture2026
@@ -6412,10 +6868,14 @@ def _record_control_getter_result2026(context, entry_lease, raw_al, identifiers)
         or any(len(value) > 33 for value in identifiers)
     ):
         raise ValueError("Active source-issued ordinary getter result required")
+    output = _build_native_control_getter_output2026(
+        context, entry_lease, raw_al, identifiers
+    )
     _NATIVE_CONTROL_GETTER_RESULTS_2026[id(context)] = (
         context,
         raw_al,
         identifiers,
+        output,
     )
 
 
@@ -6601,11 +7061,32 @@ class NativeFrontendParameters2026:
             name not in catalog_sources for name in names
         ):
             raise LookupError("Exact native frontend parameter sources unavailable")
-        sources = {}
-        for name in names:
-            data = catalog_sources[name]
+        if len(catalog_sources) > 4096:
+            raise ValueError("Native frontend resource count exceeds host bound")
+        sources, folded = {}, set()
+        total = 0
+        for name, data in catalog_sources.items():
+            if (
+                type(name) is not str
+                or not re.fullmatch(r"[ -~]{1,255}", name)
+                or any(char in name for char in '<>:"/\\|?*')
+                or name.endswith((" ", "."))
+                or name.split(".", 1)[0].rstrip(" .").upper()
+                in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                | {
+                    f"{prefix}{index}"
+                    for prefix in ("COM", "LPT")
+                    for index in range(1, 10)
+                }
+                or name.casefold() in folded
+            ):
+                raise ValueError("Unambiguous bounded ASCII Win32 basename required")
             if type(data) is not bytes or len(data) > 16 * 1024 * 1024:
                 raise ValueError("Bounded immutable frontend parameter bytes required")
+            total += len(data)
+            if total > 64 * 1024 * 1024:
+                raise ValueError("Native frontend resource bytes exceed host bound")
+            folded.add(name.casefold())
             sources[name] = data
         general = NativeGeneralParameters2026.from_sources(sources, encoded=encoded)
         tables = {}

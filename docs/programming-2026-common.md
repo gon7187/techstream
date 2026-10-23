@@ -40,9 +40,43 @@ Staged `ProgrammingReplay.run_bound2026` shares the original trace and runtime. 
 
 The ordinary4be0 tail exports the exact CONTROL interface snapshot. It does not import it into the engine. Only the actual getter's outer5a050 handoff imports that snapshot and then commits identifiers/hardware. Prepare/write outer5c2c0 does not import the interface snapshot. Both directions use source-issued pair snapshots and current signatures; no speculative reverse import runs in `finally`.
 
+For phase-0 getters, COMMON keeps the existing result registry as the single owner of raw AL, returned identifiers, and an optional immutable typed output. It records each actual primary/alternate family attempt immediately before invocation and its matching return at the export boundary. The typed form is currently issued only when every executed getter target is the authenticated `TCUWCanCIDGetter.dll`; it contains the exact34×12 query records, source-derived mode and configuration, the CanCID module's zero-initialized untouched raw buffers, and the controller's complete ordered address history. Unsupported or interrupted family attempts retain legacy ordinary getter behavior with typed output `None`. The accessor is valid only for the live source context; ending that context retires the registry entry. This narrow output receipt does not dispatch the outer callback or implement multi-FILE caching.
+
 The worker owns count/percentage scratch. Decimal callbacks10/11 publish whole arrays; callback11 records the old global percentage vector before replacing it. Hex28/2f publish actual C25/C08 bytes into persistent engine caches after classic prepare, and their restore callbacks read those same caches. P6 progress changes do not advance CONTROL's cursor. Online controller reissue retains the same actual capture and elapsed-clock sink through `bound_online_controller2026()`.
 
+## Captured frontend resources and Suzuki wait callback
+
+`NativeFrontendParameters2026` retains every supplied resource's exact ASCII
+Win32 basename, immutable bytes and SHA-256, including empty extra resources.
+The original three literal table names remain mandatory and are the only parsed
+tables. Case-fold collisions, separators, reserved device names and Win32 alias
+spellings with trailing dots/spaces reject. Host bounds are4096 resources,
+16MiB per resource and64MiB total. `validate_source()` reconstructs the complete
+snapshot, so changing an extra resource also changes the bound frontend identity.
+
+The private Suzuki wait scope is entered only by the actual
+`ProgrammingReplay.run_bound2026` selected runner, after dispatch and runner
+construction. It retains the exact stage, engine/controller/runtime, selected
+module bytes, thread, export and existing CONTROL helper lease. The direct
+CONTROL route does not require a thread job. Callback admission checks the
+complete bounded stack through the original runner and retained replay frame;
+a provider cannot reuse the same family context to issue a nested callback.
+A real noncleanup Suzuki
+`notify_igoffon_wait` producer issues a one-use origin; the engine consumes it
+and publishes58e20's two IG stores before the external primitive provider runs.
+Provider failure cannot undo those reached stores. Scope exit retires pending
+origins; arbitrary callers, stale origins and cleanup events grant no authority.
+Standalone notifications continue to call only their provider. This mechanism
+does not write FILE vectors or introduce a generic timing/event setter.
+
 ## Verification and bounds
+
+The private `_control_dh_file_view2026(selection, state)` resolver joins only the
+existing classic DH pooled selection to its exact active CONTROL target/helper
+lease and owning runtime/thread. Its retained FILE/native CPU result does not
+replace the engine's current FILE or shared state. Standalone/nonclassic metadata
+checks stay in the DH adapter; a failed pooled proof cannot become a standalone
+fallback. Nested classic PrepareRetry uses its actual outer flash helper lease.
 
 `RawControlStageMachineTests` covers same-Execute ordering, authentic pool/slot/module/receipt joins, distinct modern CPU archives, separate getter vectors/out bytes, typed versus host faults, retry and confirmation stores, Phase6 retained-module void calls, incremental preflight failure, source snapshot direction and startup-pool lifetime. Most orchestration controls substitute the concrete family runner boundary; the P5 getter proof additionally runs its real authenticated family adapter over authored primitive traffic and retains the same partial identifier vector for true and false process outputs. Family wire algorithms have their own module tests. These controls establish software behavior, not vehicle or adapter compatibility.
 

@@ -37,23 +37,8 @@ class PublicFileTests(unittest.TestCase):
         image = Path("runtime/no-car-21/recovered/CUW.dll")
         if not image.is_file():
             self.skipTest("Authenticated static CUW2026 image unavailable")
-        self.engine = CUWEngine2026(
-            image.read_bytes(),
-            general_parameters=NativeGeneralParameters2026.from_sources(
-                {
-                    "Parameter.ini": table(
-                        (
-                            "ParamFileKeySystemProtocolMicon",
-                            "EngineTypeFlag",
-                            "FlagToOutputAllAttachedInformation",
-                            "CalibrationType",
-                        ),
-                        (("149CAN", "1", "0", "27"),),
-                    )
-                },
-                encoded=False,
-            ),
-        )
+        self.engine = CUWEngine2026(image.read_bytes())
+        self.engine.bind_frontend_parameters(self.frontend_parameters())
         self.engine.configure(struct.pack("<IIddII", 2, 0, 0, 0, 0, 0))
         self.header = b"Z" * 0x98
         self.rows = (b"X" * 0xBBAC, b"Y" * 0xBBAC)
@@ -67,6 +52,246 @@ class PublicFileTests(unittest.TestCase):
         return read_reprogramming_data_file_2026(
             self.engine, self.source, mode, 1, self.header, self.rows, **kw
         )
+
+    def assert_cold_fault_sealed(self, engine, admission, expected_sources):
+        self.assertTrue(admission._consumed)
+        self.assertIs(engine.file_sources, expected_sources)
+        self.assertIs(
+            engine._wait_current_pointer_metadata2026,
+            expected_sources.selected_metadata,
+        )
+        self.assertIsNone(engine._wait_active_admission2026)
+        self.assertIsNotNone(engine._wait_admission_stage2026)
+        self.assertIsNotNone(engine._wait_admission_cursor2026)
+        with self.assertRaisesRegex(ValueError, "sealed after source failure"):
+            engine.bind_worker(object())
+        with self.assertRaisesRegex(ValueError, "sealed after source failure"):
+            engine.bind_file_sources(admission.sources)
+        with self.assertRaisesRegex(ValueError, "sealed after source failure"):
+            engine.read_reprogramming_data_file(
+                admission.sources.admission_source,
+                1,
+                1,
+                self.header,
+                self.rows,
+                source_name=admission.sources.source_name,
+            )
+        with self.assertRaisesRegex(ValueError, "sealed after source failure"):
+            engine.bind_persistence(object())
+        with self.assertRaisesRegex(ValueError, "sealed after source failure"):
+            engine.judge_flashable(1)
+        engine.close()
+        self.assertIsNone(engine._wait_admission_stage2026)
+        self.assertIsNone(engine._wait_admission_cursor2026)
+        self.assertIsNone(engine._wait_pending_admission2026)
+        self.assertIsNone(engine._wait_active_admission2026)
+
+    def fail_at_real_selector_point(self, engine, point):
+        original = engine._select_frontend_parameters_41940_2026
+        fault = RuntimeError(f"injected host fault at real {point} selector")
+
+        def select(metadata):
+            stage = engine._wait_admission_stage2026
+            if type(stage) is tuple and len(stage) == 5 and stage[2] == point:
+                raise fault
+            return original(metadata)
+
+        engine._select_frontend_parameters_41940_2026 = select
+        return fault
+
+    def test_initial_json_41940_fault_keeps_published_initial_pointer(self):
+        engine = self.frontend_engine()
+        json_member = cuw(
+            "[Format]\nVersion=209\n[Vehicle]\nNumberOfNode=1\n"
+            "ContactType=P5-Unified\nKindOfECU=149\n[Node01]\n"
+            "RequiredSpecReproVer=02\nNumberOfCalibration=1\nDiagID=0700\n"
+            "[CPU11]\nCPUImageName=cpu.vbf\nNewCID=CPU\nCPUType=311\n"
+        )
+        issued = admit_file_sources_2026(
+            engine,
+            "one.json",
+            b'["one.cuw"]',
+            region=0,
+            source_files={"one.cuw": json_member},
+        )
+        admission = issued._wait_timing_admission2026
+        assert admission is not None
+        fault = self.fail_at_real_selector_point(engine, "32ff0")
+        with self.assertRaises(RuntimeError) as caught:
+            engine.bind_file_sources(issued)
+        self.assertIs(caught.exception, fault)
+        initial = admission.table_stages.initial
+        self.assertEqual(tuple(engine._wait_igoffon_by_file2026[:1]), (10,))
+        self.assertEqual(engine._wait_general_keys2026, ("149", "", "P5-Unified"))
+        self.assert_cold_fault_sealed(engine, admission, initial)
+
+    def test_direct_scuw_41940_fault_keeps_whole_pointer_and_part_waits(self):
+        engine = self.frontend_engine()
+        part = cuw(
+            logical_text(209)
+            .replace("[Node01]", "[Node01]\nDiagID=0701")
+            .replace("authored-new", "PART")
+        )
+        whole = cuw(
+            logical_text(209)
+            .replace("[Node01]", "[Node01]\nDiagID=0700")
+            .replace("authored-new", "WHOLE")
+        )
+        archive = self.archive(
+            b"[Vehicle]\nContactType=P5-Unified\n",
+            (
+                (
+                    "Setting.ini",
+                    (
+                        b"[DeltaReproCalFile]\nFileNum=1\nFileName1=part.cuw\n"
+                        b"[WholeReproCalFile]\nFileName=whole.cuw\n"
+                    ),
+                ),
+                ("part.cuw", part),
+                ("whole.cuw", whole),
+            ),
+        )
+        issued = admit_file_sources_2026(engine, "direct.scuw", archive, region=0)
+        admission = issued._wait_timing_admission2026
+        assert admission is not None
+        fault = self.fail_at_real_selector_point(engine, "41940")
+        with self.assertRaises(RuntimeError) as caught:
+            engine.bind_file_sources(issued)
+        self.assertIs(caught.exception, fault)
+        initial = admission.table_stages.initial
+        self.assertIs(initial, admission.table_stages.final)
+        self.assertIs(initial.selected_metadata, issued.delta_groups[0][2])
+        self.assertEqual(initial.output_files, (issued.delta_groups[0][2],))
+        self.assertEqual(
+            tuple(engine.native_wait_time_for_igoffon2026(i) for i in (1, 2, 3)),
+            (10, 20, 30),
+        )
+        self.assertEqual(engine._wait_igoffon_by_file2026[0], 10)
+        self.assertEqual(engine._wait_current_igoffon2026, 10)
+        self.assertEqual(engine._wait_general_keys2026, ("", "", "P5-Unified"))
+        self.assert_cold_fault_sealed(engine, admission, initial)
+
+    def test_mapped_second_selector_41940_fault_keeps_final_pointer(self):
+        engine = self.frontend_engine()
+
+        def calibration(cid, address):
+            return cuw(
+                logical_text(209)
+                .replace("P5-Unified", "Phase6")
+                .replace(
+                    "[Node01]",
+                    f"[Node01]\nDiagID=0700\nLogicalAddress={address}",
+                )
+                .replace("authored-new", cid)
+            )
+
+        archive = self.archive(
+            b"[Vehicle]\nContactType=Phase6\n",
+            (
+                (
+                    "Setting.ini",
+                    (
+                        b"[DeltaReproCalFile]\nFileNum=1\nFileName1=part.cuw\n"
+                        b"[WholeReproCalFile]\nFileName=whole.cuw\n"
+                    ),
+                ),
+                ("part.cuw", calibration("PART", "01")),
+                ("whole.cuw", calibration("WHOLE", "01")),
+            ),
+        )
+        issued = admit_file_sources_2026(
+            engine,
+            "mapped.json",
+            b'["group.scuw","plain.cuw"]',
+            region=0,
+            source_files={
+                "group.scuw": archive,
+                "plain.cuw": calibration("PLAIN", "02"),
+            },
+        )
+        admission = issued._wait_timing_admission2026
+        assert admission is not None
+        fault = self.fail_at_real_selector_point(engine, "phase6_second32ff0")
+        with self.assertRaises(RuntimeError) as caught:
+            engine.bind_file_sources(issued)
+        self.assertIs(caught.exception, fault)
+        final = admission.table_stages.final
+        self.assertIsNot(final, admission.table_stages.post_67c60)
+        self.assertIs(engine._metadata, final.selected_metadata)
+        self.assertEqual(engine._wait_general_keys2026, ("", "", "Phase6"))
+        self.assertEqual(
+            tuple(engine.native_wait_time_for_igoffon2026(i) for i in (1, 2, 3)),
+            (10, 20, 30),
+        )
+        self.assertEqual(engine._wait_igoffon_by_file2026[:2], (10, 10))
+        self.assert_cold_fault_sealed(engine, admission, final)
+
+    def test_no_map_phase6_persistence_tail_fault_retains_post4_table(self):
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+
+        engine = self.frontend_engine()
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(
+                Path(directory) / "output",
+                ReproInfoState((RecoveryCalibration("prior.cuw", self.source),)),
+            )
+            engine.bind_persistence(persistence)
+            left = cuw(
+                logical_text(209)
+                .replace("P5-Unified", "Phase6")
+                .replace("[Node01]", "[Node01]\nDiagID=0700")
+                .replace("authored-new", "FIRST")
+                .replace("authored-old", "OLD-FIRST"),
+                (b"LEFT",),
+            )
+            right = cuw(
+                logical_text(209, slot=2)
+                .replace("P5-Unified", "Phase6")
+                .replace("[Node01]", "[Node01]\nDiagID=0700")
+                .replace("authored-new", "SECOND")
+                .replace("authored-old", "OLD-SECOND"),
+                (b"RGHT",),
+            )
+            issued = admit_file_sources_2026(
+                engine,
+                "pair.json",
+                b'["left.cuw","right.cuw"]',
+                region=0,
+                source_files={"left.cuw": left, "right.cuw": right},
+            )
+            admission = issued._wait_timing_admission2026
+            assert admission is not None
+            stages = admission.table_stages
+            host_fault = RuntimeError("host persistence final-bind fault")
+            previous_calibrations = persistence.state.calibrations
+            bound_engine = engine
+
+            def fail_final_bind(engine):
+                self.assertIs(engine, bound_engine)
+                self.assertEqual(
+                    bound_engine._wait_admission_cursor2026, len(admission.steps)
+                )
+                self.assertIs(bound_engine.file_sources, stages.final)
+                raise host_fault
+
+            persistence.bind_engine_source = fail_final_bind
+            with self.assertRaises(RuntimeError) as caught:
+                engine.bind_file_sources(issued)
+            self.assertIs(caught.exception, host_fault)
+            self.assertIs(stages.post_4a850, stages.final)
+            self.assertIs(engine._metadata, stages.post_4a850.selected_metadata)
+            self.assertEqual(engine._wait_igoffon_by_file2026[:2], (10, 10))
+            self.assertIs(persistence.state.calibrations, previous_calibrations)
+            self.assertIs(persistence._engine, engine)
+            previous_persistence_state = persistence._snapshot()
+            with self.assertRaisesRegex(ValueError, "sealed after source failure"):
+                persistence.update_cpu(0)
+            self.assertEqual(persistence._snapshot(), previous_persistence_state)
+            self.assert_cold_fault_sealed(engine, admission, stages.post_4a850)
 
     def test_normal_actual_bytes_engine_and_padding(self):
         result = self.read()
@@ -84,6 +309,276 @@ class PublicFileTests(unittest.TestCase):
         issued = self.engine.file_sources
         assert issued is not None
         self.assertEqual((issued.table_files, issued.table_file_names), ((), ()))
+
+    def test_native_file_views_are_issued_for_current_only_and_group_tables(self):
+        from scripts.cuw_file_services import (
+            validate_file_group_view_2026,
+            validate_file_view_2026,
+        )
+
+        self.assertEqual(self.read().status, 0)
+        current_only = self.engine.file_sources
+        assert current_only is not None
+        current_view = current_only.admission_view2026()
+        self.assertEqual((current_view.kind, current_view.file_index), ("none", None))
+        self.assertIs(current_view, current_only.admission_view2026())
+        self.assertIs(current_view.metadata, self.engine.native_metadata)
+        validate_file_view_2026(current_view, current_only)
+        with self.assertRaisesRegex(ValueError, "actual.*FILE|index"):
+            current_only.file_view2026(0)
+
+        first = cuw(logical_text(209).replace("authored-new", "FIRST"))
+        second = cuw(logical_text(209).replace("authored-new", "SECOND"))
+        whole = cuw(logical_text(209).replace("authored-new", "WHOLE"))
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr(
+                "Setting.ini",
+                "[DeltaReproCalFile]\nFileNum=2\nFileName1=first.cuw\n"
+                "FileName2=second.cuw\n[WholeReproCalFile]\nFileName=whole.cuw\n",
+            )
+            bundle.writestr("first.cuw", first)
+            bundle.writestr("second.cuw", second)
+            bundle.writestr("whole.cuw", whole)
+        grouped = admit_file_sources_2026(
+            self.engine,
+            "input.scuw",
+            b"[Vehicle]\nContactType=P5-Unified\n[DataCompression]\n"
+            + archive.getvalue(),
+            region=1,
+        )
+        first_view = grouped.file_view2026(0)
+        second_view = grouped.file_view2026(1)
+        group = grouped.group_view2026(0)
+        assert group is not None
+        self.assertIs(first_view, grouped.file_view2026(0))
+        self.assertIs(group, grouped.group_view2026(1))
+        self.assertEqual((first_view.kind, first_view.group_start), ("part", 0))
+        self.assertEqual((second_view.kind, second_view.file_index), ("part", 1))
+        self.assertEqual((group.start, group.width), (0, 2))
+        self.assertEqual(group.members, (first_view, second_view))
+        self.assertEqual((group.whole.kind, group.whole.file_index), ("whole", 0))
+        self.assertEqual(group.whole.original_recovery_index, 0)
+        admission = grouped.admission_view2026()
+        self.assertEqual((admission.kind, admission.file_index), ("whole", 0))
+        validate_file_view_2026(first_view, grouped)
+        validate_file_group_view_2026(group, grouped)
+        with self.assertRaises(ValueError):
+            validate_file_view_2026(replace(first_view), grouped)
+        with self.assertRaises(ValueError):
+            validate_file_group_view_2026(replace(group), grouped)
+        with self.assertRaises(ValueError):
+            validate_file_view_2026(first_view, current_only)
+        with self.assertRaises(ValueError):
+            validate_file_group_view_2026(group, current_only)
+
+    def test_mode2_reset_issues_new_file_view_version(self):
+        from scripts.programming_2026_common import NativeRuntime2026
+        from tests.test_cuw_engine_worker import (
+            EngineWorker2026Tests,
+            calibration,
+            make_controller,
+        )
+
+        fixture = EngineWorker2026Tests()
+        fixture.setUp()
+        engine = fixture.engine(calibration(cpus=2))
+        self.addCleanup(engine.close)
+        part = calibration(first_target="PART")
+        whole = calibration(first_target="WHOLE")
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr(
+                "Setting.ini",
+                "[DeltaReproCalFile]\nFileNum=1\nFileName1=part.cuw\n"
+                "[WholeReproCalFile]\nFileName=whole.cuw\n",
+            )
+            archive.writestr("part.cuw", part)
+            archive.writestr("whole.cuw", whole)
+        source = (
+            b"[Vehicle]\nContactType=P5-Unified\n[DataCompression]\n"
+            + payload.getvalue()
+        )
+        issued = admit_file_sources_2026(
+            engine,
+            "input.json",
+            b'["group.scuw"]',
+            region=0,
+            source_files={"group.scuw": source},
+        )
+        engine.bind_file_sources(issued)
+        controller = make_controller(NativeRuntime2026(lambda *_: None))
+        worker = engine.bind_worker(controller)
+        old_view = issued.file_view2026(0)
+        with engine.controller_execution(controller, 2):
+            engine._select_worker_metadata(
+                issued.files[0], controller=controller, worker=worker
+            )
+            replacement = issued.after_group_reset(0, worker=worker)
+            engine._accept_worker_file_reset(issued, replacement, worker=worker)
+
+        replacement_view = replacement.file_view2026(0)
+        self.assertIsNot(replacement_view, old_view)
+        self.assertIs(replacement_view.sources, replacement)
+        self.assertEqual(
+            (replacement_view.kind, replacement_view.file_index), ("whole", 0)
+        )
+        from scripts.cuw_file_services import validate_file_view_2026
+
+        validate_file_view_2026(replacement_view, replacement)
+        with self.assertRaises(ValueError):
+            validate_file_view_2026(old_view, replacement)
+
+    def test_mode2_compaction_keeps_trailing_plain_and_following_mapped_group(self):
+        from scripts.programming_2026_common import NativeRuntime2026
+        from tests.test_cuw_engine_worker import (
+            EngineWorker2026Tests,
+            calibration,
+            make_controller,
+        )
+
+        fixture = EngineWorker2026Tests()
+        fixture.setUp()
+        engine = fixture.engine(calibration(cpus=2))
+        self.addCleanup(engine.close)
+
+        def group_archive(prefix):
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr(
+                    "Setting.ini",
+                    "[DeltaReproCalFile]\nFileNum=2\nFileName1=part1.cuw\n"
+                    "FileName2=part2.cuw\n[WholeReproCalFile]\nFileName=whole.cuw\n",
+                )
+                archive.writestr("part1.cuw", calibration(first_target=f"{prefix}1"))
+                archive.writestr("part2.cuw", calibration(first_target=f"{prefix}2"))
+                archive.writestr("whole.cuw", calibration(first_target=f"{prefix}W"))
+            return (
+                b"[Vehicle]\nContactType=P5-Unified\n[DataCompression]\n"
+                + payload.getvalue()
+            )
+
+        issued = admit_file_sources_2026(
+            engine,
+            "input.json",
+            b'["first.scuw","trailing.cuw","following.scuw"]',
+            region=0,
+            source_files={
+                "first.scuw": group_archive("A"),
+                "trailing.cuw": calibration(first_target="TRAILING"),
+                "following.scuw": group_archive("B"),
+            },
+        )
+        engine.bind_file_sources(issued)
+        self.assertEqual(issued.delta_map, ((0, 0), (1, 0), (3, 1), (4, 1)))
+        controller = make_controller(NativeRuntime2026(lambda *_: None))
+        worker = engine.bind_worker(controller)
+        with engine.controller_execution(controller, 2):
+            engine._select_worker_metadata(
+                issued.files[0], controller=controller, worker=worker
+            )
+            replacement = issued.after_group_reset(0, worker=worker)
+            engine._accept_worker_file_reset(issued, replacement, worker=worker)
+
+        self.assertEqual(replacement.delta_map, ((2, 1), (3, 1)))
+        trailing = replacement.file_view2026(1)
+        self.assertEqual((trailing.kind, trailing.group_start), ("plain", None))
+        self.assertIsNone(replacement.group_view2026(1))
+        following = replacement.group_view2026(2)
+        assert following is not None
+        self.assertEqual((following.start, following.width), (2, 2))
+
+    def test_zero_map_mode1_table_transform_clears_actual_source_table(self):
+        from scripts.cuw_file_services import _judge_group_table_replacement2026
+        from tests.test_cuw_engine_worker import EngineWorker2026Tests, calibration
+
+        fixture = EngineWorker2026Tests()
+        fixture.setUp()
+        engine = fixture.engine(calibration())
+        self.addCleanup(engine.close)
+        part1 = calibration(first_target="PART1")
+        part2 = calibration(first_target="PART2")
+        whole = calibration(first_target="WHOLE")
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr(
+                "Setting.ini",
+                "[DeltaReproCalFile]\nFileNum=2\nFileName1=part1.cuw\n"
+                "FileName2=part2.cuw\n[WholeReproCalFile]\nFileName=whole.cuw\n",
+            )
+            archive.writestr("part1.cuw", part1)
+            archive.writestr("part2.cuw", part2)
+            archive.writestr("whole.cuw", whole)
+        source = (
+            b"[Vehicle]\nContactType=P5-Unified\n[DataCompression]\n"
+            + payload.getvalue()
+        )
+        issued = admit_file_sources_2026(engine, "direct.scuw", source, region=0)
+        group = issued.group_view2026(0)
+        assert group is not None
+        self.assertTrue(issued.delta_archive)
+        self.assertEqual(issued.delta_map_size, 0)
+
+        replacement = _judge_group_table_replacement2026(issued, group)
+
+        self.assertIs(replacement.selected_metadata, issued.delta_groups[0][2])
+        self.assertIs(replacement.auxiliary_metadata, replacement.selected_metadata)
+        self.assertEqual(replacement.selected_source, whole)
+        self.assertEqual(replacement.selected_name, "whole.cuw")
+        self.assertEqual(
+            (
+                replacement.files,
+                replacement.file_sources,
+                replacement.file_names,
+                replacement.has_file_vector,
+            ),
+            ((), (), (), False),
+        )
+        self.assertIsNone(engine.file_sources)
+
+    def test_direct_mode1_factory_rejects_copied_current_a48_before_origin_use(self):
+        from scripts.programming_2026_common import NativeRuntime2026
+        from tests.test_cuw_engine_worker import (
+            EngineWorker2026Tests,
+            calibration,
+            make_controller,
+        )
+
+        fixture = EngineWorker2026Tests()
+        fixture.setUp()
+        engine = fixture.engine(calibration())
+        self.addCleanup(engine.close)
+        archive_payload = io.BytesIO()
+        with zipfile.ZipFile(archive_payload, "w") as archive:
+            archive.writestr(
+                "Setting.ini",
+                "[DeltaReproCalFile]\nFileNum=2\nFileName1=part1.cuw\n"
+                "FileName2=part2.cuw\n[WholeReproCalFile]\nFileName=whole.cuw\n",
+            )
+            archive.writestr("part1.cuw", calibration(first_target="PART1"))
+            archive.writestr("part2.cuw", calibration(first_target="PART2"))
+            archive.writestr("whole.cuw", calibration(first_target="WHOLE"))
+        source = (
+            b"[Vehicle]\nContactType=P5-Unified\n[DataCompression]\n"
+            + archive_payload.getvalue()
+        )
+        issued = admit_file_sources_2026(engine, "direct.scuw", source, region=0)
+        engine.bind_file_sources(issued)
+        controller = make_controller(NativeRuntime2026(lambda *_: None))
+        worker = engine.bind_worker(controller)
+        current_a48 = issued.admission_view2026()
+        self.assertEqual((current_a48.kind, current_a48.file_index), ("whole", 0))
+        old_files = issued.files
+        old_recovery = issued.recovery_sources()
+
+        with engine.controller_execution(controller, 1), self.assertRaises(ValueError):
+            issued._after_judge_direct_reset_4b900_2026(
+                replace(current_a48), worker=worker, origin=object()
+            )
+
+        self.assertIs(engine.file_sources, issued)
+        self.assertEqual(issued.files, old_files)
+        self.assertEqual(issued.recovery_sources(), old_recovery)
 
     def test_public_usb_original_bytes_retain_native_trailer_source(self):
         from scripts.calibration_2026 import (
@@ -412,8 +907,9 @@ class PublicFileTests(unittest.TestCase):
         self.assertEqual(issued.selected_name, "Whole.Cuw")
         self.assertEqual(issued.delta_map, ())
         self.assertTrue(issued.current_is_retained_clone)
+        mapped_engine = self.frontend_engine()
         mapped = admit_file_sources_2026(
-            self.engine,
+            mapped_engine,
             "input.json",
             b'["part.scuw"]',
             region=0,
@@ -689,34 +1185,202 @@ class PublicFileTests(unittest.TestCase):
             self.read(2, date_formatter=lambda parts: b"captured")
         self.assertIs(caught.exception, host_fault)
 
-    def frontend_engine(self):
-        from scripts.programming_2026_common import NativeFrontendParameters2026
-
-        parameters = NativeFrontendParameters2026.from_sources(
-            {
-                "Parameter.ini": table(
-                    (
-                        "ParamFileKeySystemProtocolMicon",
-                        "EngineTypeFlag",
-                        "FlagToOutputAllAttachedInformation",
-                    ),
-                    (("P5-Unified", "0", "1"), ("Phase6", "0", "1")),
-                ),
-                "CanIDTable.ini": table(
-                    ("RequestCANID", "CalibrationType"),
-                    (("0700", "31"), ("0701", "32")),
-                ),
-                "LogicalAddressTable.ini": table(
-                    ("LogicalAddress", "CalibrationType"), (("01", "41"),)
-                ),
-            },
-            encoded=False,
-        )
+    def frontend_engine(self, *, include_empty_can_id=False, omit_general_key=None):
         engine = CUWEngine2026(Path("runtime/no-car-21/recovered/CUW.dll").read_bytes())
-        engine.bind_frontend_parameters(parameters)
+        engine.bind_frontend_parameters(
+            self.frontend_parameters(
+                include_empty_can_id=include_empty_can_id,
+                omit_general_key=omit_general_key,
+            )
+        )
         engine.configure(struct.pack("<IIddII", 4, 0, 0, 0, 0, 0))
         self.addCleanup(engine.close)
         return engine
+
+    @staticmethod
+    def frontend_parameters(
+        *,
+        include_p5_base=True,
+        include_empty_can_id=False,
+        omit_general_key=None,
+    ):
+        from scripts.programming_2026_common import NativeFrontendParameters2026
+
+        headers = (
+            "ParamFileKeySystemProtocolMicon",
+            "EngineTypeFlag",
+            "FlagToOutputAllAttachedInformation",
+            "CalibrationType",
+            "WaitTimeForIGOFFON",
+            "WaitTimeAfterBatteryDisconnected",
+            "WaitTimeAfterBatteryConnected",
+            "BatteryVoltageUpperThreshold",
+        )
+        rows = (
+            ("149CAN", "1", "0", "27", "10", "20", "30", "12000"),
+            ("149CAN311", "1", "0", "27", "10", "20", "30", "12000"),
+            ("149P5-Unified", "0", "1", "27", "10", "20", "30", "12000"),
+            ("149P5-Unified311", "0", "1", "27", "10", "20", "30", "12000"),
+            ("P5-Unified", "0", "1", "27", "10", "20", "30", "12000"),
+            ("Phase6", "0", "1", "27", "10", "20", "30", "12000"),
+        )
+        selected_columns = tuple(
+            index for index, name in enumerate(headers) if name != omit_general_key
+        )
+        can_id_rows = [("0700", "31"), ("0701", "32")]
+        if include_empty_can_id:
+            can_id_rows.append(("", "33"))
+        catalog = {
+            "Parameter.ini": table(
+                tuple(headers[index] for index in selected_columns),
+                tuple(tuple(row[index] for index in selected_columns) for row in rows),
+            ),
+            "CanIDTable.ini": table(
+                ("RequestCANID", "CalibrationType"),
+                tuple(can_id_rows),
+            ),
+            "LogicalAddressTable.ini": table(
+                ("LogicalAddress", "CalibrationType"), (("01", "41"),)
+            ),
+            "P5-Unified03.ini": b"",
+        }
+        if include_p5_base:
+            # An empty captured base resource is present to native490b0.
+            catalog["P5-Unified.ini"] = b""
+        return NativeFrontendParameters2026.from_sources(catalog, encoded=False)
+
+    def test_raw_p5_spec02_requires_present_empty_base_resource(self):
+        source = cuw(
+            "[Format]\nVersion=209\n[Vehicle]\nNumberOfNode=1\n"
+            "ContactType=P5-Unified\nKindOfECU=149\n[Node01]\n"
+            "RequiredSpecReproVer=02\nNumberOfCalibration=1\nDiagID=0700\n"
+            "[CPU11]\nCPUImageName=cpu.vbf\nNewCID=CPU\nCPUType=311\n"
+        )
+        for include_base in (False, True):
+            with self.subTest(include_base=include_base):
+                engine = CUWEngine2026(
+                    Path("runtime/no-car-21/recovered/CUW.dll").read_bytes()
+                )
+                self.addCleanup(engine.close)
+                engine.bind_frontend_parameters(
+                    self.frontend_parameters(include_p5_base=include_base)
+                )
+                engine.configure(struct.pack("<IIddII", 4, 0, 0, 0, 0, 0))
+                issued = admit_file_sources_2026(
+                    engine,
+                    "actual.json",
+                    b'["one.cuw"]',
+                    region=0,
+                    source_files={"one.cuw": source},
+                )
+                if not include_base:
+                    with self.assertRaises(NativePassThruException2026) as caught:
+                        engine.bind_file_sources(issued)
+                    self.assertEqual(
+                        (
+                            caught.exception.error,
+                            caught.exception.source,
+                            caught.exception.line,
+                        ),
+                        (
+                            9999,
+                            "C:\\Shimojo\\local\\CUW.dll\\V1.15.0.3(\x83r\x83\x8b\x83h\x97p)\\CUW\\CUW\\CPassThruCtrlr.cpp",
+                            0x3719,
+                        ),
+                    )
+                    self.assertIsNone(engine.file_sources)
+                    self.assertIsNone(engine._metadata)
+                    self.assertIsNone(engine._wait_active_admission2026)
+                    self.assertIsNotNone(engine._wait_admission_stage2026)
+                    self.assertIsNotNone(engine._wait_admission_cursor2026)
+                    self.assertEqual(
+                        tuple(
+                            engine.native_wait_time_for_igoffon2026(selector)
+                            for selector in (1, 2, 3)
+                        ),
+                        (0, 0, 0),
+                    )
+                else:
+                    engine.bind_file_sources(issued)
+                    self.assertIs(engine.file_sources, issued)
+                    self.assertIs(
+                        engine._wait_active_admission2026,
+                        issued._wait_timing_admission2026,
+                    )
+                    self.assertEqual(
+                        tuple(
+                            engine.native_wait_time_for_igoffon2026(selector)
+                            for selector in (1, 2, 3)
+                        ),
+                        (10, 20, 30),
+                    )
+
+    def test_public_raw_callback_lookup_failure_returns_generic_native_status(self):
+        engine = self.frontend_engine(omit_general_key="BatteryVoltageUpperThreshold")
+        member = cuw(
+            logical_text(209)
+            .replace("[Node01]", "[Node01]\nDiagID=0700")
+            .replace("authored-new", "WHOLE")
+        )
+        compressed = self.archive(
+            b"[Vehicle]\nNumberOfCalibration=1\n[CPU01]\nNewCID=WHOLE\n",
+            (("WHOLE-file.cuw", member),),
+        )
+        events = []
+        engine.set_log_function(
+            file_logger_2026(
+                engine,
+                Path("runtime/no-car-21/recovered/CUW.dll").read_bytes(),
+                lambda *event: events.append(event),
+                to_wide=lambda value: value.decode("ascii"),
+            )
+        )
+        result = read_reprogramming_data_file_2026(
+            engine,
+            compressed,
+            1,
+            1,
+            self.header,
+            self.rows,
+            source_name="missing-wait-key.cuwc",
+        )
+        self.assertEqual(
+            (result.status, result.header, result.cpus),
+            (1001, self.header, self.rows),
+        )
+        self.assertEqual(events[-1], (300, 3002, 2, "CUW.dll", "3"))
+        issued = engine.file_sources
+        self.assertIsNone(issued)
+        self.assertIsNone(engine._metadata)
+        stage = engine._wait_admission_stage2026
+        self.assertIsNotNone(stage)
+        self.assertIsNotNone(engine._wait_admission_cursor2026)
+        assert isinstance(stage, tuple)
+        admission = stage[0]
+        self.assertTrue(admission._consumed)
+        self.assertIsNone(engine._wait_active_admission2026)
+        with self.assertRaisesRegex(ValueError, "sealed after source failure"):
+            engine.bind_worker(object())
+        with self.assertRaisesRegex(ValueError, "sealed after source failure"):
+            engine.bind_file_sources(admission.sources)
+        with self.assertRaisesRegex(ValueError, "sealed after source failure"):
+            engine.read_reprogramming_data_file(
+                compressed,
+                1,
+                1,
+                self.header,
+                self.rows,
+                source_name="retry.cuwc",
+            )
+        with self.assertRaisesRegex(ValueError, "sealed after source failure"):
+            engine.bind_persistence(object())
+        with self.assertRaisesRegex(ValueError, "sealed after source failure"):
+            engine.judge_flashable(1)
+        engine.close()
+        self.assertIsNone(engine._wait_admission_stage2026)
+        self.assertIsNone(engine._wait_admission_cursor2026)
+        self.assertIsNone(engine._wait_pending_admission2026)
+        self.assertIsNone(engine._wait_active_admission2026)
 
     def test_public_multifile_bytes_reach_engine_and_actual_serializers(self):
         engine = self.frontend_engine()
@@ -753,6 +1417,15 @@ class PublicFileTests(unittest.TestCase):
         self.assertIs(engine.native_metadata, engine.file_sources.selected_metadata)
         self.assertEqual(engine.file_sources.file_names, ("one.cuw", "two.cuw"))
         self.assertEqual(engine.native_metadata.region, 1)
+        admission = engine.file_sources._wait_timing_admission2026
+        self.assertTrue(admission._consumed)
+        self.assertIs(engine._wait_active_admission2026, admission)
+        self.assertEqual(
+            tuple(
+                engine.native_wait_time_for_igoffon2026(index) for index in (1, 2, 3)
+            ),
+            (10, 20, 30),
+        )
 
     def test_public_delta_whole_output_uses_actual_delta_compliance(self):
         engine = self.frontend_engine()
@@ -790,6 +1463,15 @@ class PublicFileTests(unittest.TestCase):
         assert engine.file_sources is not None
         self.assertIs(engine.native_metadata, engine.file_sources.output_files[0])
         self.assertIsNot(engine.native_metadata, engine.file_sources.files[0])
+        admission = engine.file_sources._wait_timing_admission2026
+        self.assertTrue(admission._consumed)
+        self.assertIs(engine._wait_active_admission2026, admission)
+        self.assertEqual(
+            tuple(
+                engine.native_wait_time_for_igoffon2026(index) for index in (1, 2, 3)
+            ),
+            (10, 20, 30),
+        )
         previous = engine.native_metadata
         events = []
         engine.set_log_function(
@@ -875,6 +1557,45 @@ class PublicFileTests(unittest.TestCase):
         self.assertIs(engine.source_container, issued.selected_source)
         self.assertNotEqual(result.source_sha256[0], issued.admission_sha256)
         self.assertEqual(issued.admission_source, b'["left.cuw","right.cuw"]')
+        admission = issued._wait_timing_admission2026
+        assert admission is not None
+        stages = admission.table_stages
+        self.assertIs(stages.final, issued)
+        self.assertIsNot(stages.initial, stages.post_4a850)
+        self.assertIsNone(stages.post_67c60)
+        self.assertIs(engine.file_sources, stages.final)
+        transform = admission.phase6_transform
+        assert transform is not None
+        self.assertEqual(transform.raw_names, ("left.cuw", "right.cuw"))
+        self.assertEqual(transform.raw_sources, (left, right))
+        self.assertEqual(len(transform.edges), 1)
+        edge = transform.edges[0]
+        self.assertEqual(edge[:3], (0, 0, 1))
+        self.assertIs(edge[3], transform.raw_files[0])
+        self.assertIs(edge[4], transform.raw_files[1])
+        self.assertIs(edge[5], issued.selected_metadata)
+        self.assertEqual(edge[6:10], ("left.cuw", left, "right.cuw", right))
+        initial_selection = next(
+            step for step in admission.steps if step.operation == "32ff0"
+        )
+        self.assertIs(initial_selection.sources[0].metadata, transform.raw_files[0])
+        self.assertEqual(initial_selection.sources[0].source, left)
+        self.assertEqual(initial_selection.sources[0].source_name, "left.cuw")
+        self.assertIsNone(transform.mapped_reorder)
+        self.assertEqual(transform.post_4a850_files, (issued.selected_metadata,))
+        self.assertIs(stages.post_4a850, issued)
+        self.assertEqual(stages.initial.files, transform.raw_files)
+        self.assertIs(stages.initial.selected_metadata, transform.raw_files[0])
+        self.assertEqual(stages.initial.file_names, transform.raw_names)
+        self.assertIs(stages.post_4a850.selected_metadata, issued.selected_metadata)
+        self.assertEqual(stages.post_4a850.file_names, transform.post_4a850_names)
+        self.assertIs(engine._wait_active_admission2026, admission)
+        self.assertEqual(
+            tuple(engine.native_wait_time_for_igoffon2026(i) for i in (1, 2, 3)),
+            (10, 20, 30),
+        )
+        self.assertEqual(engine._wait_igoffon_by_file2026[0], 10)
+        self.assertEqual(engine._wait_igoffon_by_file2026[1], 10)
         for index, expected in enumerate((b"LEFT", b"RGHT")):
             metadata = native2026_metadata_for_cpu(engine.native_metadata, index)
             self.assertEqual(issued.recovery_index_for_metadata(metadata), 0)
@@ -913,6 +1634,223 @@ class PublicFileTests(unittest.TestCase):
         self.assertEqual(result.header, self.header)
         self.assertEqual(result.cpus, self.rows)
         self.assertIsNone(engine.file_sources)
+
+    def test_phase6_timing_transform_keeps_original_slots_for_merge_chain(self):
+        engine = self.frontend_engine()
+
+        def calibration(cid, slot):
+            return cuw(
+                logical_text(209, slot=slot)
+                .replace("P5-Unified", "Phase6")
+                .replace("[Node01]", "[Node01]\nDiagID=0700\nLogicalAddress=01")
+                .replace("authored-new", cid)
+            )
+
+        raw = (
+            calibration("FIRST", 1),
+            calibration("SECOND", 2),
+            calibration("THIRD", 3),
+        )
+        output_rows = (*self.rows, b"W" * 0xBBAC)
+        result = engine.read_reprogramming_data_file(
+            b'["first.cuw","second.cuw","third.cuw"]',
+            1,
+            1,
+            self.header,
+            output_rows,
+            source_name="input.json",
+            source_files=dict(zip(("first.cuw", "second.cuw", "third.cuw"), raw)),
+        )
+        self.assertEqual(result.status, 0)
+        issued = engine.file_sources
+        assert issued is not None
+        admission = issued._wait_timing_admission2026
+        assert admission is not None
+        transform = admission.phase6_transform
+        assert transform is not None
+        self.assertEqual(transform.raw_names, ("first.cuw", "second.cuw", "third.cuw"))
+        self.assertEqual(len(transform.edges), 2)
+        first, second = transform.edges
+        self.assertEqual(first[:3], (0, 0, 1))
+        self.assertEqual(second[:3], (1, 0, 2))
+        self.assertIs(first[3], transform.raw_files[0])
+        self.assertIs(first[4], transform.raw_files[1])
+        self.assertIs(second[3], first[5])
+        self.assertIs(second[4], transform.raw_files[2])
+        self.assertIs(second[7], first[5].source_container)
+        self.assertIs(issued.selected_metadata, second[5])
+        self.assertEqual(transform.post_4a850_names, ("first.cuw",))
+        self.assertEqual(
+            tuple(engine._wait_igoffon_by_file2026[index] for index in range(3)),
+            (10, 10, 10),
+        )
+        self.assertEqual(engine._wait_igoffon_aggregate2026, 10)
+
+    def test_phase6_cuwc_initial_false_selection_uses_raw_member(self):
+        engine = self.frontend_engine()
+        member = cuw(
+            logical_text(209)
+            .replace("P5-Unified", "Phase6")
+            .replace("[Node01]", "[Node01]\nDiagID=0700\nLogicalAddress=01")
+        )
+        compressed = self.archive(
+            b"[Vehicle]\nNumberOfCalibration=1\n[CPU01]\nNewCID=WHOLE\n",
+            (("WHOLE-file.cuw", member),),
+        )
+        result = engine.read_reprogramming_data_file(
+            compressed,
+            1,
+            1,
+            self.header,
+            self.rows,
+            source_name="direct.cuwc",
+        )
+        self.assertEqual(result.status, 0)
+        issued = engine.file_sources
+        assert issued is not None
+        admission = issued._wait_timing_admission2026
+        assert admission is not None
+        self.assertEqual(
+            (admission.steps[-1].operation, admission.steps[-1].value), ("32ff0", False)
+        )
+        self.assertIs(admission.steps[-1].sources[0].metadata, issued.files[0])
+        self.assertEqual(admission.steps[-1].sources[0].source, member)
+        transform = admission.phase6_transform
+        assert transform is not None
+        self.assertEqual(transform.raw_names, ("WHOLE-file.cuw",))
+        self.assertEqual(transform.edges, ())
+        self.assertIsNone(transform.mapped_reorder)
+        self.assertIs(engine._wait_active_admission2026, admission)
+
+    def test_mapped_phase6_68190_fault_retains_post_reorder_table(self):
+        for empty_keys in (False, True):
+            with self.subTest(empty_keys=empty_keys):
+                engine = self.frontend_engine(include_empty_can_id=empty_keys)
+                diag_id = "" if empty_keys else "0700"
+                address = "" if empty_keys else "01"
+
+                def calibration(cid, diag_id=diag_id, address=address):
+                    return cuw(
+                        logical_text(209)
+                        .replace("P5-Unified", "Phase6")
+                        .replace(
+                            "[Node01]",
+                            f"[Node01]\nDiagID={diag_id}\nLogicalAddress={address}",
+                        )
+                        .replace("authored-new", cid)
+                    )
+
+                archive = self.archive(
+                    b"[Vehicle]\nContactType=Phase6\n",
+                    (
+                        (
+                            "Setting.ini",
+                            (
+                                b"[DeltaReproCalFile]\nFileNum=1\nFileName1=part.cuw\n"
+                                b"[WholeReproCalFile]\nFileName=whole.cuw\n"
+                            ),
+                        ),
+                        ("part.cuw", calibration("PART")),
+                        ("whole.cuw", calibration("WHOLE")),
+                    ),
+                )
+                result = engine.read_reprogramming_data_file(
+                    b'["group.scuw","plain.cuw"]',
+                    1,
+                    1,
+                    self.header,
+                    self.rows,
+                    source_name="input.json",
+                    source_files={
+                        "group.scuw": archive,
+                        "plain.cuw": calibration("PLAIN"),
+                    },
+                )
+                self.assertEqual(result.status, 1001)
+                issued = engine.file_sources
+                assert issued is not None
+                admission = issued._wait_timing_admission2026
+                assert admission is not None
+                transform = admission.phase6_transform
+                assert transform is not None
+                reorder = transform.mapped_reorder
+                assert reorder is not None
+                published = engine.file_sources
+                self.assertIs(published, admission.table_stages.post_67c60)
+                assert published is not None
+                self.assertEqual(published.file_names, reorder.post_67c60_names)
+                self.assertIs(
+                    engine._wait_current_pointer_metadata2026,
+                    admission.table_stages.initial.selected_metadata,
+                )
+                self.assertIs(engine._wait_active_admission2026, None)
+                self.assertTrue(admission._consumed)
+                self.assertIsNone(engine._phase6_second_select2026)
+
+    def test_mapped_phase6_late_unmapped_row_is_native_invalid_map_fault(self):
+        engine = self.frontend_engine()
+
+        def calibration(cid, contact, diag_id, address):
+            return cuw(
+                logical_text(209)
+                .replace("P5-Unified", contact)
+                .replace(
+                    "[Node01]",
+                    f"[Node01]\nDiagID={diag_id}\nLogicalAddress={address}",
+                )
+                .replace("authored-new", cid)
+            )
+
+        mapped_archive = self.archive(
+            b"[Vehicle]\nContactType=Phase6\n",
+            (
+                (
+                    "Setting.ini",
+                    (
+                        b"[DeltaReproCalFile]\nFileNum=1\nFileName1=mapped-part.cuw\n"
+                        b"[WholeReproCalFile]\nFileName=mapped-whole.cuw\n"
+                    ),
+                ),
+                ("mapped-part.cuw", calibration("MAPPED-PART", "Phase6", "0701", "02")),
+                (
+                    "mapped-whole.cuw",
+                    calibration("MAPPED-WHOLE", "Phase6", "0701", "02"),
+                ),
+            ),
+        )
+        unmapped_phase6 = calibration("U", "Phase6", "0700", "01")
+        unmapped_p5 = calibration("V", "P5-Unified", "0700", "01")
+        result = engine.read_reprogramming_data_file(
+            b'["u.cuw","v.cuw","mapped.scuw"]',
+            1,
+            1,
+            self.header,
+            self.rows,
+            source_name="input.json",
+            source_files={
+                "u.cuw": unmapped_phase6,
+                "v.cuw": unmapped_p5,
+                "mapped.scuw": mapped_archive,
+            },
+        )
+        self.assertEqual(result.status, 1001)
+        issued = engine.file_sources
+        assert issued is not None
+        admission = issued._wait_timing_admission2026
+        assert admission is not None
+        transform = admission.phase6_transform
+        assert transform is not None
+        reorder = transform.mapped_reorder
+        assert reorder is not None
+        published = engine.file_sources
+        self.assertIs(published, admission.table_stages.post_67c60)
+        assert published is not None
+        self.assertEqual(published.file_names, reorder.post_67c60_names)
+        self.assertIs(
+            engine._wait_current_pointer_metadata2026,
+            admission.table_stages.initial.selected_metadata,
+        )
+        self.assertIsNone(engine._phase6_second_select2026)
 
     def test_public_composite_projects_actual_node_sources_without_multi_flag(self):
         from scripts.calibration_2026 import NativeNodeSource2026
@@ -994,6 +1932,25 @@ class PublicFileTests(unittest.TestCase):
                 ("whole.cuw", calibration("WHOLE", "01")),
             ),
         )
+        original_selector = engine._select_frontend_parameters_41940_2026
+        wrong_stage_rejected = []
+
+        def observe_selector(metadata):
+            stage = engine._wait_admission_stage2026
+            if type(stage) is tuple and len(stage) == 5 and stage[2] == "32ff0":
+                admission = stage[0]
+                prior_sources = engine.file_sources
+                prior_pointer = engine._wait_current_pointer_metadata2026
+                with self.assertRaises(ValueError):
+                    engine._publish_cold_file_table_2026(
+                        admission.table_stages.final, admission=admission
+                    )
+                self.assertIs(engine.file_sources, prior_sources)
+                self.assertIs(engine._wait_current_pointer_metadata2026, prior_pointer)
+                wrong_stage_rejected.append(admission)
+            return original_selector(metadata)
+
+        engine._select_frontend_parameters_41940_2026 = observe_selector
         result = engine.read_reprogramming_data_file(
             b'["group.scuw","plain.cuw"]',
             1,
@@ -1025,7 +1982,50 @@ class PublicFileTests(unittest.TestCase):
         )
         self.assertIs(issued.selected_metadata, issued.files[0])
         self.assertIsNone(issued.auxiliary_metadata)
-        self.assertEqual(issued.group_for_file(1)[:2], (1, 1))
+        admission = issued._wait_timing_admission2026
+        assert admission is not None
+        self.assertTrue(wrong_stage_rejected)
+        self.assertIs(wrong_stage_rejected[0], admission)
+        transform = admission.phase6_transform
+        assert transform is not None
+        self.assertEqual(transform.raw_names, ("part.cuw", "plain.cuw"))
+        self.assertEqual(transform.post_4a850_names, ("part.cuw", "plain.cuw"))
+        stages = admission.table_stages
+        self.assertIs(stages.final, issued)
+        self.assertIsNot(stages.initial, stages.post_4a850)
+        self.assertIsNot(stages.post_4a850, stages.post_67c60)
+        self.assertIsNot(stages.post_67c60, stages.final)
+        self.assertEqual(stages.initial.file_names, transform.raw_names)
+        self.assertEqual(stages.post_4a850.file_names, transform.post_4a850_names)
+        reorder = transform.mapped_reorder
+        assert reorder is not None
+        self.assertEqual(stages.post_67c60.file_names, reorder.post_67c60_names)
+        self.assertIs(
+            stages.post_67c60.selected_metadata, stages.initial.selected_metadata
+        )
+        self.assertIs(stages.final.selected_metadata, issued.selected_metadata)
+        self.assertIs(reorder.post_4a850_files, transform.post_4a850_files)
+        self.assertIs(reorder.post_4a850_names, transform.post_4a850_names)
+        self.assertIs(reorder.post_4a850_sources, transform.post_4a850_sources)
+        self.assertEqual(reorder.post_67c60_names, ("plain.cuw", "part.cuw"))
+        self.assertEqual(reorder.second_select[:2], (0, True))
+        self.assertIs(reorder.second_select[2], issued.selected_metadata)
+        self.assertIs(reorder.second_select[3], issued.selected_source)
+        self.assertEqual(reorder.second_select[4], issued.selected_name)
+        prior_sources = engine.file_sources
+        prior_pointer = engine._wait_current_pointer_metadata2026
+        with self.assertRaises(ValueError):
+            engine._publish_cold_file_table_2026(
+                admission.table_stages.initial, admission=admission
+            )
+        self.assertIs(engine.file_sources, prior_sources)
+        self.assertIs(engine._wait_current_pointer_metadata2026, prior_pointer)
+        initial = next(step for step in admission.steps if step.operation == "32ff0")
+        self.assertEqual(initial.sources[0].source_name, "whole.cuw")
+        self.assertIs(initial.sources[0].metadata, issued.delta_groups[0][2])
+        file_group = issued.group_for_file(1)
+        assert file_group is not None
+        self.assertEqual(file_group[:2], (1, 1))
         rejected = engine.read_reprogramming_data_file(
             b'["group.scuw","plain.cuw"]',
             1,
@@ -1113,6 +2113,117 @@ class PublicFileTests(unittest.TestCase):
             )
         self.assertEqual((missing.exception.error, missing.exception.line), (6, 0x330F))
         self.assertIsNone(self.engine.source_sha256)
+
+    def test_cold_wait_trajectory_preserves_native_route_order_and_arguments(self):
+        part = cuw(
+            logical_text(209)
+            .replace("[Node01]", "[Node01]\nDiagID=0701")
+            .replace("authored-new", "PART")
+        )
+        whole = cuw(
+            logical_text(209)
+            .replace("[Node01]", "[Node01]\nDiagID=0700")
+            .replace("authored-new", "WHOLE")
+        )
+        archive = self.archive(
+            b"[Vehicle]\nContactType=P5-Unified\n",
+            (
+                (
+                    "Setting.ini",
+                    (
+                        b"[DeltaReproCalFile]\nFileNum=1\nFileName1=part.cuw\n"
+                        b"[WholeReproCalFile]\nFileName=whole.cuw\n"
+                    ),
+                ),
+                ("part.cuw", part),
+                ("whole.cuw", whole),
+            ),
+        )
+
+        direct_engine = self.frontend_engine()
+        direct = admit_file_sources_2026(
+            direct_engine, "direct.scuw", archive, region=0
+        )
+        direct_steps = direct._wait_timing_admission2026.steps
+        direct_stages = direct._wait_timing_admission2026.table_stages
+        self.assertIs(direct_stages.initial, direct)
+        self.assertIs(direct_stages.final, direct)
+        self.assertIsNone(direct_stages.post_4a850)
+        self.assertIsNone(direct_stages.post_67c60)
+        self.assertEqual(direct_stages.initial.files, (direct.files[0],))
+        self.assertEqual(
+            direct_stages.initial.output_files, (direct.delta_groups[0][2],)
+        )
+        self.assertIs(
+            direct_stages.initial.selected_metadata, direct.delta_groups[0][2]
+        )
+        self.assertEqual(direct.admission_view2026().kind, "whole")
+        self.assertEqual(
+            tuple(step.operation for step in direct_steps),
+            ("46010", "43cd0", "32130", "41940"),
+        )
+        self.assertEqual(
+            tuple(row.source_name for row in direct_steps[1].sources), ("part.cuw",)
+        )
+        self.assertIs(direct_steps[2].sources[0].metadata, direct.delta_groups[0][2])
+        self.assertIs(direct_steps[3].sources[0].metadata, direct.delta_groups[0][2])
+
+        json_engine = self.frontend_engine()
+        listed = admit_file_sources_2026(
+            json_engine,
+            "input.json",
+            b'["group.scuw","plain.cuw"]',
+            region=0,
+            source_files={
+                "group.scuw": archive,
+                "plain.cuw": whole,
+            },
+        )
+        json_steps = listed._wait_timing_admission2026.steps
+        self.assertEqual(
+            tuple(step.operation for step in json_steps),
+            ("46010", "32130", "43cd0", "32ff0"),
+        )
+        self.assertEqual(
+            tuple(row.source_name for row in json_steps[2].sources),
+            ("part.cuw", "plain.cuw"),
+        )
+        self.assertEqual((json_steps[-1].slot, json_steps[-1].value), (0, True))
+        copied = replace(listed)
+        self.assertIs(
+            copied._wait_timing_admission2026,
+            listed._wait_timing_admission2026,
+        )
+        with self.assertRaises(ValueError):
+            validate_file_sources_2026(copied, json_engine)
+
+        compressed_engine = self.frontend_engine()
+        compressed = self.archive(
+            b"[Vehicle]\nNumberOfCalibration=1\n[CPU01]\nNewCID=WHOLE\n",
+            (("WHOLE-file.cuw", whole),),
+        )
+        result = read_reprogramming_data_file_2026(
+            compressed_engine,
+            compressed,
+            1,
+            1,
+            self.header,
+            self.rows,
+            source_name="direct.cuwc",
+        )
+        self.assertEqual(result.status, 0)
+        cuwc = compressed_engine.file_sources
+        assert cuwc is not None
+        cuwc_steps = cuwc._wait_timing_admission2026.steps
+        self.assertEqual(
+            tuple(step.operation for step in cuwc_steps), ("43cd0", "32ff0")
+        )
+        self.assertEqual((cuwc_steps[-1].slot, cuwc_steps[-1].value), (0, False))
+        self.assertTrue(cuwc._wait_timing_admission2026._consumed)
+        self.assertIs(
+            compressed_engine._wait_active_admission2026,
+            cuwc._wait_timing_admission2026,
+        )
 
     @staticmethod
     def archive(header, members):

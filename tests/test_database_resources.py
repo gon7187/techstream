@@ -1524,7 +1524,19 @@ class NativeRamTests(unittest.TestCase):
             self.assertEqual(len(header_rows), 1)
             key_cycle = header_rows[0]
             self.assertEqual(
-                key_cycle,
+                {
+                    key: key_cycle[key]
+                    for key in (
+                        "source_path",
+                        "key_cycle_raw",
+                        "key_cycle_precision_raw",
+                        "key_cycle_invalidity_raw",
+                        "key_cycle_display",
+                        "key_cycle_value_source_path",
+                        "key_cycle_precision_source_path",
+                        "key_cycle_invalidity_source_path",
+                    )
+                },
                 {
                     "source_path": pair_path,
                     "key_cycle_raw": 4,
@@ -1536,6 +1548,50 @@ class NativeRamTests(unittest.TestCase):
                     "key_cycle_invalidity_source_path": pair_path + [1, 10],
                 },
             )
+            self.assertEqual(
+                main_info[5][1], 12
+            )  # Nonzero divisor keeps coordinates open.
+            coordinate_plan = key_cycle["sequence_coordinate_plan"]
+            self.assertEqual(
+                coordinate_plan,
+                {
+                    "scope": "normal-ddr-id3-pre-sort",
+                    "status": "source-semantics-open",
+                    "points": None,
+                    "inputs_raw": {
+                        "count_a": main_info[6],
+                        "count_b": main_info[7],
+                        "divisor": 12,
+                        "sample_count": len(main_info[24][7]),
+                        **{
+                            f"mask{slot}": list(validity[slot])
+                            for slot in (0, 1, 19, 20, 21)
+                        },
+                    },
+                    "input_source_paths": {
+                        "count_a": pair_path + [0, 6],
+                        "count_b": pair_path + [0, 7],
+                        "divisor": pair_path + [0, 5, 1],
+                        "sample_count": pair_path + [0, 24, 7],
+                        **{
+                            f"mask{slot}": pair_path + [1, slot]
+                            for slot in (0, 1, 19, 20, 21)
+                        },
+                    },
+                },
+            )
+            for key, source_path in coordinate_plan["input_source_paths"].items():
+                value = decoded.records
+                for index in source_path:
+                    value = value[index]
+                expected_value = (
+                    len(value)
+                    if key == "sample_count"
+                    else list(value)
+                    if key.startswith("mask")
+                    else value
+                )
+                self.assertEqual(expected_value, coordinate_plan["inputs_raw"][key])
 
             for raw_name, source_name in (
                 ("key_cycle_raw", "key_cycle_value_source_path"),

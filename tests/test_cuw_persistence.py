@@ -53,6 +53,56 @@ def state(multi=False):
 
 
 class PersistenceTests(unittest.TestCase):
+    def test_engine_owner_is_associated_before_loaded_source_validation(self):
+        from scripts.cuw_2026 import CUWEngine2026
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        with tempfile.TemporaryDirectory() as root:
+            persistence = CUWPersistence(Path(root), state())
+            with CUWEngine2026(image.read_bytes()) as engine:
+                engine.bind_persistence(persistence)
+                self.assertIs(engine.persistence, persistence)
+                self.assertIs(persistence._engine, engine)
+                with self.assertRaisesRegex(
+                    ValueError, "Load CUW before validating persistence source"
+                ):
+                    persistence.bind_engine_source(engine)
+                self.assertIs(persistence._engine, engine)
+
+    def test_file_source_association_separates_original_index_from_live_flow(self):
+        from scripts.cuw_file_services import admit_file_sources_2026
+        from tests.test_cuw_engine_worker import EngineWorker2026Tests, calibration
+
+        raw = calibration(cpus=2)
+        fixture = EngineWorker2026Tests("runTest")
+        engine = fixture.engine(raw)
+        self.addCleanup(engine.close)
+        with tempfile.TemporaryDirectory() as root:
+            info = ReproInfoState(
+                (RecoveryCalibration("direct.cuw", raw),),
+            )
+            persistence = CUWPersistence(Path(root), info)
+            engine.bind_persistence(persistence)
+            sources = admit_file_sources_2026(engine, "direct.cuw", raw, region=0)
+            engine.bind_file_sources(sources)
+            self.assertEqual(
+                sources.recovery_index_for_metadata(engine.native_metadata), 0
+            )
+
+            info.calibration_file_index = 1
+            with self.assertRaisesRegex(ValueError, "Recovery file index"):
+                persistence.validate_file_source_association(
+                    sources, engine.native_metadata
+                )
+            self.assertEqual(
+                persistence._validate_file_source_membership(
+                    sources, engine.native_metadata
+                ),
+                0,
+            )
+
     def test_codec_sorted_crlf_source_preserving_and_all_noise(self):
         raw = b"[RecoveryInfo]\r\nWriting=1"
         for value in range(4):

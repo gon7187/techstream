@@ -103,6 +103,30 @@ def _dh_driver_status(error: NativeTransportError) -> int | None:
     return getattr(error, "passthru_status", error.code)
 
 
+def _dh_file_view(selection, state):
+    """Keep standalone equality; classic CONTROL joins its two native lifetimes."""
+    from scripts.programming_2026_common import _control_dh_file_view2026
+
+    if not isinstance(state, DHControllerState2026):
+        raise TypeError("Actual loaded-engine DH state required")
+    if isinstance(selection, CalibrationSelection):
+        return state.metadata, state.global_cpu_index
+    classic = isinstance(selection, NativeParameterBinding2026) and (
+        selection.module_name
+        in ("TCUWCanDHPrepareWriter.dll", "TCUWCanDHFlashWriter.dll")
+    )
+    view = (
+        _control_dh_file_view2026(selection, state)
+        if classic or state.metadata != selection.metadata
+        else None
+    )
+    if view is not None:
+        return view
+    if state.metadata != selection.metadata:
+        raise ValueError("Actual same-metadata engine DH state required")
+    return state.metadata, state.global_cpu_index
+
+
 def checksum(data: bytes, extra: bytes = b"") -> int:
     """DHUtils RVA17b0: sum both byte ranges, retaining the low byte."""
     if any(not isinstance(value, bytes) for value in (data, extra)):
@@ -1822,13 +1846,31 @@ class DHGateway2026:
                     raise ValueError(
                         "Constructor-empty gateway metadata differs from engine state"
                     )
-            elif self.engine_state.metadata != self.selection.metadata:
-                raise ValueError(
-                    "Actual same-metadata engine DH gateway state required"
-                )
+            else:
+                _dh_file_view(self.selection, self.engine_state)
         self.diag = CanDiag2026(self.runtime)
 
     def _validate_selection(self) -> None:
+        if (
+            isinstance(self.selection, NativeParameterBinding2026)
+            and self.selection._pool_issued
+            and self.selection.module_name
+            in ("TCUWCanDHPrepareWriter.dll", "TCUWCanDHFlashWriter.dll")
+            and not isinstance(self.engine_state, DHControllerState2026)
+        ):
+            raise ValueError(
+                "Pooled classic DH gateway requires its actual engine state"
+            )
+        if (
+            isinstance(self.selection, NativeParameterBinding2026)
+            and self.engine_state is not None
+        ):
+            _dh_file_view(self.selection, self.engine_state)
+            if (
+                self.selection._pool_issued
+                and self.engine_state.engine.worker.runtime is not self.runtime
+            ):
+                raise ValueError("DH gateway runtime differs from its CONTROL owner")
         if isinstance(self.selection, NativeControlParameterBase2026):
             if not isinstance(self.engine_state, DHControllerState2026):
                 raise TypeError("Source-issued CONTROL BASE requires its engine state")
@@ -2184,8 +2226,8 @@ def bind_gateway_client(
     if (
         not isinstance(selection, NativeControlParameterBase2026)
         or selection._pool is None
-    ) and (selection.metadata != state.metadata):
-        raise ValueError("Gateway parameter metadata differs from the actual engine")
+    ):
+        _dh_file_view(selection, state)
     if hashlib.sha256(cuw_module).hexdigest() != state.engine_sha256:
         raise ValueError(
             "Native gateway authorization caller differs from loaded engine"
@@ -2243,11 +2285,26 @@ class DHPhaseContext:
             raise ValueError(
                 "Exact native DH prepare dispatch and engine state required"
             )
-        if isinstance(self.selection, NativeParameterBinding2026) and (
-            not isinstance(self.container, CalibrationContainer)
-            or self.selection.metadata != self.state.metadata
-        ):
-            raise ValueError("Actual2026 parameter metadata differs from engine state")
+        if isinstance(self.selection, NativeParameterBinding2026):
+            if not isinstance(self.container, CalibrationContainer):
+                raise TypeError("Actual2026 parameter container required")
+            _dh_file_view(self.selection, self.state)
+            if (
+                self.selection._pool_issued
+                and self.selection.module_name
+                in ("TCUWCanDHPrepareWriter.dll", "TCUWCanDHFlashWriter.dll")
+                and self.identity.module_name != self.selection.module_name
+            ):
+                from scripts.programming_2026_common import _control_export_dispatch2026
+
+                if (self.selection.module_name, self.identity.module_name) != (
+                    "TCUWCanDHFlashWriter.dll",
+                    "TCUWCanDHPrepareWriter.dll",
+                ):
+                    raise ValueError("DH nested phase differs from its retained module")
+                _control_export_dispatch2026(
+                    self.state.engine._controller_export_target2026, "PrepareRetry"
+                )
 
 
 def _native_cpu0_address(context: DHPhaseContext) -> Address:
@@ -2341,6 +2398,8 @@ def prepare_dh(
     if context.identity.module_name != "TCUWCanDHPrepareWriter.dll":
         raise ValueError("Exact native classic DH prepare dispatch required")
     selection, state = context.selection, context.state
+    metadata, _native_cpu = _dh_file_view(selection, state)
+    parser_cpu = native2026_global_cpu_index(metadata)
 
     def number(name, default=0):
         text = selection.value(name)
@@ -2512,8 +2571,8 @@ def prepare_dh(
                         flag_to_non_seed_16_byte_resp_status=no_seed16_status,
                     )
                     secret_type = secret_info_type(
-                        state.metadata.vehicle.get("kindofecu", ""),
-                        native2026_cpu_type(state.metadata, state.global_cpu_index),
+                        metadata.vehicle.get("kindofecu", ""),
+                        native2026_cpu_type(metadata, parser_cpu),
                     )
                     key = NativeSecurityComposer2026.calculate_security_key(
                         gateway.secret_info.get(secret_type), seed
@@ -2632,6 +2691,8 @@ def flash_dh(
     if context.identity.module_name != "TCUWCanDHFlashWriter.dll":
         raise ValueError("Exact native classic DH writer dispatch required")
     state, selection = context.state, context.selection
+    metadata, native_cpu = _dh_file_view(selection, state)
+    parser_cpu = native2026_global_cpu_index(metadata)
 
     def flag(name):
         text = selection.value(name)
@@ -2669,7 +2730,7 @@ def flash_dh(
     if len(starts) >= 2:
         match = re.match(
             r"\s*[+-]?[0-9]+",
-            native2026_location_id(state.metadata, state.global_cpu_index),
+            native2026_location_id(metadata, parser_cpu),
         )
         if match is None:
             raise ValueError("Native decimal location index absent")
@@ -2687,7 +2748,7 @@ def flash_dh(
         raise ValueError("Native four-byte StartAddress hex text required")
     start = bytes.fromhex(start_text).rjust(4, b"\0")
     next_ignition = None
-    if state.global_cpu_index + 1 < native2026_cpu_count(state.metadata):
+    if parser_cpu + 1 < native2026_cpu_count(metadata):
         if (
             not isinstance(selection, NativeParameterBinding2026)
             or "Parameter.ini" not in selection.catalog_sources
@@ -2697,20 +2758,20 @@ def flash_dh(
             )
         general = NativeGeneralParameters2026.from_binding(selection)
         next_ignition = general.boolean_with_keys(
-            state.metadata.vehicle.get("kindofecu", ""),
-            native2026_cpu_type(state.metadata, state.global_cpu_index + 1),
-            state.metadata.vehicle.get("contacttype", ""),
+            metadata.vehicle.get("kindofecu", ""),
+            native2026_cpu_type(metadata, parser_cpu + 1),
+            metadata.vehicle.get("contacttype", ""),
             "FlagToDoIGOFFONAtCPUTypeChange",
         )
-    image_archive = native2026_archive(state.metadata)
+    image_archive = native2026_archive(metadata)
     image = image_archive.data
     size = image_archive.flash_size
     if not isinstance(image, bytes) or not 0 < size <= len(image):
         raise ValueError("Native contiguous CPU image and bounded FlashSize required")
     image = image[:size]
     flash_code = b""
-    if state.metadata.cpu.flash_code is not None:
-        code_archive = native2026_archive(state.metadata, flash_code=True)
+    if metadata.cpu.flash_code is not None:
+        code_archive = native2026_archive(metadata, flash_code=True)
         if not isinstance(code_archive.data, bytes) or code_archive.length > len(
             code_archive.data
         ):
@@ -2804,9 +2865,9 @@ def flash_dh(
                 result["transferred_bytes"] += count
             runtime.call(
                 "notify_progress",
-                cpu_index=state.global_cpu_index,
+                cpu_index=native_cpu,
                 transferred_bytes=result["transferred_bytes"],
-                progress=state.progress[state.global_cpu_index],
+                progress=state.progress[native_cpu],
             )
             runtime.check()
 
@@ -2853,7 +2914,7 @@ def flash_dh(
         else:
             runtime.call("stop_sync_periodic")
         if next_ignition is False:
-            runtime.call("notify_cpu_type_change", cpu_index=state.global_cpu_index + 1)
+            runtime.call("notify_cpu_type_change", cpu_index=native_cpu + 1)
         notification.assign(False)
         runtime.call("notify_programming_active", active=False)
         result["native_return"] = True
@@ -2881,14 +2942,14 @@ def flash_dh(
                 runtime.call(
                     "notify_progress_count",
                     cleanup=True,
-                    cpu_index=state.global_cpu_index,
+                    cpu_index=native_cpu,
                     transferred_bytes=0,
                 )
                 state.reset_dh_progress()
                 runtime.call(
                     "notify_progress_percent",
                     cleanup=True,
-                    cpu_index=state.global_cpu_index,
+                    cpu_index=native_cpu,
                     progress=0,
                 )
         except (Exception, KeyboardInterrupt) as cleanup:  # noqa: BLE001 - retain primary native error
@@ -4734,11 +4795,8 @@ def bind_native_context(
         return default if value is None else value
 
     state = observations.get("dh_state")
-    if (
-        not isinstance(state, DHControllerState2026)
-        or state.metadata != selection.metadata
-    ):
-        raise ValueError("Actual loaded-engine DH state required")
+    _dh_file_view(selection, state)
+    assert isinstance(state, DHControllerState2026)
     if selection.operation == "get_cid":
         pid_text = selection.value("PIDForReadSoftMaskID") or "A7"
         if len(pid_text) != 2 or any(
@@ -4785,11 +4843,7 @@ def bind_native_context(
         else:
             native = getter
     elif selection.operation in ("prepare", "write"):
-        if (
-            not isinstance(state, DHControllerState2026)
-            or state.metadata != selection.metadata
-        ):
-            raise ValueError("Actual loaded-engine DH phase state required")
+        _dh_file_view(selection, state)
         native = DHPhaseContext(
             identity, state, selection, addresses, sources, container, observed_cids
         )

@@ -260,9 +260,20 @@ the original archive backing, prunes logical blocks using the selected target,
 remaps logical CPU indices, and uses17280→163c0 to append an unmatched promoted
 FOREST CPU's current calibration/password. The original logical CPU FlashSize
 remains the copied aggregate after pruning:19300→19360 does not rerun48670.
-Nonzero skip-node flags and Blank/D4f8 branches remain explicit unsupported
-source dependencies. In the supported constructor-zero branch, a received CID
-vector shorter than the CPU vector is rejected as34e10 does.
+The pure34e10 matcher accepts an exact configured-capacity Boolean tuple through
+`configured_cpu_flags`. SCC/Phase6 branches require this real per-FILE input;
+`None` is permitted only on a reached branch that never reads those bits.
+CPU+184 is its retained node association, so configured bits use
+`native2026_node_index`, including after CPU reorder, rather than CPU ordinal.
+`configured_metadata` is the distinct actual indexed TABLE FILE used by4b0f0;
+preseed uses current metadata, while target skips and the later NewCID pass use
+that indexed metadata's SCC/Phase6 predicate and node association. Named callers
+must supply it; default current metadata represents only direct/no-named-table
+composition. A non-SCC/non-Phase6 helper returns before any CPU-index lookup.
+Blank/D4F8 skip target matching but retain configured target0 and the actual
+unmatched footprint. Insufficient received CIDs retain the native initial
+configured-target0 Boolean, then still compute targets/unmatched; they do not
+raise a convenience exception. Host capacity/provenance/record errors still raise.
 
 `native2026_validate_phase6_pair` performs19c00 without issuing a new source.
 `native2026_merge_phase6` additionally applies4a850's first-node identity guard
@@ -326,9 +337,14 @@ used by13d20;417b0 transfers records without clearing that field.
 
 The34e10 special branch for a first CPU image containing `.vbf` checks
 `NumberOfTargetHardwares` and each `%02d_TargetHardware` against the exact captured
-hardware string. Zero entries or no match fails selection even when a target CID
-matches. With matching hardware, nonempty received CIDs follow normal matching;
-an empty received vector selects CPU0 target0 without adding unmatched CIDs.
+hardware string. Zero entries or no match returns an issued false snapshot even
+when a target CID matches: all authored targets stay-1 and unmatched vectors stay
+empty because the native branch exits before their population. With matching hardware, nonempty received CIDs follow normal matching;
+an empty **live global** received vector selects CPU0 target0 without adding
+unmatched CIDs. `received_identifiers` plus aligned records represents selected
+local6c/local80; `live_received_identifiers` supplies the distinct global D270
+vector. Its default aliases the selected vector only for direct/no-distinct-vector
+convenience; engine/H callers supply both actual sources.
 `received_hardware` defaults to the native constructor's empty string; the actual
 389c0 getter capture must supply any nonempty hardware value. The direct positive
 primitive test does not claim that cross-owner getter integration is complete.
@@ -346,9 +362,11 @@ API applies the same gate; callers needing actual chronology use the split APIs.
 Earlier eager VBF FOREST promotion positives were withdrawn and replaced by
 valid S-record `.hex` rebuild inputs and explicit skipped-branch controls.
 
-The match's `check_target` records the34e10 result, including failure when
-NewCID additions fill the unmatched vector to the CPU count despite an authored
-target match. Actual callers gate rebuilding on this result.
+The match's `check_target` records the34e10 result, including hardware rejection,
+insufficient-CID false and failure when NewCID additions fill the unmatched vector
+to the CPU count despite an authored target match. False remains a registered
+snapshot with the footprint reached by that exact branch, not malformed input
+converted into a normal result. Actual callers gate rebuilding on this result.
 `native2026_rebind_cid_match` carries the snapshot across registered SetCPUType
 and CPU-reselection parent edges, because those native operations keep the same
 FILE object. A fresh parse of the exact same source is not such an edge and is
@@ -369,3 +387,40 @@ It counts logical blocks rather than deduplicated CPUs: two blocks sharing one
 NewCID return2 even when node CPU count is1. Ordinary nodes return0, and runtime
 pruning returns the surviving block count because111e0 updates native+98.
 The accessor validates exact issued metadata, the original lease and node bounds.
+
+`native2026_rebuild_current_cids_steps(metadata, target_indices,
+unmatched_identifiers, unmatched_companions, general_parameters, *, configuration)`
+models a reached3e710 body directly from current native state. Ordinary36800 does
+not require a previous34e10 match. The inputs are exact issued metadata, current
+M-wide D2A4 targets, current unmatched CID/companion byte tuples and the actual
+General/configuration. D300 is neither an input nor a store of this operation.
+The registered-match rebuild wrapper retains its receipt/metadata/General guards
+and drains the same core.
+
+The iterator yields frozen data, not live mutation permissions:
+`NativeCIDRebuildOffset2026(value)` publishes D30C reset0 and each FOREST move
+before the following fallible lookup; `NativeCIDRebuildTargets2026(indices)`
+publishes the full target vector before projection;
+`NativeCIDRebuildMetadata2026(metadata, operation, cpu_index=None)` distinguishes
+`16ae0`, `16fb0`, `19300` and each `17280` commit;
+`NativeCIDRebuildTargetStore2026(cpu_index, target_index)` follows its password
+append; `NativeCIDRebuildComplete2026(selection)` alone denotes terminal D304.
+The worker consumes the actual iterator/current yield identity inside its source
+origin; the engine publishes metadata/proofs only at that authenticated point.
+
+3ddf0 moves CID strings without moving their companion positions. CPU metadata copy uses the last old matching CPU in both branches;9
+independently copies archive objects from the first old CID match. Logical pruning
+follows CPU/archive reorder; individual target appends follow pruning. The live
+unmatched vectors and authored count remain unchanged. Structural malformed input
+rejects before the first yield; General/password failures occur at their actual
+business step after earlier yielded writes. An empty desired CID with capacity
+beyond represented active CPU rows currently rejects at the reached reorder
+point: unused native records are not inferred from constructor defaults. That
+capacity-tail branch remains unsupported pending its separate source proof.
+
+The existing issued match now retains `cpu_maximum` from its validated native
+configuration. Its registered wrapper reconstructs only the D2A4 tail proven by
+34e10's initial all-M `-1` stores, so it drains the same capacity-aware core and
+cannot bypass the empty-CID capacity boundary. Rebinding retains that capacity.
+The ordinary source-state lane receives the actual full vector and never pads
+caller state from metadata.

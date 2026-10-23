@@ -155,6 +155,12 @@ def dh_aes(identifier, seed=b"S" * 16):
 
 class RawControlRuntimeOwnershipTests(unittest.TestCase):
     def test_real_dh_provider_fault_keeps_parent_resource_until_outer_close(self):
+        self._raw_provider_fault(write=False)
+
+    def test_raw_classic_writer_keeps_cpu1_geometry_progress_and_parent_ownership(self):
+        self._raw_provider_fault(write=True)
+
+    def _raw_provider_fault(self, *, write):
         import json
         import struct
 
@@ -173,14 +179,26 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
         from tests.test_cuw_engine_worker import encoded_table
 
         root = Path("runtime/no-car-21/recovered")
-        module_name = "TCUWCanDHPrepareWriter.dll"
+        module_name = (
+            "TCUWCanDHFlashWriter.dll" if write else "TCUWCanDHPrepareWriter.dll"
+        )
+        operation = "write" if write else "prepare"
+        export = "StartFlashWrite" if write else "StartPrepareWrite"
+        helper = "4c10" if write else "8990"
+        cpu = 1 if write else 0
         if not (root / module_name).is_file():
             self.skipTest("Authenticated static DH prepare module is absent")
         fixture_case = DHUDSGetterLifecycle(
             "test_empty_control_gateway_capability_and_native_boolean_semantics"
         )
         self.addCleanup(fixture_case.doCleanups)
-        starter = fixture_case.engine_fixture()
+        starter = fixture_case.engine_fixture(
+            cpu_count=2 if write else 1,
+            cpu_index=cpu,
+            image_data=b"S1071000646174614E\nS9031000EC\n" if write else b"data",
+        )
+        foreign_engine = fixture_case.engine_fixture(kind="109", persistence=False)
+        self.addCleanup(foreign_engine.close)
         source = starter._source
         starter.close()
         assert source is not None
@@ -190,11 +208,20 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
             "108CAN383.ini": encoded_table(
                 (
                     "ParamFileKeySystemProtocolMicon",
-                    "DLLFileNameForPrepareWrite",
-                    "GetCANIDFunctionNameForPrepareWrite",
+                    "DLLFileNameForFlashWrite"
+                    if write
+                    else "DLLFileNameForPrepareWrite",
+                    "GetCANIDFunctionNameForFlashWrite"
+                    if write
+                    else "GetCANIDFunctionNameForPrepareWrite",
                     "CanIDForPrepareWrite",
                     "FlagToNonSeed16ByteRespStatus",
                     "EnableDLLVersionInformation",
+                    "StartAddress",
+                    "FlagToNonChangeReprogGWModeProcess",
+                    "DLLFileNameForGetCID",
+                    "GetCANIDFunctionNameForGetCID",
+                    "CanIDForGetCID",
                 ),
                 (
                     (
@@ -203,7 +230,12 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
                         "GetCanIDsFromParamForPrepareWrite",
                         "0700/0708",
                         "0",
-                        "\n".join((version,) * 4),
+                        f"0\n{version}\n{version}\n{version}",
+                        "00001000",
+                        "1",
+                        "TCUWCanDHSoftwareIDGetter.dll",
+                        "GetCanIDsFromParamForGetCID",
+                        "0700/0708",
                     ),
                 ),
             ),
@@ -220,7 +252,7 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
             "schema": "techstream-programming-replay-v1",
             "source": "recorded_unverified",
             "calibration_sha256": hashlib.sha256(source).hexdigest(),
-            "operation": "prepare",
+            "operation": operation,
             "node": 1,
             "observations": {
                 "current_cids": [],
@@ -228,7 +260,7 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
                 "system_time": [2026, 10, 22, 20, 1, 2, 3, 4],
                 "timeout_seconds": 30,
                 "cid_mode": 2,
-                "host": {},
+                "host": {"cpu_index": cpu},
             },
             "events": [],
         }
@@ -242,25 +274,63 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
                 {"Parameter.ini": catalog["Parameter.ini"]}, encoded=True
             ),
         )
-        engine.configure(struct.pack("<IIddII", 1, 0, 1, 2, 0, 0))
-        engine.load_cuw(source)
+        engine.configure(struct.pack("<IIddII", 2 if write else 1, 0, 1, 2, 0, 0))
+        engine.load_cuw(source, cpu_index=cpu)
+        if write:
+            output = tempfile.TemporaryDirectory(dir="runtime/no-car-33")
+            self.addCleanup(output.cleanup)
+            engine.bind_persistence(
+                CUWPersistence(
+                    Path(output.name),
+                    ReproInfoState(
+                        (RecoveryCalibration("authored.cuw", source),),
+                        write_cpu_index=cpu,
+                    ),
+                )
+            )
         self.addCleanup(engine.close)
         fault = OSError("injected DH provider fault")
         faults: list[BaseException] = [fault]
         calls = []
+        pending = []
+        count_before = [0]
 
         def provider(event, remaining):
             calls.append(event)
             operation = event.get("operation")
             if operation in ("stop_periodic", "stop_filter"):
                 return None
+            if operation == "is_sending_sync_periodic":
+                return False
             if operation == "get_timeout":
                 return 110
             if operation == "get_send_timeout":
                 return 120
             if operation == "start_flow_control_filter":
                 return 17
+            if operation == "read_specified_can_message":
+                return bytes.fromhex("00000708") + pending.pop(0)
+            if operation == "notify_progress" and write:
+                self.assertEqual(event["cpu_index"], 1)
+                self.assertEqual(event["progress"], 25)
             if operation == "write_messages":
+                if write:
+                    payload = event["data"][4:]
+                    self.assertEqual(engine.family_cpu_index, 1)
+                    if payload.startswith(b"\x34"):
+                        self.assertEqual(
+                            payload, bytes.fromhex("3401440000100000000004")
+                        )
+                        pending.append(bytes.fromhex("74200003"))
+                        return 1
+                    if payload == b"\x36da":
+                        pending.append(b"\x76")
+                        return 1
+                    self.assertEqual(payload, b"\x36ta")
+                    self.assertEqual(engine.dh_state.progress, (0, 25))
+                    self.assertEqual(
+                        engine.dh_state.transferred_bytes, (0, count_before[0] + 2)
+                    )
                 raise faults[0]
 
         replay.trace.action = provider
@@ -282,18 +352,21 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
             ),
             runtime,
         )
+        contexts = []
         replay.bind_controller2026(controller)
         replay.bind_engine2026(engine)
         replay.bind_runtime2026(runtime)
         engine.bind_worker(controller)
-        with engine.controller_execution(controller, 0):
+        with engine.controller_execution(controller, 2 if write else 0):
             pool = ControlParameterPool2026.issue(
                 engine, controller, catalog, encoded=True
             )
             self.addCleanup(pool.close)
-            self.assertEqual(pool.load_for(engine, controller, "prepare"), (0,))
+            self.assertEqual(
+                pool.load_for(engine, controller, operation), (0, 1) if write else (0,)
+            )
             target = NativeControlExportTarget2026.issue(
-                engine, controller, pool, 0, "prepare"
+                engine, controller, pool, cpu, operation
             )
             from scripts.programming_2026_dh import bind_native_context
 
@@ -308,24 +381,67 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
             identity = identify_native_module(
                 hashlib.sha256(module).hexdigest(), module_name
             )
-            dh_context = bind_native_context(
-                container,
-                1,
-                (),
-                selected,
-                identity,
-                attachments,
-                {"dh_state": engine.dh_state, "module_version": version},
+            from scripts.programming_2026_dh import _dh_file_view
+
+            getter_target = NativeControlExportTarget2026.issue(
+                engine, controller, pool, cpu, "get_cid"
             )
+            getter_name = "TCUWCanDHSoftwareIDGetter.dll"
+            getter_module = (root / getter_name).read_bytes()
+            getter_identity = identify_native_module(
+                hashlib.sha256(getter_module).hexdigest(), getter_name
+            )
+            with patch(
+                "scripts.programming_2026_common._control_dh_file_view2026",
+                side_effect=AssertionError(
+                    "Classic resolver must not handle a valid getter"
+                ),
+            ):
+                getter_context = bind_native_context(
+                    container,
+                    1,
+                    (),
+                    getter_target.binding,
+                    getter_identity,
+                    {"selected_module": getter_module},
+                    {
+                        "dh_state": engine.dh_state,
+                        "cpu_index": cpu,
+                        "module_version": inspect_module_bytes(
+                            getter_module, getter_name
+                        )["version"],
+                    },
+                )
+                self.assertIs(getter_context.engine_state, engine.dh_state)
+                self.assertEqual(
+                    _dh_file_view(getter_target.binding, engine.dh_state),
+                    (engine.dh_state.metadata, engine.dh_state.global_cpu_index),
+                )
+            standalone = bind_native_parameter2026(
+                container,
+                catalog,
+                operation,
+                metadata_state=selected.metadata,
+                cpu_index=cpu,
+                encoded=True,
+            )
+            self.assertEqual(
+                _dh_file_view(standalone, engine.dh_state)[0], selected.metadata
+            )
+            with self.assertRaises(ValueError):
+                _dh_file_view(standalone, foreign_engine.dh_state)
             runtime.own("stop_periodic", identifier=77)
             with engine.controller_export_target(controller, target):
                 raw = controller._begin_native_control_raw_execution2026(engine)
                 entry = controller._begin_native_control_helper_entry2026(
-                    engine, helper="8990"
+                    engine, helper=helper
                 )
                 try:
 
                     def run_dh_fault(_stage, active_runtime):
+                        pending.clear()
+                        if write:
+                            count_before[0] = engine.dh_state.transferred_bytes[1]
                         active = active_runtime._device_calls.control_export
                         token = controller._native_control_raw_execution2026
                         from scripts.programming_2026_common import (
@@ -354,6 +470,121 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
                             controller._native_control_export_lease2026
                         )
                         target.validate(engine, controller)
+                        dh_context = bind_native_context(
+                            container,
+                            1,
+                            (),
+                            selected,
+                            identity,
+                            attachments,
+                            {
+                                "dh_state": engine.dh_state,
+                                "module_version": version,
+                                "cpu_index": cpu,
+                            },
+                        )
+                        contexts.append(dh_context)
+                        assert dh_context.gateway_identity is not None
+                        assert dh_context.secret_info is not None
+                        with self.assertRaises(ValueError):
+                            DHGateway2026(
+                                active_runtime,
+                                selected,
+                                dh_context.gateway_identity,
+                                dh_context.secret_info,
+                            )
+                        from scripts.programming_2026_common import (
+                            _control_dh_file_view2026,
+                        )
+
+                        view = _control_dh_file_view2026(selected, engine.dh_state)
+                        self.assertEqual(view, (selected.metadata, target.cpu_index))
+                        # Rejection controls retain the real selected export as baseline.
+                        import threading
+
+                        from scripts.programming_2026_common import (
+                            _NATIVE_CONTROL_HELPER_LEASES_2026,
+                        )
+
+                        with self.assertRaises(ValueError):
+                            _control_dh_file_view2026(selected, foreign_engine.dh_state)
+                        foreign = bind_native_parameter2026(
+                            container,
+                            catalog,
+                            "prepare",
+                            metadata_state=selected.metadata,
+                            cpu_index=cpu,
+                            encoded=True,
+                        )
+                        with self.assertRaises(ValueError):
+                            _control_dh_file_view2026(foreign, engine.dh_state)
+                        with (
+                            patch.object(
+                                active_runtime._device_calls,
+                                "control_export",
+                                (engine, controller, object()),
+                            ),
+                            self.assertRaises(ValueError),
+                        ):
+                            _control_dh_file_view2026(selected, engine.dh_state)
+                        slot_state = target.entry_slot._state()
+                        with (
+                            patch.object(
+                                slot_state, "revision", slot_state.revision + 1
+                            ),
+                            self.assertRaises(ValueError),
+                        ):
+                            _control_dh_file_view2026(selected, engine.dh_state)
+                        parameter = slot_state.parameter
+                        with (
+                            patch.object(
+                                parameter, "row_index", parameter.row_index + 1
+                            ),
+                            self.assertRaises(ValueError),
+                        ):
+                            _control_dh_file_view2026(selected, engine.dh_state)
+                        changed_catalog = dict(pool.catalog_sources)
+                        changed_catalog[selected.source_name] += b"x"
+                        with (
+                            patch.object(
+                                pool._require_state(),
+                                "catalog_sources",
+                                changed_catalog,
+                            ),
+                            self.assertRaises(ValueError),
+                        ):
+                            _control_dh_file_view2026(selected, engine.dh_state)
+                        lease_state = _NATIVE_CONTROL_HELPER_LEASES_2026[
+                            id(controller._native_control_export_lease2026)
+                        ][1]
+                        with (
+                            patch.dict(lease_state, {"helper": "6f20"}),
+                            self.assertRaises(ValueError),
+                        ):
+                            _control_dh_file_view2026(selected, engine.dh_state)
+                        with (
+                            patch.dict(
+                                lease_state, {"export": "IsFinishReprogramming"}
+                            ),
+                            self.assertRaises(ValueError),
+                        ):
+                            _control_dh_file_view2026(selected, engine.dh_state)
+                        thread_errors = []
+
+                        def foreign_thread():
+                            try:
+                                _control_dh_file_view2026(selected, engine.dh_state)
+                            except ValueError as error:
+                                thread_errors.append(error)
+
+                        thread = threading.Thread(target=foreign_thread)
+                        thread.start()
+                        thread.join(1)
+                        self.assertFalse(thread.is_alive())
+                        self.assertEqual(len(thread_errors), 1)
+                        self.assertEqual(
+                            _control_dh_file_view2026(selected, engine.dh_state), view
+                        )
                         return execute_context(dh_context, active_runtime)
 
                     with (
@@ -369,9 +600,9 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
                             engine,
                             replay,
                             target,
-                            "StartPrepareWrite",
-                            helper="8990",
-                            required_exports=("StartPrepareWrite",),
+                            export,
+                            helper=helper,
+                            required_exports=(export,),
                         )
                     self.assertIs(raised.exception, fault)
                     close.assert_not_called()
@@ -398,7 +629,7 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
                     controller._end_native_control_helper_entry2026(engine, lease=entry)
                     entry = None
                     next_entry = controller._begin_native_control_helper_entry2026(
-                        engine, helper="8990"
+                        engine, helper=helper
                     )
                     entry = next_entry
                     try:
@@ -411,9 +642,9 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
                                 engine,
                                 replay,
                                 target,
-                                "StartPrepareWrite",
-                                helper="8990",
-                                required_exports=("StartPrepareWrite",),
+                                export,
+                                helper=helper,
+                                required_exports=(export,),
                             )
                         self.assertEqual(continued["state"], "failed")
                         self.assertIsNot(continued.get("native_return"), True)
@@ -432,16 +663,22 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
                             engine, lease=entry
                         )
                     controller._end_native_control_raw_execution2026(engine, raw)
+            from scripts.programming_2026_common import _control_dh_file_view2026
+
+            with self.assertRaises(ValueError):
+                _control_dh_file_view2026(selected, engine.dh_state)
             faults[0] = fault
             standalone_runtime = NativeRuntime2026(provider)
             standalone_runtime.own("stop_periodic", identifier=78)
-            with self.assertRaises(OSError) as standalone_fault:
+            dh_context = contexts[-1]
+            with self.assertRaises(ValueError):
                 execute_context(dh_context, standalone_runtime)
-            self.assertIs(standalone_fault.exception, fault)
             self.assertNotIn(
                 {"operation": "stop_periodic", "identifier": 78},
                 standalone_runtime._resources,
             )
+        if write:
+            self.assertEqual(engine.dh_state.global_cpu_index, 1)
         runtime.close()
         self.assertFalse(runtime.owns_resource("stop_periodic"))
         self.assertEqual(
@@ -451,7 +688,7 @@ class RawControlRuntimeOwnershipTests(unittest.TestCase):
 
         with engine.controller_execution(controller, 0):
             target = NativeControlExportTarget2026.issue(
-                engine, controller, pool, 0, "prepare"
+                engine, controller, pool, cpu, operation
             )
             with engine.controller_export_target(controller, target):
                 for active_target, remove_worker in ((object(), False), (target, True)):

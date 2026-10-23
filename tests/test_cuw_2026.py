@@ -9,7 +9,8 @@ import zlib
 from dataclasses import replace
 from pathlib import Path
 from threading import Thread
-from unittest.mock import MagicMock, patch
+from typing import Any, cast
+from unittest.mock import MagicMock, PropertyMock, patch
 
 from scripts.cuw_2026 import (
     CommunicationLogNativeFault,
@@ -63,6 +64,492 @@ def archive(rows):
 
 
 class ManagedServicesTests(unittest.TestCase):
+    def test_cold_frontend_bind_keeps_historical_getter_capacity(self):
+        from scripts.demo_calibration import table
+        from scripts.programming_2026_common import NativeFrontendParameters2026
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        parameters = NativeFrontendParameters2026.from_sources(
+            {
+                "Parameter.ini": table(
+                    ("ParamFileKeySystemProtocolMicon",), (("149CAN",),)
+                ),
+                "CanIDTable.ini": table(("RequestCANID",), (("7E0",),)),
+                "LogicalAddressTable.ini": table(("LogicalAddress",), (("0103",),)),
+            },
+            encoded=False,
+        )
+        with CUWEngine2026(image.read_bytes()) as engine:
+            observed_publication_order = []
+            original_setattr = object.__setattr__
+
+            def observe_publication(owner, name, value):
+                if owner is engine and name in (
+                    "_general_parameters",
+                    "_frontend_parameters",
+                ):
+                    observed_publication_order.append(name)
+                    self.assertIsNotNone(owner._pending_initial_getter_reset2026)
+                    self.assertEqual(owner._initial_getter_reset_epoch2026, 1)
+                original_setattr(owner, name, value)
+
+            with patch.object(CUWEngine2026, "__setattr__", observe_publication):
+                engine.bind_frontend_parameters(parameters)
+            self.assertEqual(
+                observed_publication_order,
+                ["_general_parameters", "_frontend_parameters"],
+            )
+            first = engine._pending_initial_getter_reset2026
+            self.assertIsNotNone(first)
+            assert first is not None
+            self.assertEqual((first.maximum, first.epoch), (0, 1))
+            self.assertIsNone(first.configuration)
+
+            engine.configure(struct.pack("<IIddII", 4, 0, 0, 0, 0, 0))
+            self.assertIs(engine._pending_initial_getter_reset2026, first)
+            self.assertEqual(first.maximum, 0)
+
+            engine.bind_frontend_parameters(parameters)
+            second = engine._pending_initial_getter_reset2026
+            assert second is not None
+            self.assertIsNot(second, first)
+            self.assertEqual((second.maximum, second.epoch), (4, 2))
+            self.assertIs(second.configuration, engine.configuration)
+
+            engine.configure(struct.pack("<IIddII", 8, 0, 0, 0, 0, 0))
+            self.assertIs(engine._pending_initial_getter_reset2026, second)
+            self.assertEqual(second.maximum, 4)
+
+    def test_failed_initial_projection_keeps_origin_and_retries_same_bind(self):
+        from scripts.cuw_engine_worker import EngineWorker2026
+        from tests.test_cuw_engine_worker import EngineWorker2026Tests
+
+        engine, controller = EngineWorker2026Tests("runTest").cold_initial_reset_worker(
+            initial_maximum=4, configured_maximum=4
+        )
+        self.addCleanup(engine.close)
+        origin = engine._pending_initial_getter_reset2026
+        assert origin is not None
+        issued = []
+        apply_reset = EngineWorker2026._apply_initial_getter_reset_40580_2026
+
+        def fail_after_projection(worker, pending_origin):
+            issued.append(worker)
+            apply_reset(worker, pending_origin)
+            raise RuntimeError("injected initial projection tail failure")
+
+        with (
+            patch.object(
+                EngineWorker2026,
+                "_apply_initial_getter_reset_40580_2026",
+                fail_after_projection,
+            ),
+            self.assertRaisesRegex(RuntimeError, "injected initial projection"),
+        ):
+            engine.bind_worker(controller)
+
+        self.assertIs(engine._pending_initial_getter_reset2026, origin)
+        self.assertIsNone(engine._initial_getter_reset_binding2026)
+        self.assertIsNone(engine._worker)
+        self.assertTrue(issued[0]._closed)
+        self.assertFalse(hasattr(controller, "worker"))
+
+        worker = engine.bind_worker(controller)
+        self.assertIsNone(engine._pending_initial_getter_reset2026)
+        self.assertEqual(worker._getter_reset_epoch2026, origin.epoch)
+        self.assertEqual(len(worker._getter_histories_a34_2026[0].node_strings_28), 4)
+
+    def test_close_revokes_pending_initial_reset_without_reusing_its_epoch(self):
+        from scripts.demo_calibration import table
+        from scripts.programming_2026_common import NativeFrontendParameters2026
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        parameters = NativeFrontendParameters2026.from_sources(
+            {
+                "Parameter.ini": table(
+                    ("ParamFileKeySystemProtocolMicon",), (("149CAN",),)
+                ),
+                "CanIDTable.ini": table(("RequestCANID",), (("7E0",),)),
+                "LogicalAddressTable.ini": table(("LogicalAddress",), (("0103",),)),
+            },
+            encoded=False,
+        )
+        engine = CUWEngine2026(image.read_bytes())
+        engine.bind_frontend_parameters(parameters)
+        self.assertIsNotNone(engine._pending_initial_getter_reset2026)
+        engine.close()
+        self.assertIsNone(engine._pending_initial_getter_reset2026)
+        self.assertIsNone(engine._initial_getter_reset_binding2026)
+        self.assertEqual(engine._initial_getter_reset_epoch2026, 1)
+
+    def test_cold_persistence_requires_the_real_recursive_empty_aggregate(self):
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+        from scripts.demo_calibration import table
+        from scripts.programming_2026_common import NativeFrontendParameters2026
+        from tests.test_cuw_engine_worker import calibration
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        frontend = NativeFrontendParameters2026.from_sources(
+            {
+                "Parameter.ini": table(
+                    ("ParamFileKeySystemProtocolMicon",), (("149CAN",),)
+                ),
+                "CanIDTable.ini": table(("RequestCANID",), (("7E0",),)),
+                "LogicalAddressTable.ini": table(("LogicalAddress",), (("0103",),)),
+            },
+            encoded=False,
+        )
+        source = calibration()
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(
+                Path(directory), ReproInfoState((RecoveryCalibration("a.cuw", source),))
+            )
+            engine = CUWEngine2026(image.read_bytes(), persistence=persistence)
+            self.addCleanup(engine.close)
+            persistence.delete_recovery()
+            engine.bind_frontend_parameters(frontend)
+            self.assertIsNotNone(engine._pending_initial_getter_reset2026)
+
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(
+                Path(directory), ReproInfoState((RecoveryCalibration("a.cuw", source),))
+            )
+            engine = CUWEngine2026(image.read_bytes(), persistence=persistence)
+            self.addCleanup(engine.close)
+            engine.bind_frontend_parameters(frontend)
+            self.assertIsNone(engine._pending_initial_getter_reset2026)
+
+    def test_loaded_late_frontend_bind_does_not_reissue_initial_reset(self):
+        from scripts.demo_calibration import table
+        from scripts.programming_2026_common import NativeFrontendParameters2026
+        from tests.test_cuw_engine_worker import EngineWorker2026Tests
+
+        engine, controller = EngineWorker2026Tests("runTest").cold_initial_reset_worker(
+            initial_maximum=4, configured_maximum=4
+        )
+        self.addCleanup(engine.close)
+        origin = engine._pending_initial_getter_reset2026
+        assert origin is not None
+        current_sources = dict(origin.parameters.sources)
+        current_sources["CanIDTable.ini"] = table(
+            ("RequestCANID", "CalibrationType"), (("7E0", "91"),)
+        )
+        current_sources["LogicalAddressTable.ini"] = table(
+            ("LogicalAddress", "CalibrationType"), (("0103", "92"),)
+        )
+        later_parameters = NativeFrontendParameters2026.from_sources(
+            current_sources, encoded=False
+        )
+        engine.bind_frontend_parameters(later_parameters)
+        self.assertIs(engine._pending_initial_getter_reset2026, origin)
+        self.assertEqual(engine._initial_getter_reset_epoch2026, 1)
+        self.assertIs(engine._frontend_parameters, later_parameters)
+        worker = engine.bind_worker(controller)
+        self.assertEqual(worker._getter_reset_epoch2026, 1)
+        self.assertEqual(len(worker._getter_histories_a34_2026[0].node_strings_28), 4)
+        self.assertIsNone(engine._pending_initial_getter_reset2026)
+
+    def test_cleanup_issue_failure_preserves_initial_reset_for_retry(self):
+        from scripts.cuw_engine_cleanup import _issue_engine_cleanup
+        from tests.test_cuw_engine_worker import EngineWorker2026Tests
+
+        engine, controller = EngineWorker2026Tests("runTest").cold_initial_reset_worker(
+            initial_maximum=3, configured_maximum=3
+        )
+        self.addCleanup(engine.close)
+        origin = engine._pending_initial_getter_reset2026
+        assert origin is not None
+        issue_cleanup = _issue_engine_cleanup
+        issued = []
+
+        def capture_worker(owner, control):
+            worker = issue_worker(owner, control)
+            issued.append(worker)
+            return worker
+
+        from scripts.cuw_engine_worker import _issue_engine_worker as issue_worker
+
+        def fail_cleanup(*_args, **_kwargs):
+            raise RuntimeError("injected cleanup issuance failure")
+
+        with (
+            patch("scripts.cuw_engine_worker._issue_engine_worker", capture_worker),
+            patch("scripts.cuw_engine_cleanup._issue_engine_cleanup", fail_cleanup),
+            self.assertRaisesRegex(RuntimeError, "cleanup issuance"),
+        ):
+            engine.bind_worker(controller)
+        self.assertIs(engine._pending_initial_getter_reset2026, origin)
+        self.assertIsNone(engine._worker)
+        self.assertIsNone(engine._initial_getter_reset_binding2026)
+        self.assertTrue(issued[0]._closed)
+        self.assertFalse(hasattr(controller, "worker"))
+        self.assertIsNone(engine._cleanup_controller)
+
+        with patch("scripts.cuw_engine_cleanup._issue_engine_cleanup", issue_cleanup):
+            worker = engine.bind_worker(controller)
+        self.assertIsNone(engine._pending_initial_getter_reset2026)
+        self.assertEqual(worker._getter_reset_epoch2026, origin.epoch)
+
+    def test_initial_reset_validator_rejects_copy_stale_and_cross_engine(self):
+        from scripts.cuw_engine_worker import EngineWorker2026
+        from tests.test_cuw_engine_worker import EngineWorker2026Tests
+
+        engine, controller = EngineWorker2026Tests("runTest").cold_initial_reset_worker(
+            initial_maximum=4, configured_maximum=4
+        )
+        self.addCleanup(engine.close)
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        other = CUWEngine2026(image.read_bytes())
+        self.addCleanup(other.close)
+        apply_reset = EngineWorker2026._apply_initial_getter_reset_40580_2026
+        observed_origins = []
+
+        def reject_forged_origins(worker, origin):
+            observed_origins.append(origin)
+            with self.assertRaises(ValueError):
+                engine._validate_initial_getter_reset_40580_2026(
+                    replace(origin), worker=worker
+                )
+            with self.assertRaises(ValueError):
+                other._validate_initial_getter_reset_40580_2026(origin, worker=worker)
+            self.assertEqual(worker._getter_reset_epoch2026, 0)
+            apply_reset(worker, origin)
+
+        with patch.object(
+            EngineWorker2026,
+            "_apply_initial_getter_reset_40580_2026",
+            reject_forged_origins,
+        ):
+            worker = engine.bind_worker(controller)
+        self.assertEqual(len(observed_origins), 1)
+        with self.assertRaises(ValueError):
+            engine._validate_initial_getter_reset_40580_2026(
+                observed_origins[0], worker=worker
+            )
+
+    def test_unbound_nonzero_recovery_index_cannot_cross_live_without_file_table(self):
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            load_recovery_state,
+            parse_recovery_info,
+        )
+        from scripts.programming_2026_common import NativeRuntime2026
+        from tests.test_cuw_engine_worker import (
+            EngineWorker2026Tests,
+            calibration,
+            make_controller,
+        )
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        first = calibration(cpus=2, first_target="FIRST")
+        source = calibration(cpus=2, first_target="SELECTED")
+        engine = EngineWorker2026Tests("runTest").engine(source)
+        self.addCleanup(engine.close)
+        document = parse_recovery_info(
+            b"[RecoveryInfo]\nMultiCalibrationFileNum=2\n"
+            b"CalibrationFileIndex=1\n"
+            b"[RecoveryInfo1]\nSavedCalibrationFilePath=first.cuw\n"
+            b"[RecoveryInfo2]\nSavedCalibrationFilePath=second.cuw\n",
+            encoded=False,
+        )
+        state = load_recovery_state(
+            document,
+            {"first.cuw": first, "second.cuw": source},
+            cpu_capacity=2,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            engine.bind_persistence(CUWPersistence(Path(directory), state))
+            controller = make_controller(NativeRuntime2026(lambda *_args: None))
+            with self.assertRaisesRegex(ValueError, "actual D71C flow"):
+                engine.bind_worker(controller)
+            self.assertIsNone(engine._worker)
+            self.assertIsNone(engine._pending_file_admission_origin2026)
+            self.assertIsNone(engine._file_admission_owner_thread2026)
+
+    def test_first_bind_issues_exact_zero_flow_proof_for_reordered_recovery_file(self):
+        from scripts.cuw_file_services import admit_file_sources_2026
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            load_recovery_state,
+            parse_recovery_info,
+        )
+        from scripts.demo_calibration import table
+        from scripts.programming_2026_common import (
+            NativeGeneralParameters2026,
+            NativeRuntime2026,
+        )
+        from tests.test_calibration_2026 import cuw, logical_text
+        from tests.test_cuw_engine_worker import make_controller
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        engine = CUWEngine2026(
+            image.read_bytes(),
+            general_parameters=NativeGeneralParameters2026.from_sources(
+                {
+                    "Parameter.ini": table(
+                        (
+                            "ParamFileKeySystemProtocolMicon",
+                            "EngineTypeFlag",
+                            "FlagToOutputAllAttachedInformation",
+                            "CalibrationType",
+                        ),
+                        (("149CAN", "1", "0", "27"),),
+                    )
+                },
+                encoded=False,
+            ),
+        )
+        engine.configure(struct.pack("<IIddII", 2, 0, 0, 0, 0, 0))
+        self.addCleanup(engine.close)
+        part = cuw(
+            logical_text(209)
+            .replace("P5-Unified", "Phase6")
+            .replace("[Node01]", "[Node01]\nDiagID=0700\nLogicalAddress=01")
+            .replace("authored-new", "PART")
+        )
+        whole = cuw(
+            logical_text(209)
+            .replace("P5-Unified", "Phase6")
+            .replace("[Node01]", "[Node01]\nDiagID=0700\nLogicalAddress=01")
+            .replace("authored-new", "WHOLE")
+        )
+        plain = cuw(
+            logical_text(209)
+            .replace("P5-Unified", "Phase6")
+            .replace("[Node01]", "[Node01]\nDiagID=0700\nLogicalAddress=02")
+            .replace("authored-new", "FIRST")
+        )
+        group = b"[Vehicle]\nContactType=Phase6\n" + archive(
+            [
+                (
+                    "Setting.ini",
+                    (
+                        b"[DeltaReproCalFile]\nFileNum=1\nFileName1=part.cuw\n"
+                        b"[WholeReproCalFile]\nFileName=whole.cuw\n"
+                    ),
+                ),
+                ("part.cuw", part),
+                ("whole.cuw", whole),
+            ]
+        )
+        engine.load_cuw(plain)
+        with tempfile.TemporaryDirectory() as directory:
+            recovery = parse_recovery_info(
+                b"[RecoveryInfo]\nMultiCalibrationFileNum=2\n"
+                b"CalibrationFileIndex=1\n"
+                b"[RecoveryInfo1]\nSavedCalibrationFilePath=group.scuw\n"
+                b"[RecoveryInfo2]\nSavedCalibrationFilePath=plain.cuw\n",
+                encoded=False,
+            )
+            persistence = CUWPersistence(
+                Path(directory),
+                load_recovery_state(
+                    recovery,
+                    {"group.scuw": group, "plain.cuw": plain},
+                    cpu_capacity=2,
+                ),
+            )
+            engine.bind_persistence(persistence)
+            controller = make_controller(NativeRuntime2026(lambda *_args: None))
+            sources = admit_file_sources_2026(
+                engine,
+                "input.json",
+                b'["group.scuw","plain.cuw"]',
+                region=0,
+                source_files={"group.scuw": group, "plain.cuw": plain},
+            )
+            engine.bind_file_sources(sources)
+            self.assertEqual(sources.file_names, ("plain.cuw", "part.cuw"))
+            self.assertEqual(sources.recovery_index_for_metadata(sources.files[0]), 1)
+            old_cpu_proof = engine._persistence_cpu_transition2026
+            old_file_proof = engine._persistence_file_flow_transition2026
+            with (
+                patch(
+                    "scripts.cuw_engine_cleanup._issue_engine_cleanup",
+                    side_effect=RuntimeError("cleanup issue fault"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "cleanup issue fault"),
+            ):
+                engine.bind_worker(controller)
+            self.assertIsNone(engine._worker)
+            self.assertIsNone(engine._pending_file_admission_origin2026)
+            self.assertIsNone(engine._file_admission_owner_thread2026)
+            self.assertIs(engine._persistence_cpu_transition2026, old_cpu_proof)
+            self.assertIs(engine._persistence_file_flow_transition2026, old_file_proof)
+            worker = engine.bind_worker(controller)
+            proof = engine._persistence_file_flow_transition2026
+            self.assertIsNotNone(proof)
+            assert proof is not None
+            self.assertEqual(proof.producer, "43cd0-admission")
+            self.assertEqual((proof.before_flow, proof.after_flow), (0, 0))
+            self.assertEqual(proof.persisted_file_index, 1)
+            self.assertIs(proof.worker, worker)
+            engine._validate_persistence_source(engine.native_metadata)
+            snapshot = persistence._snapshot()
+            engine._validate_persistence_source(
+                engine.native_metadata, state_snapshot=snapshot
+            )
+            self.assertIs(engine._persistence_file_flow_transition2026, proof)
+
+            persistence.state.write_cpu_index = 1
+            with self.assertRaisesRegex(ValueError, "actual engine target"):
+                engine._validate_persistence_source(engine.native_metadata)
+            persistence.state.write_cpu_index = 0
+            engine._validate_persistence_source(engine.native_metadata)
+            persistence.state.calibration_file_index = 2
+            with self.assertRaisesRegex(ValueError, "actual D71C flow"):
+                engine._validate_persistence_source(engine.native_metadata)
+            persistence.state.calibration_file_index = 1
+            engine._validate_persistence_source(engine.native_metadata)
+            with (
+                engine.controller_execution(controller, 2),
+                self.assertRaises(ValueError),
+            ):
+                engine._accept_getter_file_projection_32ff0_2026(
+                    sources.file_view2026(0), worker=worker, origin=object()
+                )
+            self.assertIs(engine._persistence_file_flow_transition2026, proof)
+            self.assertIs(engine.native_metadata, sources.selected_metadata)
+
+            engine._persistence_file_flow_transition2026 = None
+            with self.assertRaisesRegex(ValueError, "actual D71C flow"):
+                engine._validate_persistence_source(engine.native_metadata)
+
+            engine._persistence_file_flow_transition2026 = proof
+            with engine.controller_execution(controller, 2):
+                engine._select_worker_metadata(
+                    sources.files[1], controller=controller, worker=worker
+                )
+            self.assertIsNone(engine._persistence_file_flow_transition2026)
+            with self.assertRaisesRegex(ValueError, "actual D71C flow"):
+                engine._validate_persistence_source(engine.native_metadata)
+            with self.assertRaises(ValueError):
+                engine._record_file_flow_transition2026(
+                    worker=worker,
+                    origin=object(),
+                    producer="43cd0-admission",
+                    old_sources=sources,
+                    new_sources=sources,
+                    before_flow=0,
+                    after_flow=0,
+                    flow_view=sources.file_view2026(0),
+                    current_pointer_view=sources.admission_view2026(),
+                )
+
     def test_actual141_transition_keeps_recovery_position_while_cpu_resets(self):
         from scripts.calibration_2026 import native2026_metadata_for_cpu
         from scripts.cuw_file_services import admit_file_sources_2026
@@ -116,21 +603,52 @@ class ManagedServicesTests(unittest.TestCase):
                 engine._select_worker_metadata(
                     selected, controller=controller, worker=worker
                 )
-                worker._persist_position()
+                persistence.update_cpu(1)
                 self.assertEqual(persistence.state.write_cpu_index, 1)
+                self.assertEqual(
+                    persistence.state.offset_of_write_cpu_multi_cal_index, 1
+                )
                 replacement = issued.after_group_reset(0, worker=worker)
                 engine._accept_worker_file_reset(issued, replacement, worker=worker)
 
-            self.assertEqual(worker.source_state.cpu_offset, 1)
+            self.assertEqual(worker.source_state.cpu_offset, 0)
+            self.assertEqual(persistence.state.offset_of_write_cpu_multi_cal_index, 1)
             self.assertEqual(worker.source_state.current_global_cpu_index, 0)
             self.assertEqual(persistence.state.write_cpu_index, 1)
             engine._validate_persistence_source(engine.native_metadata)
+
             with engine.controller_execution(controller, 2):
                 chained = replacement.after_group_reset(0, worker=worker)
                 engine._accept_worker_file_reset(replacement, chained, worker=worker)
             transition = engine._persistence_cpu_transition2026
             assert transition is not None
             self.assertEqual((transition.before_cpu, transition.after_cpu), (0, 0))
+            engine._validate_persistence_source(engine.native_metadata)
+            before_failed_reset = engine.file_sources
+            assert before_failed_reset is not None
+            before_cpu_proof = engine._persistence_cpu_transition2026
+            before_file_proof = engine._persistence_file_flow_transition2026
+            rejected_replacement = before_failed_reset.after_group_reset(
+                0, worker=worker
+            )
+            with (
+                engine.controller_execution(controller, 2),
+                patch.object(
+                    worker,
+                    "_file_reset_selected",
+                    side_effect=RuntimeError("worker prepublication fault"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "worker prepublication"),
+            ):
+                engine._accept_worker_file_reset(
+                    before_failed_reset, rejected_replacement, worker=worker
+                )
+            self.assertIs(engine.file_sources, before_failed_reset)
+            self.assertIs(worker._file_sources, before_failed_reset)
+            self.assertIs(engine._persistence_cpu_transition2026, before_cpu_proof)
+            self.assertIs(
+                engine._persistence_file_flow_transition2026, before_file_proof
+            )
             engine._validate_persistence_source(engine.native_metadata)
             snapshot = persistence._snapshot()
             engine._validate_persistence_source(
@@ -146,7 +664,6 @@ class ManagedServicesTests(unittest.TestCase):
             self.assertIs(engine._persistence_cpu_transition2026, transition)
             engine._validate_persistence_source(engine.native_metadata)
             stale_fields = {
-                "origin": object(),
                 "worker": object(),
                 "persistence": object(),
                 "state": object(),
@@ -224,9 +741,465 @@ class ManagedServicesTests(unittest.TestCase):
                 engine._accept_worker_file_reset(
                     replacement, failing_replacement, worker=worker
                 )
-            self.assertIsNone(engine._persistence_cpu_transition2026)
+            reset_cpu_proof = engine._persistence_cpu_transition2026
+            self.assertIsNotNone(reset_cpu_proof)
+            self.assertIs(reset_cpu_proof.file_sources, failing_replacement)
+            self.assertIsNone(engine._persistence_file_flow_transition2026)
+            engine._validate_persistence_source(engine.native_metadata)
+
+    def test_actual_mode2_reset_issues_independent_file_flow_proof(self):
+        from scripts.cuw_file_services import admit_file_sources_2026
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+        from scripts.demo_calibration import table
+        from scripts.programming_2026_common import (
+            NativeGeneralParameters2026,
+            NativeRuntime2026,
+        )
+        from tests.test_calibration_2026 import cuw, logical_text
+        from tests.test_cuw_engine_worker import make_controller
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        engine = CUWEngine2026(
+            image.read_bytes(),
+            general_parameters=NativeGeneralParameters2026.from_sources(
+                {
+                    "Parameter.ini": table(
+                        (
+                            "ParamFileKeySystemProtocolMicon",
+                            "EngineTypeFlag",
+                            "FlagToOutputAllAttachedInformation",
+                            "CalibrationType",
+                        ),
+                        (("149CAN", "1", "0", "27"),),
+                    )
+                },
+                encoded=False,
+            ),
+        )
+        engine.configure(struct.pack("<IIddII", 2, 0, 0, 0, 0, 0))
+        part = cuw(
+            logical_text(209)
+            .replace("P5-Unified", "Phase6")
+            .replace("[Node01]", "[Node01]\nDiagID=0700\nLogicalAddress=01")
+            .replace("authored-new", "PART")
+        )
+        whole = cuw(
+            logical_text(209)
+            .replace("P5-Unified", "Phase6")
+            .replace("[Node01]", "[Node01]\nDiagID=0700\nLogicalAddress=01")
+            .replace("authored-new", "WHOLE")
+        )
+        plain = cuw(
+            logical_text(209)
+            .replace("P5-Unified", "Phase6")
+            .replace("[Node01]", "[Node01]\nDiagID=0700\nLogicalAddress=02")
+            .replace("authored-new", "FIRST")
+        )
+        group = b"[Vehicle]\nContactType=Phase6\n" + archive(
+            [
+                (
+                    "Setting.ini",
+                    (
+                        b"[DeltaReproCalFile]\nFileNum=1\nFileName1=part.cuw\n"
+                        b"[WholeReproCalFile]\nFileName=whole.cuw\n"
+                    ),
+                ),
+                ("part.cuw", part),
+                ("whole.cuw", whole),
+            ]
+        )
+        engine.load_cuw(plain)
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(
+                Path(directory),
+                ReproInfoState(
+                    (
+                        RecoveryCalibration("plain.cuw", plain),
+                        RecoveryCalibration("group.scuw", group),
+                    ),
+                    multi_calibration_file_num=2,
+                    calibration_file_index=0,
+                ),
+            )
+            engine.bind_persistence(persistence)
+            issued = admit_file_sources_2026(
+                engine,
+                "input.json",
+                b'["plain.cuw","group.scuw"]',
+                region=0,
+                source_files={"plain.cuw": plain, "group.scuw": group},
+            )
+            engine.bind_file_sources(issued)
+            self.addCleanup(engine.close)
+            self.assertEqual(issued.file_names, ("plain.cuw", "part.cuw"))
+            self.assertEqual(issued.delta_map, ((1, 0),))
+            controller = make_controller(NativeRuntime2026(lambda *_args: None))
+            worker = engine.bind_worker(controller)
+            with engine.controller_execution(controller, 2):
+                engine._select_worker_metadata(
+                    issued.files[1], controller=controller, worker=worker
+                )
+                replacement = issued.after_group_reset(1, worker=worker)
+                engine._accept_worker_file_reset(issued, replacement, worker=worker)
+
+            proof = engine._persistence_file_flow_transition2026
+            self.assertIsNotNone(proof)
+            assert proof is not None
+            self.assertEqual(proof.producer, "4b900-mode2")
+            self.assertIs(proof.origin, replacement)
+            self.assertIs(proof.old_sources, issued)
+            self.assertIs(proof.new_sources, replacement)
+            self.assertEqual((proof.before_flow, proof.after_flow), (0, 1))
+            self.assertEqual(proof.persisted_file_index, 0)
+            self.assertEqual(worker._flow_file_index2026, 1)
+            self.assertEqual(persistence.state.calibration_file_index, 0)
+            engine._validate_persistence_source(engine.native_metadata)
+            snapshot = persistence._snapshot()
+            engine._validate_persistence_source(
+                engine.native_metadata, state_snapshot=snapshot
+            )
+            self.assertIs(engine._persistence_file_flow_transition2026, proof)
+
+            flow_view, pointer_view = engine._persistence_file_views2026(
+                replacement, engine.native_metadata, worker._flow_file_index2026
+            )
+            with engine.controller_execution(controller, 2):
+                with self.assertRaises(ValueError):
+                    engine._record_file_flow_transition2026(
+                        worker=worker,
+                        origin=object(),
+                        producer="3d120-next",
+                        old_sources=replacement,
+                        new_sources=replacement,
+                        before_flow=99,
+                        after_flow=1,
+                        flow_view=flow_view,
+                        current_pointer_view=pointer_view,
+                    )
+                self.assertIs(engine._persistence_file_flow_transition2026, proof)
+                with self.assertRaises(ValueError):
+                    engine._record_file_flow_transition2026(
+                        worker=worker,
+                        origin=object(),
+                        producer="3d120-next",
+                        old_sources=replacement,
+                        new_sources=replacement,
+                        before_flow=1,
+                        after_flow=1,
+                        flow_view=flow_view,
+                        current_pointer_view=pointer_view,
+                    )
+                persistence.state.calibration_file_index = 1
+                with self.assertRaises(ValueError):
+                    engine._clear_file_flow_transition2026(
+                        worker=worker, origin=object()
+                    )
+                persistence.state.calibration_file_index = 0
+            self.assertIs(engine._persistence_file_flow_transition2026, proof)
+            engine._validate_persistence_source(engine.native_metadata)
+
+            persistence.state.write_cpu_index = 1
             with self.assertRaisesRegex(ValueError, "actual engine target"):
                 engine._validate_persistence_source(engine.native_metadata)
+            persistence.state.write_cpu_index = 0
+            engine._validate_persistence_source(engine.native_metadata)
+            persistence.state.calibration_file_index = 2
+            with self.assertRaisesRegex(ValueError, "actual D71C flow"):
+                engine._validate_persistence_source(engine.native_metadata)
+            persistence.state.calibration_file_index = 0
+            engine._validate_persistence_source(engine.native_metadata)
+            with engine.controller_execution(controller, 2):
+                engine._select_worker_metadata(
+                    replacement.files[0], controller=controller, worker=worker
+                )
+            self.assertIsNone(engine._persistence_file_flow_transition2026)
+            with self.assertRaisesRegex(ValueError, "actual D71C flow"):
+                engine._validate_persistence_source(engine.native_metadata)
+
+    def test_reissue_rebinds_both_live_witnesses_and_rolls_back_exact_records(self):
+        from threading import Event
+
+        from scripts.calibration_2026 import native2026_metadata_for_cpu
+        from scripts.calibration_catalog import CalibrationCatalog
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            load_recovery_state,
+            parse_recovery_info,
+        )
+        from scripts.demo_calibration import table
+        from scripts.programming_2026_common import NativeFrontendParameters2026
+        from tests.test_calibration_2026 import cuw
+        from tests.test_cuw_engine_threads import ThreadOwnershipTests
+        from tests.test_cuw_engine_worker import encoded_table
+
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+
+        def phase6(address: str, target: str) -> bytes:
+            text = (
+                "[Format]\nVersion=105\n[Vehicle]\nNumberOfNode=1\n"
+                "ContactType=Phase6\nKindOfECU=149\n[Node01]\n"
+                "RequiredSpecReproVer=02\nNumberOfCalibration=2\n"
+                f"DiagID=0700\nLogicalAddress={address}\n"
+            )
+            for index in (1, 2):
+                text += (
+                    f"[CPU1{index}]\nCPUImageName={target}{index}.vbf\n"
+                    f"CPUType={310 + index}\nNewCID=NEW{index}\n"
+                    f"StartAddress=010000{index}000\n"
+                    "SizeOfUncompressedDownloadData=00000020\n"
+                    "SizeOfDownloadData=00000004\nNumberOfTargets=1\n"
+                    f"01_TargetCalibration={target}{index}\n"
+                )
+            return cuw(text, (b"data1", b"data2"))
+
+        part = phase6("01", "PART")
+        whole = phase6("01", "WHOLE")
+        plain = phase6("02", "PLAIN")
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as stream:
+            stream.writestr(
+                "Setting.ini",
+                "[DeltaReproCalFile]\nFileNum=1\nFileName1=part.cuw\n"
+                "[WholeReproCalFile]\nFileName=whole.cuw\n",
+            )
+            stream.writestr("part.cuw", part)
+            stream.writestr("whole.cuw", whole)
+        group = (
+            b"[Vehicle]\nContactType=Phase6\n[DataCompression]\n" + payload.getvalue()
+        )
+        frontend_sources = {
+            "Parameter.ini": table(
+                (
+                    "ParamFileKeySystemProtocolMicon",
+                    "WaitTimeForIGOFFON",
+                    "WaitTimeAfterBatteryDisconnected",
+                    "WaitTimeAfterBatteryConnected",
+                    "BatteryVoltageUpperThreshold",
+                ),
+                (
+                    ("149Phase6311", "10", "20", "30", "12000"),
+                    ("149P5-Unified311", "10", "20", "30", "12000"),
+                    ("149Phase6", "10", "20", "30", "12000"),
+                ),
+            ),
+            "CanIDTable.ini": table(
+                ("RequestCANID", "CalibrationType"), (("0700", "31"),)
+            ),
+            "LogicalAddressTable.ini": table(
+                ("LogicalAddress", "CalibrationType"),
+                (("01", "41"), ("02", "42")),
+            ),
+            "P5-Unified.ini": b"",
+        }
+
+        def encode_frontend_table(data):
+            rows = tuple(
+                tuple(line.split(",")) for line in data.decode("utf-8").splitlines()
+            )
+            return encoded_table(rows[0], rows[1:])
+
+        catalog_sources = {
+            name: encode_frontend_table(data)
+            for name, data in frontend_sources.items()
+            if name.endswith(".ini") and name not in ("P5-Unified.ini",)
+        }
+        catalog_sources["P5-Unified.ini"] = encoded_table(
+            ("ParamFileKeySystemProtocolMicon",), (("149P5-Unified",),)
+        )
+        catalog_sources["149P5-Unified311.ini"] = encoded_table(
+            ("ParamFileKeySystemProtocolMicon", "DLLFileNameForGetCID"),
+            (("149P5-Unified311", "TCUWCanUnifiedCIDGetter.dll"),),
+        )
+        catalog_sources["149Phase6.ini"] = encoded_table(
+            ("ParamFileKeySystemProtocolMicon", "DLLFileNameForGetCID"),
+            (("149Phase6", "TCUWCanUnifiedCIDGetter.dll"),),
+        )
+        frontend = NativeFrontendParameters2026.from_sources(
+            catalog_sources, encoded=True
+        )
+        fixture = ThreadOwnershipTests()
+        self.addCleanup(fixture.doCleanups)
+        engine, controller, old_job, session = fixture.imported_prepare(
+            operation="get_cid",
+            paired=True,
+            source=plain,
+            source_files={"plain.cuw": plain, "group.scuw": group},
+            frontend_parameters=frontend,
+            catalog_sources=catalog_sources,
+            module_name="TCUWCanUnifiedCIDGetter.dll",
+        )
+        sources = engine.file_sources
+        assert sources is not None
+        document = parse_recovery_info(
+            b"[RecoveryInfo]\nMultiCalibrationFileNum=2\n"
+            b"CalibrationFileIndex=0\n"
+            b"[RecoveryInfo1]\nSavedCalibrationFilePath=plain.cuw\n"
+            b"[RecoveryInfo2]\nSavedCalibrationFilePath=group.scuw\n",
+            encoded=False,
+        )
+        state = load_recovery_state(
+            document,
+            {"plain.cuw": plain, "group.scuw": group},
+            cpu_capacity=4,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(Path(directory), state)
+            engine.bind_persistence(persistence)
+            bound_persistence = engine.persistence
+            assert bound_persistence is not None
+            worker = engine.worker
+            engine.bind_retry_controller()
+            fault = ValueError("authored stopped-CID clock fault")
+            clock_entered = Event()
+            clock_release = Event()
+
+            controller.runtime.local_milliseconds_of_day = lambda: 1000
+
+            def clock_fault():
+                clock_entered.set()
+                if not clock_release.wait(2):
+                    raise TimeoutError("Clock fault test release was not signaled")
+                raise fault
+
+            with engine.controller_execution(controller, 2):
+                engine._select_worker_metadata(
+                    sources.files[1], controller=controller, worker=worker
+                )
+                cpu_one = native2026_metadata_for_cpu(engine.native_metadata, 1)
+                engine._select_worker_metadata(
+                    cpu_one, controller=controller, worker=worker
+                )
+                bound_persistence.update_cpu(1)
+                replacement = sources.after_group_reset(1, worker=worker)
+                engine._accept_worker_file_reset(sources, replacement, worker=worker)
+            engine._validate_persistence_source(engine.native_metadata)
+            old_cpu_proof = engine._persistence_cpu_transition2026
+            old_file_proof = engine._persistence_file_flow_transition2026
+            self.assertIsNotNone(old_cpu_proof)
+            self.assertIsNotNone(old_file_proof)
+            replay_fixture = ThreadOwnershipTests()
+            self.addCleanup(replay_fixture.doCleanups)
+            _replay_engine, _replay_controller, _replay_job, replay = (
+                replay_fixture.imported_prepare(
+                    operation="get_cid",
+                    source=replacement.selected_source,
+                    source_files={
+                        "resume.cuw": replacement.selected_source,
+                        "plain.cuw": plain,
+                    },
+                    catalog_sources=catalog_sources,
+                    module_name="TCUWCanUnifiedCIDGetter.dll",
+                )
+            )
+            session.trace.native_local_milliseconds_of_day = clock_fault
+            controller.runtime.local_milliseconds_of_day = clock_fault
+            cast(Any, replay.trace).action = controller.runtime.action
+            replay.trace.clock = controller.runtime.clock
+            replay.trace.cancelled = controller.runtime.cancelled
+            replay.trace.native_local_seconds_of_day = (
+                controller.runtime.local_seconds_of_day
+            )
+            replay.trace.native_local_milliseconds_of_day = (
+                controller.runtime.local_milliseconds_of_day
+            )
+            replay_catalog = dict(replay._catalog_sources)
+            replay_catalog["149Phase6.ini"] = encoded_table(
+                (
+                    "ParamFileKeySystemProtocolMicon",
+                    "DLLFileNameForGetCID",
+                ),
+                (("149Phase6", "TCUWCanUnifiedCIDGetter.dll"),),
+            )
+            replay = replace(
+                replay,
+                catalog=CalibrationCatalog.from_tables(
+                    {
+                        name: data
+                        for name, data in replay_catalog.items()
+                        if name not in ("CanIDTable.ini", "LogicalAddressTable.ini")
+                    }
+                ),
+                _catalog_sources=replay_catalog,
+            )
+            replay.bind_runtime2026(controller.runtime)
+            replay.bind_engine2026(engine)
+            replay.bind_controller2026(controller)
+            old_job.start(replay)
+            self.assertTrue(clock_entered.wait(2))
+            self.assertTrue(engine._native_receiving_cfe2_2026)
+            self.assertGreater(old_job._sequence, 0)
+            self.assertIsNotNone(old_job._lease)
+            with self.assertRaises(TimeoutError):
+                engine.stop_receiving_cid(timeout=0.05)
+            clock_release.set()
+            with self.assertRaises(ValueError) as caught:
+                old_job.result(2)
+            self.assertIs(caught.exception, fault)
+            self.assertEqual(engine.stop_receiving_cid(timeout=2), 0)
+            controller.runtime.local_milliseconds_of_day = lambda: 1000
+            rebind_fault = RuntimeError("authored dependent-owner rebind fault")
+            self.assertTrue(engine.native_cancelled())
+            self.assertFalse(old_job.native_worker_exists)
+            self.assertFalse(old_job.host_stop_requested)
+            self.assertTrue(old_job.state.stop_requested)
+            self.assertFalse(worker.source_state.continuation_pending)
+            self.assertEqual(engine.native_phase, 0)
+            with (
+                patch(
+                    "scripts.cuw_engine_worker._finalize_engine_worker_replacement",
+                    side_effect=rebind_fault,
+                ),
+                self.assertRaises(RuntimeError) as caught,
+            ):
+                engine.bind_thread_job(controller)
+            self.assertIs(caught.exception, rebind_fault)
+            self.assertIs(engine._persistence_cpu_transition2026, old_cpu_proof)
+            self.assertIs(engine._persistence_file_flow_transition2026, old_file_proof)
+            self.assertIs(engine.worker, worker)
+            self.assertIs(engine._thread_job, old_job)
+            engine._validate_persistence_source(engine.native_metadata)
+
+            next_job = engine.bind_thread_job(controller)
+            next_worker = engine.worker
+            self.assertIsNot(next_worker, worker)
+            rebound_cpu = engine._persistence_cpu_transition2026
+            rebound_file = engine._persistence_file_flow_transition2026
+            assert rebound_cpu is not None and rebound_file is not None
+            assert old_cpu_proof is not None and old_file_proof is not None
+            self.assertIsNot(rebound_cpu, old_cpu_proof)
+            self.assertIsNot(rebound_file, old_file_proof)
+            self.assertEqual(rebound_cpu.producer, old_cpu_proof.producer)
+            self.assertIs(rebound_cpu.origin, old_cpu_proof.origin)
+            self.assertEqual(
+                (rebound_cpu.before_cpu, rebound_cpu.after_cpu),
+                (old_cpu_proof.before_cpu, old_cpu_proof.after_cpu),
+            )
+            self.assertEqual(rebound_cpu.persisted_cpu, old_cpu_proof.persisted_cpu)
+            self.assertEqual(rebound_file.producer, old_file_proof.producer)
+            self.assertIs(rebound_file.origin, old_file_proof.origin)
+            self.assertIs(rebound_file.old_sources, old_file_proof.old_sources)
+            self.assertIs(rebound_file.new_sources, old_file_proof.new_sources)
+            self.assertEqual(
+                (rebound_file.before_flow, rebound_file.after_flow),
+                (old_file_proof.before_flow, old_file_proof.after_flow),
+            )
+            self.assertEqual(
+                rebound_file.persisted_file_index, old_file_proof.persisted_file_index
+            )
+            self.assertIs(rebound_cpu.worker, next_worker)
+            self.assertIs(rebound_file.worker, next_worker)
+            engine._validate_persistence_source(engine.native_metadata)
+            self.addCleanup(next_job.stop)
+            persistence.state.calibration_file_index = 1
+            engine._validate_persistence_source(engine.native_metadata)
 
     def test_divided_image_resume_preserves_percentage(self):
         from scripts.demo_calibration import table
@@ -1865,6 +2838,8 @@ class ManagedServicesTests(unittest.TestCase):
             ({"receiving": True, "receiving_prompt": True}, (1, False)),
             ({"receiving_prompt": True, "error": 3}, (2, False)),
             ({"error": 3}, (5004, True)),
+            ({"error": 0xFFFFFFFF}, (5004, True)),
+            ({"error": 0x80000001}, (5004, True)),
         ):
             self.assertEqual(replace(base, **fields).receiving_status(), expected)
         self.assertEqual(replace(base, receiving=True).receiving_result_status(), 5005)
@@ -1905,6 +2880,7 @@ class ManagedServicesTests(unittest.TestCase):
             ),
         ):
             self.assertEqual(replace(base, **fields).reprogramming_status(), expected)
+
         expected = (7002, 2, 1, 1, 3, 4, 7011, 7004, 7010, 7005, 7003, 7002)
         self.assertEqual(
             tuple(
@@ -1927,6 +2903,104 @@ class ManagedServicesTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             EngineStatus2026(phase=True)
+        with self.assertRaises(ValueError):
+            EngineStatus2026(error=-1)
+        with self.assertRaises(ValueError):
+            EngineStatus2026(receiving=cast(bool, 1))
+
+    def test_native_receiving_projection_uses_literal_engine_dw_fields(self):
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        engine = CUWEngine2026(image.read_bytes())
+        self.addCleanup(engine.close)
+        self.assertEqual(engine.native_receiving_status2026(), (0x138B, False))
+        self.assertFalse(engine.native_receiving_cfe2_2026)
+        self.assertFalse(engine.native_receiving_prompt2026)
+
+        engine._worker_phase = 0
+        engine._native_error_output = (0xFFFFFFFF, 0)
+        self.assertEqual(engine.native_receiving_status2026(), (0x138C, True))
+        engine._native_receiving_prompt2026 = True
+        self.assertEqual(engine.native_receiving_status2026(), (2, False))
+        engine._native_receiving_cfe2_2026 = True
+        self.assertEqual(engine.native_receiving_status2026(), (1, False))
+        engine._native_error_output = (2, 0)
+        engine._native_fatal_output = True
+        engine._worker_phase = 1
+        self.assertEqual(engine.native_receiving_status2026(), (0xFA4, False))
+        engine._native_error_output = (0, 0)
+        self.assertEqual(engine.native_receiving_status2026(), (0x7D2, True))
+        engine._native_fatal_output = False
+        engine.__dict__["_native_receiving_cfe2_2026"] = 1
+        with self.assertRaises(ValueError):
+            engine.native_receiving_status2026()
+
+    def test_high_bit_native_receiving_code_reaches_both_log_paths(self):
+        from scripts.cuw_persistence import (
+            CUWPersistence,
+            RecoveryCalibration,
+            ReproInfoState,
+        )
+        from scripts.programming_2026_common import NativeRuntime2026
+        from tests.test_calibration_2026 import cpu_text, cuw
+        from tests.test_cuw_engine_worker import (
+            EngineWorker2026Tests,
+            make_controller,
+        )
+
+        fixture = EngineWorker2026Tests("runTest")
+        source = cuw(cpu_text())
+        previous = bytes(0x2160)
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(
+                Path(directory),
+                ReproInfoState((RecoveryCalibration("source.cuw", source),)),
+            )
+            engine = fixture.engine(source, persistence=persistence)
+            self.addCleanup(engine.close)
+            engine._worker_phase = 0
+            engine._native_error_output = (0x80000001, 0)
+            mock_worker = MagicMock()
+            mock_worker.write_programming_log.return_value = b"serialized"
+            with patch.object(
+                CUWEngine2026,
+                "worker",
+                new_callable=PropertyMock,
+                return_value=mock_worker,
+            ):
+                self.assertEqual(
+                    engine.get_info_for_repro_log(previous), (0, b"serialized")
+                )
+            mock_worker.write_programming_log.assert_called_once_with(previous)
+
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = CUWPersistence(
+                Path(directory),
+                ReproInfoState((RecoveryCalibration("source.cuw", source),)),
+            )
+            engine = fixture.engine(source, persistence=persistence)
+            self.addCleanup(engine.close)
+            controller = make_controller(NativeRuntime2026(lambda *_args: None))
+            worker = engine.bind_worker(controller)
+            engine._worker_phase = 0
+            engine._native_error_output = (0xFFFFFFFF, 0)
+            log_info = MagicMock(return_value=object())
+            with (
+                patch.object(
+                    engine,
+                    "engine_runtime_device",
+                    return_value=MagicMock(connecting=False, last_message=None),
+                ),
+                patch("scripts.cuw_engine_worker.build_programming_log_info", log_info),
+            ):
+                info = worker.programming_log_info()
+            self.assertIs(info, log_info.return_value)
+            self.assertEqual(log_info.call_args.kwargs["receiving_status"], 0x138C)
 
     def test_native_vehicle_memory_both_formats_and_output(self):
         base = 0x10000000
@@ -2646,6 +3720,45 @@ class ControlContextScopeTests(unittest.TestCase):
                 self.assertEqual(engine.native_dh_type_cache2026, 0)
                 self.assertEqual(repro_state.ssmid, 0)
                 self.assertEqual(repro_state.dh_central_gw_type, 0)
+
+
+class ColdWaitCopyPointTests(unittest.TestCase):
+    def test_public_json_consumes_the_authenticated_copy_point_once(self):
+        from tests.test_cuw_file_services import PublicFileTests
+
+        fixture = PublicFileTests(
+            "test_public_multifile_bytes_reach_engine_and_actual_serializers"
+        )
+        fixture.setUp()
+        original = CUWEngine2026._complete_cold_32ff0_query_cid_copy2026
+        observed = []
+
+        def capture(engine, admission, step, stage_sources, metadata):
+            copied = original(engine, admission, step, stage_sources, metadata)
+            observed.append((engine, admission, step, stage_sources, metadata, copied))
+            return copied
+
+        try:
+            with patch.object(
+                CUWEngine2026,
+                "_complete_cold_32ff0_query_cid_copy2026",
+                capture,
+            ):
+                fixture.test_public_multifile_bytes_reach_engine_and_actual_serializers()
+            self.assertEqual(len(observed), 1)
+            engine, admission, step, sources, metadata, copied = observed[0]
+            self.assertIs(engine.file_sources, sources)
+            self.assertIs(engine.native_metadata, metadata)
+            self.assertEqual(
+                (step.operation, step.slot, step.value), ("32ff0", 0, True)
+            )
+            self.assertTrue(copied)
+            self.assertEqual(admission._query_cid_copy_count, 1)
+            with self.assertRaisesRegex(ValueError, "Exact live cold32ff0 copy point"):
+                original(engine, admission, step, sources, metadata)
+            self.assertEqual(admission._query_cid_copy_count, 1)
+        finally:
+            fixture.doCleanups()
 
 
 if __name__ == "__main__":

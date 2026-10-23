@@ -311,9 +311,9 @@ class ControlParameterPool2026Tests(unittest.TestCase):
         for capacity in (0, 1):
             with self.subTest(capacity=capacity):
                 engine = self.make_engine(classic_source())
-                engine.common_definitions.num_cpu_maxnum = capacity
                 controller = self.controller()
                 engine.bind_worker(controller)
+                engine.common_definitions.num_cpu_maxnum = capacity
 
                 def check(
                     _worker, capacity=capacity, engine=engine, controller=controller

@@ -38,6 +38,52 @@ context during admission. Constructing the root does not start or execute it and
 does not claim successful programming; physical behavior remains
 `PHYSICAL_UNCONFIRMED`.
 
+An API4 getter continuation can produce the next raw `get_cid` root only during
+145's synchronous outer-thread promotion. The producer validates the exact
+issued continuation before copying the old session context, and derives the
+calibration container, node, CPU index and current identifiers from the
+continuation's post-tail source metadata and observation. It retains the same
+catalog, module bytes, attachments, runtime owners and strict trace, while
+starting unused and without a selected module or held CONTROL target. The real
+child creates its CONTROL context after phase admission.
+
+For bound CONTROL stages, source protocol lineage is recorded at the actual
+export-body ingress: after dispatch and runner-factory success, immediately
+before marking the session used and invoking that runner. Standalone replay and
+runner-factory failures do not enter this source boundary.
+
+The bound Suzuki runner has one similarly narrow callback scope. It opens only
+after source dispatch and runner construction succeed, and encloses the actual
+selected Suzuki body. `notify_igoffon_wait` can update the live engine timing
+state only from that authenticated body; standalone replay and unrelated host
+notifications remain ordinary provider calls. The callback proof walks the
+bounded producer stack to the exact selected runner entry and rejects nested
+`execute_context` calls made during an outstanding provider call.
+
+The Suzuki callback regression also exercises the source writer through a real
+phase-2 raw CONTROL execution. Its paired test driver returns the transmitted
+CAN echo before each source-addressed response; at `notify_igoffon_wait`, the
+test verifies the selected `StartFlashWrite` target and helper lease are live,
+then confirms the worker retains the callback's wait value after the scope and
+lease unwind. This proves the software callback path only; it does not validate
+a complete flash on a physical J2534 device.
+
+The focused replay tests also build an authored classic CAN Format40 source and
+explicit source-selected `149CAN311/312.ini` catalog rows. Two actual CanCID
+body acquisitions consume the authored `49 04 02` primitive payloads on one
+paired provider and compare each returned identifier tuple to those delivered
+bytes; the first acquisition is then strictly replayed. This is an offline
+software fixture, not a vehicle capture or proof of the later G7 promotion.
+
+The test-only `make_authored_control_recorder` starts the same empty-row replay
+trace, runtime and paired provider before the first getter. Its primitive reply
+callback answers only source-requested SDK operations and host observations;
+each request is appended to the trace and checked by the original trace
+consumer. It cannot provide getter identifiers or other native business
+results. A caller can drive successive source roots on that one live trace and
+validate the accumulated rows at a checkpoint. This authoring run is distinct
+from strict replay of frozen rows.
+
 ## Source identity
 
 For `source="recorded_unverified"`, each supplied operation module must match the

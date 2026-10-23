@@ -10,6 +10,7 @@ import tempfile
 from array import array
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -21,6 +22,7 @@ from scripts.native_modules import NativeModuleIdentity, identify_native_module
 from scripts.programming import NativeTransportError
 
 if TYPE_CHECKING:
+    from scripts.cuw_engine_worker import _NativeGetterContinuation2026
     from scripts.j2534_2026 import J2534Device2026, J2534InterfacePair2026
     from scripts.programming_2026_common import NativeParameterBinding2026
 
@@ -1477,6 +1479,80 @@ class ProgrammingReplay:
             _module_files=self._module_files,
         )
 
+    def _next_cid_root_34cb0_2026(
+        self, entry: _NativeGetterContinuation2026
+    ) -> ProgrammingReplay:
+        """Build the next raw getter root from a promoted native continuation."""
+        from scripts.calibration_2026 import Native2026Metadata
+        from scripts.cuw_engine_threads import EngineThreadJob2026
+        from scripts.cuw_engine_worker import (
+            EngineWorker2026,
+            _NativeGetterContinuation2026,
+        )
+
+        if type(entry) is not _NativeGetterContinuation2026:
+            raise TypeError("Exact native getter continuation required")
+        if type(entry.job) is not EngineThreadJob2026:
+            raise TypeError("Exact native getter job required")
+        if type(entry.worker) is not EngineWorker2026:
+            raise TypeError("Exact native getter worker required")
+
+        entry.job._validate_promoted_getter_continuation_2026(entry)
+
+        previous = entry.old_session
+        metadata = entry.post_tail_metadata
+        if (
+            type(previous) is not ProgrammingReplay
+            or previous is not self
+            or type(metadata) is not Native2026Metadata
+        ):
+            raise ValueError("Promoted getter source root and metadata required")
+        container = metadata.source_container
+        digest = metadata.source_sha256
+        if container is None or container.digest != digest:
+            raise ValueError("Promoted getter FILE identity is inconsistent")
+
+        context = deepcopy(previous.context)
+        observations = dict(context["observations"])
+        observations["current_cids"] = tuple(
+            cid.decode("latin1") for cid in entry.observation.received_cids
+        )
+        host = dict(observations["host"])
+        host["cpu_index"] = metadata.cpu_index
+        if "native2026" in host:
+            native = dict(host["native2026"])
+            native.pop("export", None)
+            native.pop("stage", None)
+            native["cpu_index"] = metadata.cpu_index
+            host["native2026"] = native
+        host.pop("export", None)
+        host.pop("stage", None)
+        observations["host"] = host
+        context.update(
+            operation="get_cid",
+            node=metadata.node,
+            calibration_sha256=digest,
+            observations=observations,
+        )
+        input_hashes = dict(previous.input_hashes)
+        input_hashes["calibration"] = digest
+
+        # Owner references are already authenticated; binding the engine reselects a module.
+        return ProgrammingReplay(
+            container,
+            context,
+            previous.catalog,
+            previous.modules,
+            previous.attachments,
+            previous.trace,
+            input_hashes,
+            _engine2026=previous._engine2026,
+            _runtime2026=previous._runtime2026,
+            _controller2026=previous._controller2026,
+            _catalog_sources=previous._catalog_sources,
+            _module_files=previous._module_files,
+        )
+
     def _next_control_export2026(self, target, export: str):
         """Clone one source-issued CONTROL export onto this exact shared trace."""
         from scripts.cuw_2026 import CUWEngine2026
@@ -1930,12 +2006,22 @@ class ProgrammingReplay:
         lifetime. This method neither closes the runtime nor promotes completion.
         """
         self.bind_runtime2026(runtime)
+        from scripts import programming_2026_suzuki_fhi as suzuki2026
+
         if self._control_target2026 is None:
             selection, module, addresses, node, cpu, vehicle = self._dispatch()
             self._executed_selection2026 = selection
             runner = self._runner(selection, module, addresses, node, cpu, vehicle)
-            self.used = True
-            result = runner()
+            family = suzuki2026._MAIN_MODULES.get(module.name)
+            if family is not None and family[1].startswith("suzuki"):
+                with runtime._suzuki_igoffon_wait_scope_2026(
+                    self, engine=self._engine2026, controller=self._controller2026
+                ):
+                    self.used = True
+                    result = runner()
+            else:
+                self.used = True
+                result = runner()
         else:
             self._validate_control_stage2026()
             with self._engine2026.controller_export_target(
@@ -1944,8 +2030,19 @@ class ProgrammingReplay:
                 selection, module, addresses, node, cpu, vehicle = self._dispatch()
                 self._executed_selection2026 = selection
                 runner = self._runner(selection, module, addresses, node, cpu, vehicle)
-                self.used = True
-                result = runner()
+                self._engine2026._record_getter_protocol_ingress2026(self)
+                family = suzuki2026._MAIN_MODULES.get(module.name)
+                if family is not None and family[1].startswith("suzuki"):
+                    with runtime._suzuki_igoffon_wait_scope_2026(
+                        self,
+                        engine=self._engine2026,
+                        controller=self._controller2026,
+                    ):
+                        self.used = True
+                        result = runner()
+                else:
+                    self.used = True
+                    result = runner()
                 if (
                     isinstance(result, dict)
                     and self._control_export2026 == "StartGetCID"

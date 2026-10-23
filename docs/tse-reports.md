@@ -161,6 +161,18 @@ association is by normal slot position and exact pair path, never by stored
 signal identifier; sibling signals and ADS rows remain unannotated. Stored
 sample text, raw values and flags are unchanged.
 
+The existing per-pair normal KeyCycle header also carries a
+`sequence_coordinate_plan` for the source-proved zero-step pre-sort subset. An
+empty saved sample array has a derived empty plan. With samples, the plan is
+derived only when the saved divisor is zero and every sample fails the normal
+sequence admission checks; otherwise `points` is `None` and the status is
+`source-semantics-open`. Derived points retain staging order and contain only
+the proven zero coordinate, tag and source index. Raw counts, divisor, masks
+and their source paths remain attached to the same header. This does not claim
+general numeric conversion, final sorting, ADS sequence behavior or plotted
+coordinates. Plan metadata, copied masks and points share the existing bounded
+view budget.
+
 Operation-history headers expose the six stored current-time fields (year,
 month, day, hour, minute, second) and preserve the following metadata byte.
 CommandAPI `23434–234c3` logs the same `GetAnalyzeWorkFactorApiRcv` fields;

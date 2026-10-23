@@ -274,7 +274,11 @@ class RetryController2026:
         self._battery_query = False
         self._battery_above_threshold = False
         self._battery_voltage = 0.0
-        self._resume_milliseconds = 0
+        if (
+            type(engine._native_prepare_d314_2026) is not int
+            or not 0 <= engine._native_prepare_d314_2026 < 86400000
+        ):
+            raise ValueError("Actual native D314 clock state required")
         self._queries: list[RetryQuery2026] = []
         self._inputs: list[RetryInput2026] = []
         configuration = engine.configuration
@@ -333,7 +337,7 @@ class RetryController2026:
                 self._battery_above_threshold,
                 self._battery_voltage,
                 self.engine.native_cycle_output,
-                self._resume_milliseconds,
+                self.engine._native_prepare_d314_2026,
                 tuple(self._error_counts),
             )
 
@@ -381,11 +385,13 @@ class RetryController2026:
         self.engine._require_native_prepare_prefix(worker)
         if type(milliseconds) is not int or not 0 <= milliseconds < 86400000:
             raise ValueError("Native local milliseconds within day required")
+        if self.engine._native_prepare_d314_2026 != milliseconds:
+            raise ValueError("Prepare clock must already be published at D314")
         with self._lock:
-            self._result = self._checkpoint_byte = 0
-            self._battery_query = self._battery_above_threshold = False
+            self._battery_above_threshold = False
             self._battery_voltage = 0.0
-            self._resume_milliseconds = milliseconds
+            self._battery_query = False
+            self._checkpoint_byte = 0
 
     def worker_started(self) -> None:
         remaining = self.worker.runtime.check()
@@ -596,7 +602,7 @@ class RetryController2026:
                 if self._pending or self._stopped.is_set():
                     return
                 if self._checkpoint_byte:
-                    self._resume_milliseconds = (
+                    self.engine._native_prepare_d314_2026 = (
                         self.worker.runtime.read_local_milliseconds_of_day()
                     )
                     self._checkpoint_byte = 0
@@ -629,7 +635,7 @@ class RetryController2026:
         cleanup.validate_owner(self.engine, self.worker)
         with self._lock:
             self._pending = False
-            self._result = self._resume_milliseconds = 0
+            self._result = self.engine._native_prepare_d314_2026 = 0
             self._changed.set()
 
     def _cleanup_reset(self, cleanup) -> None:
@@ -643,7 +649,9 @@ class RetryController2026:
             self._pending = self._battery_query = False
             self._battery_above_threshold = False
             self._battery_voltage = 0.0
-            self._result = self._resume_milliseconds = self._checkpoint_byte = 0
+            self._result = self.engine._native_prepare_d314_2026 = (
+                self._checkpoint_byte
+            ) = 0
             self._periodic_mode = self._periodic_identifier = 0
             self._error_counts[:] = [0] * len(self._error_counts)
             self._changed.set()

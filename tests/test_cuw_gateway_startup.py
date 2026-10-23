@@ -853,15 +853,18 @@ class GatewayStartupTests(unittest.TestCase):
             self.assertEqual(event["interval"], 2000)
         self.assertTrue(capture.used)
 
-    def test_actual_phase1_class1_publishes_980_and_equality1_new_password(self):
+    def test_actual_phase1_class1_publishes_980_without_changing_password_selection(
+        self,
+    ):
         sdk, device, engine, controller, worker, _, capture = self.p5_context()
         with engine.controller_execution(controller, 1):
+            self.assertFalse(worker.control_state.use_new_password)
             state = worker.run_gateway_startup()
             assert state is not None
             self.assertEqual(state.classification, 1)
             self.assertTrue(worker.native_initial_command_retry)
             self.assertEqual(engine.repro_gateway_node, 1)
-            self.assertTrue(worker.control_state.use_new_password)
+            self.assertFalse(worker.control_state.use_new_password)
         self.assertTrue(capture.used)
         self.assertEqual(sdk.replies, [])
         self.assertEqual(device.periodics, [18])

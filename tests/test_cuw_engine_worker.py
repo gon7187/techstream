@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import struct
 import tempfile
 import threading
@@ -37,11 +38,12 @@ def calibration(
     first_target: str = "OLD",
     second_cpu_type: str = "311",
     first_image: str = "authored.bin",
+    contact_type: str = "P5-Unified",
 ) -> bytes:
     gateway = "NumberOfGateway=1\n01_GatewayDiagID=0751\n" if daihatsu else ""
     text = (
         "[Format]\nVersion=105\n[Vehicle]\nNumberOfNode=1\n"
-        "ContactType=P5-Unified\nKindOfECU=149\n"
+        f"ContactType={contact_type}\nKindOfECU=149\n"
         f"[Node01]\nRequiredSpecReproVer=02\nNumberOfCalibration={cpus}\n{gateway}"
         f"[CPU11]\nCPUImageName={first_image}\nCPUType=311\nNewCID=NEW1\n"
         "StartAddress=0100001000\nSizeOfUncompressedDownloadData=00000020\n"
@@ -96,6 +98,752 @@ def encoded_table(headers: tuple[str, ...], rows: tuple[tuple[str, ...], ...]) -
 
 
 class EngineWorker2026Tests(unittest.TestCase):
+    def test_actual_ordinary_early_one_to_three_has_no_scheduling_tail(self):
+        from tests.test_cuw_engine_threads import ThreadOwnershipTests
+
+        fixture = ThreadOwnershipTests("runTest")
+        engine, controller, job, session = fixture.imported_prepare(paired=True)
+        self.addCleanup(fixture.doCleanups)
+        controller.runtime.local_milliseconds_of_day = lambda: 1000
+        session.trace.native_local_milliseconds_of_day = (
+            controller.runtime.local_milliseconds_of_day
+        )
+        # This real standalone source prefix produces BE8=1 on the same CStart.
+        # It is not a completed phase1 child or active-child reentry proof.
+        with engine.controller_execution(controller, 1):
+            pass
+        self.assertEqual(job.worker.native_prepare_handshake, 1)
+        flags = (
+            engine._native_outer_cfe0_2026,
+            engine._native_be54_pending2026,
+            engine._native_receiving_cfe2_2026,
+        )
+        reads = []
+        controller.runtime.local_milliseconds_of_day = lambda: reads.append(1) or 23456
+        job.start(session)
+        self.assertEqual(job.worker.native_prepare_handshake, 3)
+        self.assertEqual(reads, [1])
+        self.assertEqual(engine.native_phase, 1)
+        self.assertEqual(engine._native_prepare_d314_2026, 23456)
+        self.assertEqual(
+            (
+                engine._native_outer_cfe0_2026,
+                engine._native_be54_pending2026,
+                engine._native_receiving_cfe2_2026,
+            ),
+            flags,
+        )
+        self.assertEqual(job.state.sequence, 0)
+        self.assertIsNone(job._active_record)
+        self.assertIsNone(job._lease)
+        self.assertIsNone(job._prepared_ordinary_entry2026)
+        self.assertIsNone(job._ordinary_prepare_origin2026)
+        self.assertFalse(session.used)
+        self.assertEqual(session.trace.position, 0)
+
+    def _ordinary_rebuild_fixture(self, source, *, persistence=None, cpu_index=0):
+        from tests.test_cuw_engine_threads import ThreadOwnershipTests
+
+        fixture = ThreadOwnershipTests("runTest")
+        catalog = {
+            name + ".ini": encoded_table(
+                ("ParamFileKeySystemProtocolMicon", "DLLFileNameForPrepareWrite"),
+                ((name, "TCUWCanReproStdPrepareWriter.dll"),),
+            )
+            for name in (
+                "149P5-Unified",
+                "149P5-Unified03",
+                "149P5-Unified311",
+                "149P5-Unified312",
+            )
+        }
+        catalog["Parameter.ini"] = encoded_table(
+            (
+                "ParamFileKeySystemProtocolMicon",
+                "M16CTypeFlag",
+                "FORESTTypeFlag",
+                "PasswordAddress",
+                "ByteOrder",
+                "FlagToHoldSFormatRecords",
+            ),
+            (
+                ("149P5-Unified", "0", "0", "00", "1", "0"),
+                ("149P5-Unified311", "1", "0", "00", "1", "0"),
+                ("149P5-Unified312", "0", "1", "01", "1", "0"),
+            ),
+        )
+        result = fixture.imported_prepare(
+            paired=True,
+            source=source,
+            cpu_maximum=2,
+            cpu_index=cpu_index,
+            persistence=persistence,
+            module_name="TCUWCanReproStdPrepareWriter.dll",
+            catalog_sources=catalog,
+        )
+        self.addCleanup(fixture.doCleanups)
+        return result
+
+    def test_actual_ordinary_prefix_publishes_zero_file_before_late_cpu_fault(self):
+        from scripts.calibration_2026 import native2026_cpu_count
+
+        engine, controller, job, session = self._ordinary_rebuild_fixture(
+            calibration(cpus=2, first_image="authored.hex")
+        )
+        controller.runtime.local_milliseconds_of_day = lambda: 1000
+        session.trace.native_local_milliseconds_of_day = (
+            controller.runtime.local_milliseconds_of_day
+        )
+        self.receive(engine, controller, (b"UNKNOWN", b"OTHER"))
+        worker = job.worker
+        with engine.controller_execution(controller, 0):
+            self.assertFalse(worker.mark_cid_reception_complete())
+        self.assertEqual(
+            worker._judge_live_selection2026.unmatched_ids, (b"NEW1", b"NEW2")
+        )
+        before = worker.source_state
+        clock_reads = []
+        controller.runtime.local_milliseconds_of_day = lambda: (
+            clock_reads.append(1) or 12345
+        )
+        native_flags = (
+            engine._native_outer_cfe0_2026,
+            engine._native_be54_pending2026,
+            engine._native_receiving_cfe2_2026,
+        )
+        source = engine.native_metadata.source_container
+        self.assertEqual(before.cpu_offset, 0)
+        session.trace.native_local_milliseconds_of_day = (
+            controller.runtime.local_milliseconds_of_day
+        )
+        with self.assertRaisesRegex(ValueError, "Native CPU getter index absent"):
+            job.start(session)
+        self.assertEqual(clock_reads, [1])
+        self.assertEqual(engine._native_prepare_d314_2026, 12345)
+        self.assertEqual(engine.native_phase, 1)
+        self.assertEqual(
+            (
+                engine._native_outer_cfe0_2026,
+                engine._native_be54_pending2026,
+                engine._native_receiving_cfe2_2026,
+            ),
+            native_flags,
+        )
+        self.assertFalse(session.used)
+        self.assertEqual(session.trace.position, 0)
+        self.assertEqual(native2026_cpu_count(engine.native_metadata), 0)
+        self.assertIs(engine.native_metadata.source_container, source)
+        self.assertIs(worker._all_loaded_metadata[0], engine.native_metadata)
+        self.assertEqual(
+            worker._current_global_cpu_index, before.current_global_cpu_index
+        )
+        self.assertEqual(
+            (worker._current_node, worker._current_cpu_index),
+            (before.current_node, before.current_cpu_index),
+        )
+        self.assertTrue(worker._cid_rebuild_done_3542026)
+        self.assertEqual(job.state.sequence, 0)
+        self.assertIsNone(job._lease)
+        self.assertIsNone(job._ordinary_prepare_origin2026)
+
+    def test_actual_recovery_prefix_keeps_short_file_and_supersedes_cpu_proof(self):
+        from scripts.calibration_2026 import native2026_cpu_count
+        from scripts.cuw_persistence import encode_recovery_info, parse_recovery_info
+        from tests.test_calibration_2026 import logical_text
+
+        logical = (
+            logical_text()
+            .replace("[Vehicle]", "[Vehicle]\nKindOfECU=149")
+            .replace("NumberOfLogicalBlock=1", "NumberOfLogicalBlock=2")
+        )
+        logical += (
+            "[LogicalBlock102]\nNewCID=SECOND\nNumberOfTargets=1\n"
+            "01_TargetCalibration=SECOND-OLD\nReproMethod=02\n"
+            "[ReproData102]\nStartAddress=00001004\nLength=00000004\n"
+        )
+        for source, received, expected_count, expected_cpu in (
+            (calibration(cpus=2, first_image="authored.hex"), (b"OLD", b"OTHER"), 1, 1),
+            (cuw(logical, (b"data", b"more")), (b"UNKNOWN", b"OTHER"), 0, 0),
+        ):
+            with (
+                self.subTest(expected_count=expected_count),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                saved = RecoveryCalibration(
+                    "authored.cuw", source, saved_path=r"C:\saved\authored.cuw"
+                )
+                document = parse_recovery_info(
+                    encode_recovery_info(
+                        ReproInfoState(
+                            (saved,),
+                            multi_calibration_file_num=1,
+                            write_cpu_index=1,
+                            use_new_software_password=True,
+                            offset_of_write_cpu_multi_cal_index=4,
+                        )
+                    )
+                )
+                persistence = CUWPersistence.import_recovery(
+                    Path(directory),
+                    document,
+                    {saved.saved_path: source},
+                    cpu_capacity=2,
+                )
+                engine, controller, job, session = self._ordinary_rebuild_fixture(
+                    source, persistence=persistence, cpu_index=1
+                )
+                controller.runtime.local_milliseconds_of_day = lambda: 1000
+                session.trace.native_local_milliseconds_of_day = (
+                    controller.runtime.local_milliseconds_of_day
+                )
+                worker = job.worker
+                self.assertTrue(worker.control_state.recovery_mode)
+                self.assertEqual(worker.source_state.current_global_cpu_index, 1)
+                self.assertEqual(worker.source_state.cpu_offset, 0)
+                self.receive(engine, controller, received)
+                with engine.controller_execution(controller, 0):
+                    self.assertEqual(
+                        worker.mark_cid_reception_complete(), expected_count == 1
+                    )
+                original_metadata = engine.native_metadata
+                reads = []
+                controller.runtime.local_milliseconds_of_day = lambda reads=reads: (
+                    reads.append(1) or 34567
+                )
+                session.trace.native_local_milliseconds_of_day = (
+                    controller.runtime.local_milliseconds_of_day
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "Native CPU getter index absent"
+                ):
+                    job.start(session)
+                self.assertEqual(reads, [1])
+                self.assertEqual(engine.native_phase, 2)
+                self.assertEqual(engine._native_prepare_d314_2026, 34567)
+                self.assertTrue(persistence.notification)
+                self.assertTrue(worker.control_state.use_new_password)
+                self.assertEqual(worker.source_state.progress_base, 4)
+                self.assertEqual(worker.source_state.cpu_offset, 0)
+                self.assertEqual(
+                    native2026_cpu_count(engine.native_metadata), expected_count
+                )
+                self.assertIs(worker._all_loaded_metadata[0], engine.native_metadata)
+                self.assertIs(
+                    engine.native_metadata.source_container,
+                    original_metadata.source_container,
+                )
+                self.assertEqual(worker._current_global_cpu_index, expected_cpu)
+                self.assertEqual(worker._current_cpu_index, expected_cpu)
+                self.assertTrue(worker._cid_rebuild_done_3542026)
+                self.assertEqual(persistence.state.write_cpu_index, 1)
+                proof = engine._persistence_cpu_transition2026
+                if expected_cpu == 1:
+                    self.assertIsNone(proof)
+                    self.assertEqual(engine.dh_state._progress[0], 100)
+                else:
+                    self.assertIsNotNone(proof)
+                    assert proof is not None
+                    self.assertEqual(
+                        (
+                            proof.producer,
+                            proof.persisted_cpu,
+                            proof.before_cpu,
+                            proof.after_cpu,
+                        ),
+                        ("ordinary-36800", 1, 0, 0),
+                    )
+                    self.assertIs(proof.metadata, engine.native_metadata)
+                    self.assertFalse(
+                        engine._persistence_cpu_transition_valid2026(
+                            original_metadata, persistence.state, None, 0
+                        )
+                    )
+                engine._validate_persistence_source(engine.native_metadata)
+                self.assertEqual(job.state.sequence, 0)
+                self.assertIsNone(job._lease)
+                self.assertIsNone(job._ordinary_prepare_origin2026)
+                self.assertFalse(session.used)
+                self.assertEqual(session.trace.position, 0)
+
+    def test_actual_ordinary_forest_cpu_store_rebinds_its_selection_cache(self):
+        from unittest.mock import patch
+
+        source = cuw(
+            "[Format]\nVersion=8\n[Vehicle]\nNumberOfCalibration=2\n"
+            "ContactType=P5-Unified\nKindOfECU=149\n"
+            "[CPU01]\nCPUImageName=one.hex\nCPUType=311\nNewCID=M16C\n"
+            "NumberOfTargets=1\n01_TargetCalibration=OLD1\n"
+            "[CPU02]\nCPUImageName=two.hex\nCPUType=312\nNewCID=FOREST\n"
+            "NumberOfTargets=1\n01_TargetCalibration=OLD2\n",
+            (
+                srecord(1, 0, b"xFIRST") + b"\n" + srecord(7, 0),
+                srecord(1, 0, b"x\x01\x02\x03\x04z") + b"\n" + srecord(7, 0),
+            ),
+        )
+        engine, controller, job, session = self._ordinary_rebuild_fixture(source)
+        worker = job.worker
+        controller.runtime.local_milliseconds_of_day = lambda: 1000
+        session.trace.native_local_milliseconds_of_day = (
+            controller.runtime.local_milliseconds_of_day
+        )
+        self.receive(engine, controller, (b"OLD1", b"UNKNOWN"))
+        with engine.controller_execution(controller, 0):
+            self.assertTrue(worker.mark_cid_reception_complete())
+        sentinel = OSError("authored child-entry fault after actual ordinary prefix")
+        original = worker._phase_started
+        observed = []
+
+        def observe_initializer(phase, **kwargs):
+            # The input root held CPU0; the real FOREST tail selected CPU1.
+            self.assertFalse(job._is_raw_control_ordinary_root2026(session))
+            receipt = job._prepared_ordinary_entry2026
+            self.assertIsNotNone(receipt)
+            job._prepared_ordinary_entry2026 = None
+            try:
+                with self.assertRaisesRegex(ValueError, "no unconsumed36800 receipt"):
+                    original(phase, **kwargs)
+                self.assertIsNone(worker._phase_started_ms)
+            finally:
+                job._prepared_ordinary_entry2026 = receipt
+            original(phase, **kwargs)
+            selection = worker._selections_by_file[0]
+            assert selection is not None
+            self.assertIs(selection.rebuilt_metadata, engine.native_metadata)
+            self.assertEqual(worker.source_state.cpu_offset, 1)
+            self.assertEqual(worker.source_state.current_global_cpu_index, 1)
+            self.assertEqual(selection.target_indices, (1, 0))
+            observed.append(selection)
+            raise sentinel
+
+        with patch.object(worker, "_phase_started", observe_initializer):
+            job.start(session)
+            with self.assertRaises(OSError) as caught:
+                job.result(2)
+        self.assertIs(caught.exception, sentinel)
+        self.assertEqual(len(observed), 1)
+        self.assertTrue(worker._cid_rebuild_done_3542026)
+        self.assertFalse(session.used)
+        self.assertEqual(session.trace.position, 0)
+
+    def test_actual_child_consumes_ordinary_receipt_before_once_initializer(self):
+        from unittest.mock import patch
+
+        from scripts.j2534_2026 import DriverMetadata2026
+        from tests.test_cuw_engine_threads import ThreadOwnershipTests
+
+        events_path = Path(
+            "runtime/no-car-next-20261022/retry-regressions/prepare-ack-parked-sdk.json"
+        )
+        events = json.loads(read_private_bytes(events_path))
+        fixture = ThreadOwnershipTests("runTest")
+        engine, controller, job, session = fixture.imported_prepare(
+            recorded_driver=True, events=events
+        )
+        self.addCleanup(fixture.doCleanups)
+        pair = engine.interface_pair
+        assert pair is not None
+        descriptor = DriverMetadata2026("Authored offline SDK", "offline.dll")
+        pair.engine.set_driver(descriptor)
+        pair.control.set_driver(descriptor)
+        reads = []
+        clock = lambda: reads.append(1) or 1000
+        session.trace.native_local_milliseconds_of_day = clock
+        controller.runtime.local_milliseconds_of_day = clock
+        session.bind_runtime2026(controller.runtime)
+        session.bind_engine2026(engine)
+        session.bind_controller2026(controller)
+        engine.bind_retry_controller()
+        worker = job.worker
+        original = worker._phase_started
+        consumed = []
+
+        def observe_initializer(phase, **kwargs):
+            receipt = job._prepared_ordinary_entry2026
+            original(phase, **kwargs)
+            self.assertTrue(job.is_child_thread)
+            self.assertIsNotNone(receipt)
+            self.assertIsNone(job._prepared_ordinary_entry2026)
+            self.assertEqual(reads, [1])
+            self.assertEqual(worker._phase_started_ms, 1000)
+            with self.assertRaisesRegex(ValueError, "already initialized"):
+                original(phase)
+            self.assertEqual(reads, [1])
+            self.assertIsNone(job._prepared_ordinary_entry2026)
+            consumed.append(receipt)
+
+        with patch.object(worker, "_phase_started", observe_initializer):
+            job.start(session)
+            report = job.result(2)
+        self.assertEqual(len(consumed), 1)
+        self.assertIs(report["native_return"], False)
+        self.assertTrue(job.state.waiting_for_resume)
+        self.assertIsNone(job._ordinary_prepare_origin2026)
+        self.assertIsNone(job._prepared_ordinary_entry2026)
+        # Consume the rest of this real captured native-fault/cleanup trajectory.
+        pair.engine.open()
+        self.assertFalse(worker.check_device_version())
+        self.assertTrue(fixture.doCleanups())
+        session.trace.assert_complete()
+
+    def test_reached_rebuild_file_keeps_an_unresolved_numeric_cursor(self):
+        from scripts.calibration_2026 import (
+            NativeCIDRebuildMetadata2026,
+            native2026_cpu_count,
+            native2026_rebuild_current_cids_steps,
+        )
+        from scripts.cuw_engine_worker import EngineWorker2026
+        from tests.test_calibration_2026 import Calibration2026Tests
+
+        fixture = Calibration2026Tests("runTest")
+        metadata, general, configuration = fixture._current_rebuild_input()
+        for unmatched, expected_count in (
+            ((b"M16C", b"FOREST"), 0),
+            ((b"FOREST",), 1),
+        ):
+            with self.subTest(unmatched=unmatched):
+                iterator = native2026_rebuild_current_cids_steps(
+                    metadata,
+                    (-1,) * 4,
+                    unmatched,
+                    (),
+                    general,
+                    configuration=configuration,
+                )
+                step = next(
+                    value
+                    for value in iterator
+                    if isinstance(value, NativeCIDRebuildMetadata2026)
+                )
+                self.assertEqual(step.operation, "16ae0")
+                self.assertEqual(native2026_cpu_count(step.metadata), expected_count)
+                # Native FILE publication precedes any later CPU-dependent work.
+                self.assertIs(
+                    EngineWorker2026._ordinary_file_metadata_for_cursor_3e710_2026(
+                        step.metadata, 1
+                    ),
+                    step.metadata,
+                )
+                self.assertFalse(
+                    EngineWorker2026._ordinary_is_logical_cpu_19710_2026(
+                        step.metadata, 1
+                    )
+                )
+
+    def test_control_password_projection_reads_actual_dh_password_field(self):
+        engine = self.engine(calibration())
+        self.addCleanup(engine.close)
+        worker = engine.bind_worker(make_controller(NativeRuntime2026(lambda *_: None)))
+        self.assertFalse(worker.control_state.use_new_password)
+        engine.dh_state.set_use_new_password(True)
+        self.assertTrue(worker.control_state.use_new_password)
+        self.assertEqual(engine.repro_gateway_node, 0)
+
+    def test_ordinary_prepare_requires_actual_start_origin_before_source_writes(self):
+        engine = self.engine(calibration())
+        self.addCleanup(engine.close)
+        worker = engine.bind_worker(make_controller(NativeRuntime2026(lambda *_: None)))
+        before = worker.source_state
+        with self.assertRaises(ValueError):
+            worker._apply_ordinary_prepare_36800_2026(origin=object())
+        self.assertEqual(worker.source_state, before)
+
+    def test_late_wait_restore_rejects_naked_origin_without_changing_engine_epoch(self):
+        engine = self.engine(calibration())
+        self.addCleanup(engine.close)
+        worker = engine.bind_worker(make_controller(NativeRuntime2026(lambda *_: None)))
+        epoch = engine._wait_timing_epoch2026
+        with self.assertRaises(ValueError):
+            worker._consume_file_wait_restore_origin_32ff0_2026(object(), engine=engine)
+        with self.assertRaises(ValueError):
+            worker._restore_judge_file_waits_32ff0_2026(object(), 0)
+        with self.assertRaises(ValueError):
+            worker._validate_frontend_selection_41940_2026(
+                engine.native_metadata, engine=engine
+            )
+        self.assertEqual(engine._wait_timing_epoch2026, epoch)
+        self.assertIsNone(worker._file_wait_restore_origin2026)
+
+    def test_a48_pointer_cache_keeps_original_keys_after_real_mode2_compaction(self):
+        from scripts.cuw_engine_worker import _native_a48_cache_slot2026
+
+        def archive_source(target):
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr(
+                    "Setting.ini",
+                    "[DeltaReproCalFile]\nFileNum=2\nFileName1=one.cuw\n"
+                    "FileName2=two.cuw\n[WholeReproCalFile]\nFileName=whole.cuw\n",
+                )
+                archive.writestr("one.cuw", calibration(first_target=target))
+                archive.writestr("two.cuw", calibration(first_target=target + "2"))
+                archive.writestr("whole.cuw", calibration(first_target=target + "W"))
+            return (
+                b"[Vehicle]\nContactType=P5-Unified\n[DataCompression]\n"
+                + payload.getvalue()
+            )
+
+        engine = self.engine(calibration())
+        self.addCleanup(engine.close)
+        sources = admit_file_sources_2026(
+            engine,
+            "input.json",
+            b'["first.scuw","plain.cuw","second.scuw"]',
+            region=0,
+            source_files={
+                "first.scuw": archive_source("FIRST"),
+                "plain.cuw": calibration(),
+                "second.scuw": archive_source("SECOND"),
+            },
+        )
+        engine.bind_file_sources(sources)
+        controller = make_controller(NativeRuntime2026(lambda *_: None))
+        worker = engine.bind_worker(controller)
+        second_container = sources.files[3].source_container
+        self.assertEqual(_native_a48_cache_slot2026(sources, 0), 0)
+        self.assertEqual(_native_a48_cache_slot2026(sources, 1), 0)
+        self.assertEqual(_native_a48_cache_slot2026(sources, 3), 1)
+        self.assertEqual(_native_a48_cache_slot2026(sources, 4), 1)
+        with engine.controller_execution(controller, 2):
+            replacement = sources.after_group_reset(0, worker=worker)
+            engine._accept_worker_file_reset(sources, replacement, worker=worker)
+        self.assertIs(replacement.files[2].source_container, second_container)
+        self.assertEqual(_native_a48_cache_slot2026(replacement, 2), 1)
+        self.assertEqual(_native_a48_cache_slot2026(replacement, 3), 1)
+        self.assertIsNone(_native_a48_cache_slot2026(replacement, 0))
+
+    def test_cold_41940_retains_failed_general_key_before_judge_rows(self):
+        from scripts.programming_2026_common import (
+            NativeFrontendParameters2026,
+            NativePassThruException2026,
+        )
+
+        frontend = NativeFrontendParameters2026.from_sources(
+            {
+                "Parameter.ini": table(
+                    (
+                        "ParamFileKeySystemProtocolMicon",
+                        "M16CTypeFlag",
+                        "FORESTTypeFlag",
+                    ),
+                    (("149P5-Unified311", "0", "0"),),
+                ),
+                "CanIDTable.ini": table(("RequestCANID", "CalibrationType"), ()),
+                "LogicalAddressTable.ini": table(
+                    ("LogicalAddress", "CalibrationType"), ()
+                ),
+            },
+            encoded=False,
+        )
+        engine = CUWEngine2026(
+            read_private_bytes(RUNTIME / "CUW.dll"), general_parameters=frontend.general
+        )
+        self.addCleanup(engine.close)
+        engine.configure(struct.pack("<IIddII", 4, 0, 0, 0, 0, 0))
+        engine.bind_frontend_parameters(frontend)
+        source = calibration(contact_type="Classic")
+        sources = admit_file_sources_2026(
+            engine,
+            "input.json",
+            b'["plain.cuw"]',
+            region=0,
+            source_files={"plain.cuw": source},
+        )
+        with self.assertRaises(NativePassThruException2026) as caught:
+            engine.bind_file_sources(sources)
+        self.assertEqual(caught.exception.line, 0x2B72)
+        self.assertEqual(engine._wait_general_keys2026, ("149", "", "Classic"))
+        self.assertIsNone(engine._worker)
+        self.assertIsNone(engine._judge_flashable_invocation2026)
+
+    def test_5ffc0_early_3006_preserves_reused_caller_outputs(self):
+        from scripts.cuw_2026 import NativeFlashabilityRow2026
+        from scripts.cuw_engine_worker import _NativeJudgeRows2026
+
+        engine = self.engine(calibration(contact_type="Classic"))
+        self.addCleanup(engine.close)
+        worker = engine.bind_worker(make_controller(NativeRuntime2026(lambda *_: None)))
+        row = NativeFlashabilityRow2026(bytes(333))
+        buffers = _NativeJudgeRows2026(True, (row,), 1)
+        self.assertEqual(
+            worker._judge_flashable_file_5ffc0_2026(1, None, buffers=buffers),
+            (3006, True, (row,)),
+        )
+        self.assertTrue(buffers.check_target)
+        self.assertEqual(buffers.rows, (row,))
+        self.assertEqual(buffers.count, 1)
+
+    def test_native_35c60_classic_label_uses_first_cpu_general_key(self):
+        from scripts.cuw_engine_worker import (
+            EngineWorker2026,
+            _native_flashability_row2026,
+        )
+
+        source = calibration(contact_type="Classic")
+        general = NativeGeneralParameters2026.from_sources(
+            {
+                "Parameter.ini": table(
+                    ("ParamFileKeySystemProtocolMicon", "KindOfECUNames"),
+                    (("149Classic", "Front\nRear\nSpare\nExtra"),),
+                )
+            },
+            encoded=False,
+        )
+        engine = CUWEngine2026(
+            read_private_bytes(RUNTIME / "CUW.dll"), general_parameters=general
+        )
+        self.addCleanup(engine.close)
+        engine.configure(struct.pack("<IIddII", 4, 0, 0, 0, 0, 0))
+        engine.load_cuw(source)
+        controller = make_controller(NativeRuntime2026(lambda *_: None))
+        worker = engine.bind_worker(controller)
+        self.assertIsInstance(worker, EngineWorker2026)
+        row = _native_flashability_row2026(
+            old_cid=b"OLD",
+            new_cid=b"NEW",
+            companion=b"",
+            eligible=False,
+            description=b"",
+            terminal=False,
+        )
+        self.assertEqual(
+            worker._native_flashability_description_35c60_2026(
+                engine.native_metadata, None, row, 2
+            ),
+            b"Rear",
+        )
+
+    def test_native_flashability_row_packs_bounded_source_fields(self) -> None:
+        from scripts.cuw_engine_worker import _native_flashability_row2026
+
+        raw = _native_flashability_row2026(
+            old_cid=b"OLD",
+            new_cid=b"NEW",
+            companion=b"NODE",
+            eligible=True,
+            description=b"label",
+            terminal=False,
+        )
+        self.assertEqual(len(raw), 333)
+        self.assertEqual(raw[:4], b"OLD\0")
+        self.assertEqual(raw[0x22:0x26], b"NEW\0")
+        self.assertEqual(raw[0x44:0x49], b"NODE\0")
+        self.assertEqual(raw[0x4B], 1)
+        self.assertEqual(raw[0x4C:0x52], b"label\0")
+        self.assertEqual(raw[0x14C], 0)
+        with self.assertRaises(ValueError):
+            _native_flashability_row2026(
+                old_cid=b"x" * 34,
+                new_cid=b"",
+                companion=b"",
+                eligible=False,
+                description=b"",
+                terminal=False,
+            )
+
+    def test_native_flashability_stable_rows_preserve_four_source_passes(self) -> None:
+        from scripts.cuw_engine_worker import (
+            _native_flashability_row2026,
+            _native_flashability_stable_rows62330_2026,
+        )
+
+        rows = (
+            _native_flashability_row2026(
+                old_cid=b"A",
+                new_cid=b"B",
+                companion=b"N",
+                eligible=False,
+                description=b"",
+                terminal=False,
+            ),
+            _native_flashability_row2026(
+                old_cid=b"",
+                new_cid=b"C",
+                companion=b"N",
+                eligible=False,
+                description=b"",
+                terminal=False,
+            ),
+            _native_flashability_row2026(
+                old_cid=b"X",
+                new_cid=b"Y",
+                companion=b"N",
+                eligible=True,
+                description=b"",
+                terminal=False,
+            ),
+            _native_flashability_row2026(
+                old_cid=b"A",
+                new_cid=b"D",
+                companion=b"N",
+                eligible=False,
+                description=b"",
+                terminal=False,
+            ),
+            _native_flashability_row2026(
+                old_cid=b"Q",
+                new_cid=b"",
+                companion=b"N",
+                eligible=False,
+                description=b"",
+                terminal=False,
+            ),
+        )
+        result = _native_flashability_stable_rows62330_2026(rows)
+        self.assertEqual(
+            [row[0x4B] for row in result],
+            [1, 0, 0, 0],
+        )
+        self.assertEqual(
+            [row[:0x22].split(b"\0", 1)[0] for row in result],
+            [b"X", b"A", b"Q", b""],
+        )
+
+    def test_native_stable_rows_dedupe_against_all_earlier_passes(self):
+        from scripts.cuw_engine_worker import (
+            _native_flashability_row2026,
+            _native_flashability_stable_rows62330_2026,
+        )
+
+        def row(old, new, eligible=False):
+            return _native_flashability_row2026(
+                old_cid=old,
+                new_cid=new,
+                companion=b"K",
+                eligible=eligible,
+                description=b"",
+                terminal=False,
+            )
+
+        eligible = row(b"A", b"B", True)
+        distinct = row(b"C", b"D")
+        self.assertEqual(
+            _native_flashability_stable_rows62330_2026(
+                (
+                    row(b"", b"D"),
+                    row(b"A", b"X"),
+                    eligible,
+                    row(b"A", b""),
+                    distinct,
+                    row(b"", b"B"),
+                )
+            ),
+            (eligible, distinct),
+        )
+
+    def test_native_getter_query_record_maps_to_recovery_address(self):
+        from scripts.cuw_engine_worker import _native_getter_requested_address2026
+        from scripts.cuw_persistence import RequestedAddress
+
+        record = (1).to_bytes(4, "little") + b"01A0\0\0\0\0"
+        self.assertEqual(
+            _native_getter_requested_address2026(record),
+            RequestedAddress("01A0", logical=True),
+        )
+        with self.assertRaises(UnicodeDecodeError):
+            _native_getter_requested_address2026(
+                (1).to_bytes(4, "little") + b"\xff\0\0\0\0\0\0\0"
+            )
+
     def setUp(self):
         required = (RUNTIME / "CUW.dll", RUNTIME / "TCUWControlCommPhase.dll")
         if any(not path.is_file() for path in required):
@@ -137,6 +885,252 @@ class EngineWorker2026Tests(unittest.TestCase):
         engine.load_cuw(source, cpu_index=cpu_index)
         return engine
 
+    def cold_initial_reset_worker(
+        self, *, initial_maximum: int, configured_maximum: int
+    ):
+        from scripts.programming_2026_common import NativeFrontendParameters2026
+
+        general_sources = {
+            "Parameter.ini": table(
+                (
+                    "ParamFileKeySystemProtocolMicon",
+                    "M16CTypeFlag",
+                    "FORESTTypeFlag",
+                    "PasswordAddress",
+                    "ByteOrder",
+                    "FlagToDoIGOFFONAtCPUTypeChange",
+                    "FlagToChangeToReprogGWModeForCentralGW",
+                ),
+                tuple(
+                    (key, "0", "0", "00", "1", "0", "0")
+                    for key in (
+                        "149P5-Unified",
+                        "149P5-Unified311",
+                        "149P5-Unified312",
+                    )
+                ),
+            ),
+            "CanIDTable.ini": table(
+                ("RequestCANID", "CalibrationType"), (("7E0", "17"),)
+            ),
+            "LogicalAddressTable.ini": table(
+                ("LogicalAddress", "CalibrationType"), (("0103", "18"),)
+            ),
+        }
+        frontend = NativeFrontendParameters2026.from_sources(
+            general_sources, encoded=False
+        )
+        image = Path("runtime/no-car-21/recovered/CUW.dll")
+        engine = CUWEngine2026(image.read_bytes(), general_parameters=frontend.general)
+        if initial_maximum:
+            engine.configure(struct.pack("<IIddII", initial_maximum, 0, 0, 0, 0, 0))
+        engine.bind_frontend_parameters(frontend)
+        if configured_maximum != initial_maximum:
+            engine.configure(struct.pack("<IIddII", configured_maximum, 0, 0, 0, 0, 0))
+        engine.load_cuw(calibration())
+        controller = make_controller(NativeRuntime2026(lambda *_: None))
+        return engine, controller
+
+    def cold_worker_for_recording(self, source_engine, source_session):
+        from scripts.programming_2026_common import NativeFrontendParameters2026
+        from scripts.programming_replay import load_programming_replay
+
+        source = source_engine._source
+        assert isinstance(source, bytes)
+        catalog = dict(source_session._catalog_sources)
+        catalog.setdefault(
+            "CanIDTable.ini",
+            encoded_table(("RequestCANID", "CalibrationType"), (("0200", "0"),)),
+        )
+        catalog.setdefault(
+            "LogicalAddressTable.ini",
+            encoded_table(("LogicalAddress", "CalibrationType"), (("0103", "0"),)),
+        )
+        session = load_programming_replay(
+            source,
+            json.dumps(source_session.context).encode(),
+            catalog,
+            source_session._module_files,
+        )
+        self.addCleanup(session.trace.close)
+        runtime = NativeRuntime2026(
+            session.trace.action,
+            clock=session.trace.clock,
+            cancelled=session.trace.cancelled,
+            local_seconds_of_day=session.trace.native_local_seconds_of_day,
+            local_milliseconds_of_day=session.trace.native_local_milliseconds_of_day,
+        )
+        session.bind_runtime2026(runtime)
+        frontend = NativeFrontendParameters2026.from_sources(catalog, encoded=True)
+        engine = CUWEngine2026(
+            (RUNTIME / "CUW.dll").read_bytes(),
+            general_parameters=frontend.general,
+        )
+        self.addCleanup(engine.close)
+        engine.bind_frontend_parameters(frontend)
+        engine.configure(struct.pack("<IIddII", 4, 0, 1, 2, 0, 0))
+        engine.load_cuw(source)
+        controller = make_controller(runtime)
+        pair = session.trace.interface_pair
+        assert pair is not None
+        from scripts.j2534_2026 import DriverMetadata2026
+
+        for view in (pair.engine, pair.control):
+            view.set_current_driver(DriverMetadata2026("Authored", "authored.dll"))
+        engine.bind_interface_pair(pair)
+        worker = engine.bind_worker(controller)
+        return engine, controller, session, worker
+
+    def test_cold_40580_projection_uses_historical_capacity_without_resetting_4e0(self):
+        from unittest.mock import patch
+
+        from scripts.cuw_engine_worker import EngineWorker2026
+
+        for initial_maximum, configured_maximum in ((4, 4), (0, 4), (4, 8)):
+            with self.subTest(
+                initial_maximum=initial_maximum,
+                configured_maximum=configured_maximum,
+            ):
+                engine, controller = self.cold_initial_reset_worker(
+                    initial_maximum=initial_maximum,
+                    configured_maximum=configured_maximum,
+                )
+                self.addCleanup(engine.close)
+                origins = []
+                apply_initial_reset = (
+                    EngineWorker2026._apply_initial_getter_reset_40580_2026
+                )
+
+                def observe_initial_reset(
+                    worker,
+                    origin,
+                    _origins=origins,
+                    _apply=apply_initial_reset,
+                ):
+                    _origins.append(origin)
+                    _apply(worker, origin)
+
+                with patch.object(
+                    EngineWorker2026,
+                    "_apply_initial_getter_reset_40580_2026",
+                    observe_initial_reset,
+                ):
+                    worker = engine.bind_worker(controller)
+                self.assertEqual(len(origins), 1)
+                self.assertIs(engine.native_metadata, worker.loaded_metadata[0])
+                self.assertEqual(engine.received_identifiers, ())
+                self.assertEqual(worker._getter_reset_epoch2026, 1)
+                self.assertEqual(len(worker._getter_histories_a34_2026), 16)
+                self.assertEqual(worker._getter_flow_received_cids2026, ((),) * 16)
+                self.assertEqual(worker._getter_flow_query_records2026, ((),) * 16)
+                self.assertEqual(
+                    worker._getter_file_a48_received_cids2026, (None,) * 16
+                )
+                configuration = engine.configuration
+                if configuration is None:
+                    self.fail("cold fixture lost its CPU configuration")
+                self.assertEqual(
+                    worker._getter_configured_masks_4f0_2026,
+                    configuration.source_cpu_flags,
+                )
+                self.assertEqual(
+                    tuple(map(len, worker._getter_configured_masks_4f0_2026)),
+                    (configured_maximum,) * 16,
+                )
+                for history in worker._getter_histories_a34_2026:
+                    self.assertEqual(history.received_cids, ())
+                    self.assertEqual(history.query_records, ())
+                    self.assertEqual(len(history.node_strings_28), initial_maximum)
+                    self.assertEqual(len(history.node_strings_50), initial_maximum)
+                    self.assertEqual(len(history.node_strings_78), initial_maximum)
+                    self.assertEqual(len(history.node_strings_a0), initial_maximum)
+                    self.assertEqual(
+                        len(history.cell_dword_bits_c8), 32 * initial_maximum
+                    )
+                    self.assertEqual(len(history.cell_strings_d4), 32 * initial_maximum)
+                    self.assertEqual(len(history.retained_bits_fc), initial_maximum)
+                    self.assertEqual(len(history.node_dword_bits_10c), initial_maximum)
+                self.assertEqual(len(worker._node_strings_4402026), initial_maximum)
+                self.assertEqual(
+                    len(worker._cell_dword_bits_5542026), 32 * initial_maximum
+                )
+                self.assertEqual(
+                    len(worker._cell_strings_5602026), 32 * initial_maximum
+                )
+                self.assertEqual(len(worker._retained_bits_5882026), initial_maximum)
+                self.assertEqual(len(worker._node_dword_bits_1b9c2026), initial_maximum)
+                self.assertEqual(
+                    len(worker._configured_bits_4e0_2026),
+                    configured_maximum,
+                )
+                history = worker._getter_histories_a34_2026
+                with self.assertRaisesRegex(ValueError, "Fresh unpublished worker"):
+                    worker._apply_initial_getter_reset_40580_2026(origins[0])
+                self.assertEqual(worker._getter_reset_epoch2026, 1)
+                self.assertIs(worker._getter_histories_a34_2026, history)
+                with self.assertRaisesRegex(TypeError, "source-issued initial"):
+                    worker._apply_initial_getter_reset_40580_2026(object())
+                with self.assertRaisesRegex(TypeError, "origin required"):
+                    worker._reset_getter_history_and_aux_40580_2026(object())
+                self.assertEqual(worker._getter_reset_epoch2026, 1)
+                self.assertIs(worker._getter_histories_a34_2026, history)
+                from scripts.cuw_engine_worker import (
+                    _replace_engine_worker,
+                    _rollback_engine_worker_replacement,
+                )
+
+                replacement = _replace_engine_worker(engine, controller, worker)
+                self.assertIs(replacement._getter_histories_a34_2026, history)
+                self.assertEqual(
+                    replacement._getter_flow_received_cids2026,
+                    worker._getter_flow_received_cids2026,
+                )
+                self.assertEqual(replacement._getter_reset_epoch2026, 1)
+                self.assertEqual(
+                    replacement._node_strings_4402026,
+                    worker._node_strings_4402026,
+                )
+                self.assertIsNot(
+                    replacement._node_strings_4402026,
+                    worker._node_strings_4402026,
+                )
+                _rollback_engine_worker_replacement(engine, worker, replacement)
+                self.assertIs(engine.worker, worker)
+                self.assertIs(worker._getter_histories_a34_2026, history)
+                self.assertEqual(worker._getter_reset_epoch2026, 1)
+
+    def test_authenticated_cleanup_reuses_only_the_literal_getter_reset_subset(self):
+        from scripts.j2534_2026 import J2534InterfacePair2026
+
+        engine = self.engine(calibration())
+        self.addCleanup(engine.close)
+
+        def provider(*_args):
+            return PrimitiveResult()
+
+        engine_device = J2534Device2026(provider, background_workers=False)
+        control_device = J2534Device2026(provider, background_workers=False)
+        engine.bind_interface_pair(
+            J2534InterfacePair2026(engine_device, control_device)
+        )
+        controller = make_controller(NativeRuntime2026(control_device.primitive))
+        worker = engine.bind_worker(controller)
+        cleanup = engine.bind_cleanup_controller()
+
+        cleanup.run()
+
+        self.assertEqual(len(worker._getter_histories_a34_2026), 16)
+        for history in worker._getter_histories_a34_2026:
+            self.assertEqual(len(history.node_strings_28), 4)
+            self.assertEqual(len(history.cell_dword_bits_c8), 128)
+            self.assertEqual(len(history.retained_bits_fc), 4)
+        self.assertEqual(len(worker._node_strings_4402026), 4)
+        self.assertEqual(len(worker._cell_dword_bits_5542026), 128)
+        self.assertEqual(len(worker._cell_strings_5602026), 128)
+        self.assertEqual(len(worker._retained_bits_5882026), 4)
+        self.assertEqual(len(worker._configured_bits_4e0_2026), 4)
+        self.assertEqual(worker._getter_reset_epoch2026, 1)
+
     @staticmethod
     def receive(engine, controller, values: tuple[bytes, ...]) -> None:
         engine._import_identifier_context()
@@ -156,17 +1150,418 @@ class EngineWorker2026Tests(unittest.TestCase):
         self.assertIs(worker.controller, controller)
         self.assertIs(worker.runtime, controller.runtime)
 
-    def test_close_invalidates_controller_lease_and_allows_fresh_issue(self):
+    def test_manual_close_cannot_bypass_native_worker_reissue(self):
         engine = self.engine(calibration())
         controller = make_controller(NativeRuntime2026(lambda *_: None))
         self.addCleanup(engine.close)
         first = engine.bind_worker(controller)
+        configuration = engine.configuration
+        assert configuration is not None
         first.close()
         with self.assertRaisesRegex(ValueError, "closed"):
             first.validate_source()
-        second = engine.bind_worker(controller)
-        self.assertIsNot(first, second)
-        self.assertIs(controller.worker, second)  # pyright: ignore[reportAttributeAccessIssue]
+        with self.assertRaisesRegex(ValueError, "Engine worker is closed"):
+            engine.bind_worker(controller)
+        self.assertIs(engine._worker, first)
+        self.assertIsNone(getattr(controller, "worker", None))
+
+    def test_completed_thread_job_is_not_attached_to_standalone_capture(self):
+        from tests.test_cuw_engine_threads import ThreadOwnershipTests
+
+        if not (RUNTIME / "CUW.dll").is_file():
+            self.skipTest("Authenticated static thread replay fixture is unavailable")
+        fixture = ThreadOwnershipTests("runTest")
+        engine, controller, job, session = fixture.imported_prepare(
+            operation="get_cid", include_control=False
+        )
+        self.addCleanup(fixture.doCleanups)
+        self.addCleanup(engine.close)
+        self.addCleanup(job.stop)
+        clock = lambda: 1000
+        session.trace.native_local_milliseconds_of_day = clock
+        controller.runtime.local_milliseconds_of_day = clock
+        worker = job.worker
+
+        job.start(session)
+        job.result(3)
+        self.assertIsNone(job._lease)
+        self.assertIsNone(job._session)
+        assert job._active_record is not None
+        self.assertTrue(job._active_record.completed.is_set())
+
+        with engine.controller_execution(controller, 0):
+            capture = worker._control_file_capture
+            self.assertIsNotNone(capture)
+            assert capture is not None
+            self.assertIsNone(capture._thread_job)
+            self.assertIsNone(capture.job_sequence)
+            self.assertIsNone(capture.phase_lease)
+            self.assertIsNone(capture.raw_session)
+            self.assertIsNone(capture.completion_record)
+            capture.metadata_for_cpu(0)
+
+    def test_actual_unsupported_raw_getter_keeps_legacy_import_untyped(self):
+        from unittest.mock import patch
+
+        from scripts.cuw_engine_worker import EngineWorker2026
+        from tests.test_cuw_engine_threads import ThreadOwnershipTests
+
+        fixture = ThreadOwnershipTests("runTest")
+        self.addCleanup(fixture.doCleanups)
+        original_import = EngineWorker2026.import_control_getter_return2026
+        outputs = []
+        sequences = []
+        contexts = []
+        workers = []
+
+        def observe_import(worker, context):
+            original_import(worker, context)
+            outputs.append(worker._imported_getter_output2026(context))
+            sequences.append(worker._getter_ordinary_return_sequence2026)
+            contexts.append(context)
+            workers.append(worker)
+            with self.assertRaises(ValueError):
+                original_import(worker, context)
+            with self.assertRaises(TypeError):
+                worker._imported_getter_output2026(object())
+
+        with patch.object(
+            EngineWorker2026,
+            "import_control_getter_return2026",
+            observe_import,
+        ):
+            fixture.test_actual_p5_false_getter_imports_pair_through_thread_job()
+        self.assertEqual(outputs, [None])
+        self.assertEqual(sequences, [1])
+        self.assertIsNone(workers[0]._imported_getter_output_ref2026)
+        with self.assertRaises(ValueError):
+            workers[0]._imported_getter_output2026(contexts[0])
+
+    def test_native_getter_raw_cell_conversion_sign_extends_type_byte(self):
+        from scripts.cuw_engine_worker import (
+            _native_getter_c_string2026,
+            _native_getter_cell2026,
+        )
+
+        self.assertEqual(
+            _native_getter_cell2026(b"\x80TEXT\0" + bytes(8)),
+            (0xFFFFFF80, b"TEXT"),
+        )
+        with self.assertRaises(ValueError):
+            _native_getter_cell2026(b"\x80short")
+        self.assertEqual(_native_getter_c_string2026(b"A\0\0", 3), b"A")
+        with self.assertRaises(ValueError):
+            _native_getter_c_string2026(b"AB", 3)
+
+    def test_authenticated_cancid_output_imports_typed_buffers_once(self):
+        from scripts.j2534_2026 import (
+            DriverMetadata2026,
+            J2534Device2026,
+            J2534InterfacePair2026,
+            NativeMessage,
+            PrimitiveResult,
+        )
+        from scripts.programming_2026_common import (
+            NativeRuntime2026,
+            _control_getter_output2026,
+        )
+        from scripts.programming_2026_legacy import bind_can_cid_context, run_can_cid
+        from scripts.programming_replay import _native_request
+        from tests.test_programming_2026_common import RawControlStageMachineTests
+
+        fixture = RawControlStageMachineTests()
+        self.addCleanup(fixture.doCleanups)
+        payloads = (b"\x49\0\x10\0\0\0", b"\x49\x04\x01" + b"DEMO\0".ljust(16, b" "))
+        recorder_fixture = RawControlStageMachineTests()
+        self.addCleanup(recorder_fixture.doCleanups)
+        _, _, recorder_session = recorder_fixture.fixture(
+            operation="get_cid",
+            getter="TCUWCanCIDGetter.dll",
+            selector="GetCanIDsFromParamForGetCID",
+            parameter_values={
+                "GetCANIDFunctionNameForGetCID": "GetCanIDsFromParamForGetCID",
+                "CanIDForGetCID": "0200/0208",
+                "ReceiveTimeoutBeforeGetCID": "123",
+            },
+        )
+        binding, module, *_ = recorder_session._dispatch()
+        cid_context = bind_can_cid_context(
+            recorder_session.container,
+            recorder_session.node,
+            (),
+            binding,
+            module.native_identity,
+            {},
+            {},
+        )
+        reads = []
+        rows = []
+        fail_start_filter = False
+
+        def encode(value):
+            if value is None:
+                return {"type": "none", "value": None}
+            if type(value) is bool:
+                return {"type": "bool", "value": value}
+            if type(value) is int:
+                return {"type": "int", "value": value}
+            if type(value) is bytes:
+                return {"type": "bytes", "value": value.hex()}
+            if isinstance(value, NativeMessage):
+                return {
+                    "type": "mapping",
+                    "value": {
+                        "_native_type": {"type": "text", "value": "PASSTHRU_MSG_2026"},
+                        **{key: encode(item) for key, item in vars(value).items()},
+                    },
+                }
+            if type(value) is tuple:
+                return {"type": "tuple", "value": [encode(item) for item in value]}
+            if type(value) is dict:
+                return {
+                    "type": "mapping",
+                    "value": {key: encode(item) for key, item in value.items()},
+                }
+            raise TypeError(f"Unsupported captured J2534 result: {type(value)!r}")
+
+        payload_iter = iter(payloads)
+
+        def capture_driver(event, _remaining):
+            nonlocal fail_start_filter
+            operation = event["operation"]
+            if operation == "passthru_write":
+                message = event["messages"][0]
+                reads.extend(
+                    (
+                        NativeMessage(6, message.data[:4], rx_status=9),
+                        NativeMessage(
+                            6, bytes.fromhex("00000208") + next(payload_iter)
+                        ),
+                    )
+                )
+                result = PrimitiveResult(value=1)
+            elif operation == "passthru_read":
+                result = PrimitiveResult(value=(reads.pop(0),))
+            elif operation in ("passthru_open", "passthru_connect"):
+                result = PrimitiveResult(value=17)
+            elif operation == "passthru_start_filter":
+                if fail_start_filter:
+                    fail_start_filter = False
+                    result = PrimitiveResult(status=16)
+                else:
+                    result = PrimitiveResult(value=101)
+            elif operation == "create_mutex":
+                result = PrimitiveResult(value=1)
+            elif operation == "wait_handle":
+                result = PrimitiveResult(value=0)
+            elif operation == "load_library":
+                result = PrimitiveResult(value=2)
+            elif operation == "get_symbol":
+                result = PrimitiveResult(value=3)
+            else:
+                result = PrimitiveResult()
+            rows.append(
+                {
+                    "kind": "action",
+                    "request": _native_request(event),
+                    "result": encode({"status": result.status, "value": result.value}),
+                    "elapsed_ms": 1,
+                }
+            )
+            return result
+
+        clock = lambda: 0
+        device = J2534Device2026(capture_driver, clock=clock, background_workers=False)
+        peer = J2534Device2026(capture_driver, clock=clock, background_workers=False)
+        direct_pair = J2534InterfacePair2026(peer, device)
+        for view in (direct_pair.engine, direct_pair.control):
+            view.set_current_driver(DriverMetadata2026("Authored", "authored.dll"))
+        device.have_ownership()
+        direct_result = run_can_cid(
+            cid_context,
+            NativeRuntime2026(
+                device.primitive, clock=lambda: 0, native_cancelled=lambda: False
+            ),
+        )
+        self.assertTrue(direct_result["native_success"])
+        self.assertEqual(direct_result["cids"], (b"DEMO",))
+        successful_driver_events = tuple(rows)
+        rows.clear()
+        reads.clear()
+        payload_iter = iter(payloads)
+        fail_start_filter = True
+        failed_device = J2534Device2026(
+            capture_driver, clock=clock, background_workers=False
+        )
+        failed_peer = J2534Device2026(
+            capture_driver, clock=clock, background_workers=False
+        )
+        failed_pair = J2534InterfacePair2026(failed_peer, failed_device)
+        for view in (failed_pair.engine, failed_pair.control):
+            view.set_current_driver(DriverMetadata2026("Authored", "authored.dll"))
+        failed_device.have_ownership()
+        failed_direct_result = run_can_cid(
+            cid_context,
+            NativeRuntime2026(
+                failed_device.primitive,
+                clock=clock,
+                native_cancelled=lambda: False,
+            ),
+        )
+        self.assertFalse(
+            failed_direct_result["native_success"],
+            f"timeout={cid_context.timeout_allowing_id} addresses={cid_context.addresses!r} "
+            f"ops={[row['request']['operation'] for row in rows]}",
+        )
+        failed_driver_events = tuple(rows)
+        engine, controller, session = fixture.fixture(
+            operation="get_cid",
+            getter="TCUWCanCIDGetter.dll",
+            selector="GetCanIDsFromParamForGetCID",
+            parameter_values={
+                "GetCANIDFunctionNameForGetCID": "GetCanIDsFromParamForGetCID",
+                "CanIDForGetCID": "0200/0208",
+                "ReceiveTimeoutBeforeGetCID": "123",
+            },
+            events=successful_driver_events,
+            paired=True,
+        )
+        worker = engine.bind_worker(controller)
+        with engine.controller_execution(controller, 0):
+            result = controller.execute(engine, session)
+            context = controller.native_control_context2026(engine)
+            output = _control_getter_output2026(context)
+            self.assertIsNotNone(output)
+            assert output is not None
+            self.assertIs(result["native_return"], True)
+            self.assertEqual(output.identifiers, (b"DEMO",))
+            self.assertIs(output.raw_al, True)
+            self.assertEqual(worker._getter_ordinary_return_sequence2026, 1)
+            worker.import_control_getter_return2026(context)
+            self.assertIs(worker._imported_getter_output2026(context), output)
+            with self.assertRaises(ValueError):
+                worker.import_control_getter_return2026(context)
+            staged = worker._prepare_getter_import2026(
+                context, output, output.identifiers
+            )
+            self.assertIsNotNone(staged)
+            assert staged is not None
+            (
+                strings,
+                cell_bits,
+                cell_strings,
+                configured,
+                retained,
+                node_dwords,
+                tail1,
+                tail2,
+                records,
+                hardware,
+            ) = staged
+            maximum = output.configuration.cpu_maximum
+            self.assertEqual(strings, ((b"",) * maximum,) * 4)
+            self.assertEqual(cell_bits, [0] * (32 * output.configuration.cpu_maximum))
+            self.assertEqual(
+                cell_strings, [b""] * (32 * output.configuration.cpu_maximum)
+            )
+            self.assertEqual(configured, [False] * output.configuration.cpu_maximum)
+            self.assertEqual(retained, [False] * output.configuration.cpu_maximum)
+            self.assertEqual(node_dwords, [0] * output.configuration.cpu_maximum)
+            self.assertEqual((tail1, tail2, hardware), (b"", b"", b""))
+            self.assertEqual(records, output.query_records34)
+            self.assertEqual(engine.received_identifiers, (b"DEMO",))
+            self.assertEqual(engine._working_identifier_records, records)
+            self.assertEqual(worker._cell_dword_bits_5542026, cell_bits)
+            self.assertEqual(worker._cell_strings_5602026, cell_strings)
+        with self.assertRaises(ValueError):
+            worker._imported_getter_output2026(context)
+
+        failed_fixture = RawControlStageMachineTests()
+        self.addCleanup(failed_fixture.doCleanups)
+        failed_engine, failed_controller, failed_session = failed_fixture.fixture(
+            operation="get_cid",
+            getter="TCUWCanCIDGetter.dll",
+            selector="GetCanIDsFromParamForGetCID",
+            parameter_values={
+                "GetCANIDFunctionNameForGetCID": "GetCanIDsFromParamForGetCID",
+                "CanIDForGetCID": "0200/0208",
+                "ReceiveTimeoutBeforeGetCID": "123",
+            },
+            events=failed_driver_events,
+            paired=True,
+        )
+        failed_worker = failed_engine.bind_worker(failed_controller)
+        with failed_engine.controller_execution(failed_controller, 0):
+            failed_result = failed_controller.execute(failed_engine, failed_session)
+            failed_context = failed_controller.native_control_context2026(failed_engine)
+            failed_output = _control_getter_output2026(failed_context)
+            self.assertIsNotNone(failed_output)
+            assert failed_output is not None
+            self.assertIs(failed_result["native_return"], False)
+            self.assertIs(failed_output.raw_al, False)
+            self.assertEqual(failed_output.identifiers, ())
+            self.assertEqual(failed_worker._getter_ordinary_return_sequence2026, 1)
+            histories_before = failed_worker._getter_histories_a34_2026
+            flow_before = failed_worker._flow_file_index2026
+            reset_epoch_before = failed_worker._getter_reset_epoch2026
+            failed_worker.import_control_getter_return2026(failed_context)
+            self.assertIs(
+                failed_worker._imported_getter_output2026(failed_context), failed_output
+            )
+            with self.assertRaises(ValueError):
+                failed_worker.import_control_getter_return2026(failed_context)
+            self.assertEqual(failed_engine.received_identifiers, ())
+            self.assertEqual(
+                failed_engine._working_identifier_records,
+                failed_output.query_records34,
+            )
+            self.assertIs(failed_worker._getter_histories_a34_2026, histories_before)
+            self.assertEqual(failed_worker._flow_file_index2026, flow_before)
+            self.assertEqual(failed_worker._getter_reset_epoch2026, reset_epoch_before)
+            self.assertTrue(
+                all(
+                    history.node_strings_28 == ()
+                    for history in failed_worker._getter_histories_a34_2026
+                )
+            )
+        with self.assertRaises(ValueError):
+            failed_worker._imported_getter_output2026(failed_context)
+
+        mismatch_engine, mismatch_controller, mismatch_session, mismatch_worker = (
+            self.cold_worker_for_recording(engine, session)
+        )
+        self.assertEqual(mismatch_worker._getter_reset_epoch2026, 1)
+        self.assertEqual(
+            mismatch_worker._getter_histories_a34_2026[0].node_strings_28, ()
+        )
+        self.assertEqual(len(mismatch_worker._configured_bits_4e0_2026), 4)
+        with mismatch_engine.controller_execution(mismatch_controller, 0):
+            mismatch_result = mismatch_controller.execute(
+                mismatch_engine, mismatch_session
+            )
+            mismatch_context = mismatch_controller.native_control_context2026(
+                mismatch_engine
+            )
+            mismatch_output = _control_getter_output2026(mismatch_context)
+            self.assertIs(mismatch_result["native_return"], True)
+            self.assertIsNotNone(mismatch_output)
+            histories_before = mismatch_worker._getter_histories_a34_2026
+            strings_before = tuple(mismatch_worker._node_strings_4402026)
+            cells_before = tuple(mismatch_worker._cell_dword_bits_5542026)
+            identifiers_before = mismatch_engine.received_identifiers
+            with self.assertRaisesRegex(
+                ValueError, "scratch differs from configuration"
+            ):
+                mismatch_worker.import_control_getter_return2026(mismatch_context)
+            self.assertIs(mismatch_worker._getter_histories_a34_2026, histories_before)
+            self.assertEqual(
+                tuple(mismatch_worker._node_strings_4402026), strings_before
+            )
+            self.assertEqual(
+                tuple(mismatch_worker._cell_dword_bits_5542026), cells_before
+            )
+            self.assertEqual(mismatch_engine.received_identifiers, identifiers_before)
+            self.assertIsNone(mismatch_worker._imported_getter_output_ref2026)
 
     def test_worker_replacement_preserves_engine_state_and_rolls_back_atomically(self):
         from scripts.cuw_engine_worker import (
@@ -180,6 +1575,24 @@ class EngineWorker2026Tests(unittest.TestCase):
         self.addCleanup(engine.close)
         self.receive(engine, controller, (b"OLD",))
         first = engine.bind_worker(controller)
+        configuration = engine.configuration
+        assert configuration is not None
+        self.assertEqual(first._flow_file_index2026, 0)
+        self.assertFalse(first._getter_sequence_changed_39c2026)
+        self.assertEqual(len(first._getter_histories_a34_2026), 16)
+        self.assertTrue(
+            all(
+                history.node_strings_28 == ()
+                for history in first._getter_histories_a34_2026
+            )
+        )
+        self.assertEqual(
+            len(first._cell_dword_bits_5542026),
+            32 * configuration.cpu_maximum,
+        )
+        self.assertEqual(
+            tuple(first._configured_bits_4e0_2026), configuration.cpu_flags
+        )
         with engine.controller_execution(controller, 0):
             self.assertTrue(first.mark_cid_reception_complete())
         with engine.controller_execution(controller, 1):
@@ -188,6 +1601,17 @@ class EngineWorker2026Tests(unittest.TestCase):
 
         second = _replace_engine_worker(engine, controller, first)
         self.assertIs(engine.worker, second)
+        self.assertEqual(second._flow_file_index2026, 0)
+        self.assertIs(
+            second._getter_histories_a34_2026,
+            first._getter_histories_a34_2026,
+        )
+        self.assertEqual(
+            second._cell_dword_bits_5542026, first._cell_dword_bits_5542026
+        )
+        self.assertIsNot(
+            second._cell_dword_bits_5542026, first._cell_dword_bits_5542026
+        )
         self.assertEqual(second.source_state.target_indices, before.target_indices)
         self.assertEqual(
             second.source_state.retained_cpu_type, before.retained_cpu_type
@@ -283,6 +1707,14 @@ class EngineWorker2026Tests(unittest.TestCase):
             self.assertFalse(worker.mark_cid_reception_complete())
 
         self.assertIs(engine.native_metadata, original)
+        configuration = engine.configuration
+        assert configuration is not None
+        self.assertEqual(
+            worker._judge_live_selection2026.targets,
+            (-1,) * configuration.cpu_maximum,
+        )
+        self.assertEqual(worker._judge_live_selection2026.unmatched_ids, (b"NEW1",))
+        self.assertEqual(worker._judge_live_selection2026.authored_count, 1)
         with self.assertRaisesRegex(ValueError, "no completed native CID selection"):
             _ = worker.native_writer_target_index
 
@@ -411,7 +1843,7 @@ class EngineWorker2026Tests(unittest.TestCase):
         self.assertEqual(native2026_cpu_type(engine.native_metadata, 0), "311")
         self.assertEqual(len(native2026_cpu_targets(engine.native_metadata, 1)), 1)
 
-    def test_vbf_prepare_preserves_existing_d30c_for_zero_current_cpu(self):
+    def test_vbf_prepare_does_not_import_persisted_progress_as_d30c(self):
         source = cuw(
             "[Format]\nVersion=8\n[Vehicle]\nNumberOfCalibration=2\n"
             "ContactType=P5-Unified\nKindOfECU=149\n"
@@ -435,21 +1867,23 @@ class EngineWorker2026Tests(unittest.TestCase):
             controller = make_controller(NativeRuntime2026(lambda *_: None))
             self.receive(engine, controller, (b"OLD1", b"OLD2"))
             worker = engine.bind_worker(controller)
+            self.assertEqual(worker.source_state.progress_base, 0)
+            self.assertEqual(state.offset_of_write_cpu_multi_cal_index, 1)
 
             with engine.controller_execution(controller, 0):
                 self.assertTrue(worker.mark_cid_reception_complete())
-            self.assertEqual(worker.source_state.cpu_offset, 1)
+            self.assertEqual(worker.source_state.cpu_offset, 0)
             self.assertEqual(worker.source_state.current_global_cpu_index, 0)
 
             with engine.controller_execution(controller, 1):
                 pass
 
-            self.assertEqual(worker.source_state.cpu_offset, 1)
-            self.assertEqual(worker.source_state.current_global_cpu_index, 1)
-            self.assertEqual(engine.native_metadata.cpu_index, 1)
+            self.assertEqual(worker.source_state.cpu_offset, 0)
+            self.assertEqual(worker.source_state.current_global_cpu_index, 0)
+            self.assertEqual(engine.native_metadata.cpu_index, 0)
             self.assertEqual(worker.native_writer_target_index, 0)
 
-    def test_36800_vbf_applies_d30c_without_a_cached_cid_selection(self):
+    def test_36800_vbf_keeps_constructor_d30c_without_a_producer(self):
         source = calibration(cpus=2, first_image="first.vbf")
         state = ReproInfoState(
             (RecoveryCalibration("source.cuw", source),),
@@ -463,16 +1897,19 @@ class EngineWorker2026Tests(unittest.TestCase):
             controller = make_controller(NativeRuntime2026(lambda *_: None))
             self.receive(engine, controller, (b"OLD1", b"OLD2"))
             worker = engine.bind_worker(controller)
+            self.assertEqual(worker.source_state.progress_base, 0)
+            self.assertEqual(state.offset_of_write_cpu_multi_cal_index, 1)
             self.assertEqual(worker.source_state.current_global_cpu_index, 0)
-            self.assertEqual(worker.source_state.cpu_offset, 1)
+            self.assertEqual(worker.source_state.cpu_offset, 0)
+            self.assertEqual(worker._flow_file_index2026, 0)
             self.assertEqual(engine.native_metadata.cpu_index, 0)
 
             with engine.controller_execution(controller, 1):
                 pass
 
-            self.assertEqual(engine.native_metadata.cpu_index, 1)
-            self.assertEqual(worker.source_state.current_global_cpu_index, 1)
-            self.assertEqual(worker.source_state.cpu_offset, 1)
+            self.assertEqual(engine.native_metadata.cpu_index, 0)
+            self.assertEqual(worker.source_state.current_global_cpu_index, 0)
+            self.assertEqual(worker.source_state.cpu_offset, 0)
 
     def test_36800_retains_effective_cpu_zero_without_changing_selected_cpu(self):
         source = calibration(cpus=2, second_cpu_type="312")
@@ -722,7 +2159,7 @@ class EngineWorker2026Tests(unittest.TestCase):
         self.assertEqual(worker.online_context().all_loaded_metadata, issued.files)
         self.assertTrue(worker.persist_current_cpu)
 
-    def test_actual141_reset_retains_persisted_d30c_offset(self):
+    def test_actual141_reset_keeps_d30c_zero_without_a_producer(self):
         from scripts.calibration_2026 import native2026_metadata_for_cpu
 
         part = calibration(cpus=2, first_target="PART")
@@ -753,7 +2190,7 @@ class EngineWorker2026Tests(unittest.TestCase):
             self.addCleanup(engine.close)
             controller = make_controller(NativeRuntime2026(lambda *_: None))
             worker = engine.bind_worker(controller)
-            self.assertEqual(worker.source_state.cpu_offset, 1)
+            self.assertEqual(worker.source_state.cpu_offset, 0)
 
             with engine.controller_execution(controller, 2):
                 selected_cpu = native2026_metadata_for_cpu(engine.native_metadata, 1)
@@ -761,11 +2198,11 @@ class EngineWorker2026Tests(unittest.TestCase):
                     selected_cpu, controller=controller, worker=worker
                 )
                 self.assertEqual(engine.native_metadata.cpu_index, 1)
-                self.assertEqual(worker.source_state.cpu_offset, 1)
+                self.assertEqual(worker.source_state.cpu_offset, 0)
                 worker._persist_position()
                 self.assertEqual(persistence.state.write_cpu_index, 1)
                 self.assertEqual(
-                    persistence.state.offset_of_write_cpu_multi_cal_index, 1
+                    persistence.state.offset_of_write_cpu_multi_cal_index, 0
                 )
                 replacement = issued.after_group_reset(0, worker=worker)
                 engine._accept_worker_file_reset(issued, replacement, worker=worker)
@@ -773,7 +2210,7 @@ class EngineWorker2026Tests(unittest.TestCase):
             self.assertIs(engine.native_metadata, replacement.selected_metadata)
             self.assertEqual(engine.native_metadata.cpu_index, 0)
             self.assertEqual(worker.source_state.current_global_cpu_index, 0)
-            self.assertEqual(worker.source_state.cpu_offset, 1)
+            self.assertEqual(worker.source_state.cpu_offset, 0)
 
     def test_json_delta_group_reset_atomically_replaces_worker_file_views(self):
         first = calibration(first_target="FIRST")
@@ -798,9 +2235,12 @@ class EngineWorker2026Tests(unittest.TestCase):
         issued = admit_file_sources_2026(
             engine,
             "input.json",
-            b'["group.scuw"]',
+            b'["prefix.cuw","group.scuw"]',
             region=0,
-            source_files={"group.scuw": archive_source},
+            source_files={
+                "prefix.cuw": calibration(first_target="PREFIX"),
+                "group.scuw": archive_source,
+            },
         )
         engine.bind_file_sources(issued)
         self.addCleanup(engine.close)
@@ -811,18 +2251,22 @@ class EngineWorker2026Tests(unittest.TestCase):
             engine._select_worker_metadata(
                 issued.files[1], controller=controller, worker=worker
             )
+            old_group = issued.group_for_file(worker.source_state.current_file_index)
+            self.assertIsNotNone(old_group)
+            assert old_group is not None
+            self.assertGreater(old_group[0], 0)
             replacement = issued.after_group_reset(1, worker=worker)
             engine._accept_worker_file_reset(issued, replacement, worker=worker)
 
         self.assertIs(engine.file_sources, replacement)
+        assert old_group is not None
+        self.assertEqual(worker._flow_file_index2026, old_group[0])
         self.assertIs(engine.native_metadata, replacement.selected_metadata)
-        self.assertEqual(worker.loaded_metadata, (engine.native_metadata,))
+        self.assertEqual(worker.loaded_metadata, replacement.files)
         self.assertEqual(worker.online_context().all_loaded_metadata, replacement.files)
         self.assertTrue(worker.persist_current_cpu)
 
-    def test_47e60_restores_typed_a48_selection_and_36800_reapplies_it(self):
-        from scripts.calibration_2026 import native2026_cpu_targets, native2026_cpu_type
-
+    def test_named_whole_completion_rejects_without_indexed_a48_producer(self):
         first = calibration(first_target="FIRST")
         second = calibration(first_target="SECOND")
         whole = cuw(
@@ -892,37 +2336,32 @@ class EngineWorker2026Tests(unittest.TestCase):
         self.receive(engine, controller, (b"OLD1", b"UNKNOWN"))
         worker = engine.bind_worker(controller)
 
+        original_metadata = engine.native_metadata
+        original_state = worker.source_state
+        self.assertEqual(worker._getter_a48_received_cids2026, ())
+        self.assertIsNone(worker._judge_a48_match2026)
         with engine.controller_execution(controller, 0):
-            self.assertTrue(worker.mark_cid_reception_complete())
-        self.assertEqual(worker.source_state.target_indices, (0, -1))
-        with engine.controller_execution(controller, 1):
-            pass
-        retained = engine.native_metadata
-        self.assertEqual(worker.source_state.target_indices, (1, 0))
-        self.assertEqual(worker.source_state.cpu_offset, 1)
-        self.assertEqual(native2026_cpu_type(retained, 0), "312")
-        self.assertEqual(native2026_cpu_targets(retained, 0)[1].calibration, "FOREST")
-        with engine.controller_execution(controller, 2):
-            engine._select_worker_metadata(
-                issued.files[1], controller=controller, worker=worker
-            )
-            replacement = issued.after_group_reset(1, worker=worker)
-            self.assertIs(replacement.selected_metadata, retained)
-            engine._accept_worker_file_reset(issued, replacement, worker=worker)
-            worker._restore_file_selection_47e60()
-            with self.assertRaisesRegex(ValueError, "no completed native CID"):
-                _ = worker.native_writer_target_index
-
-        with engine.controller_execution(controller, 1):
-            pass
-        self.assertIs(engine.native_metadata, retained)
-        self.assertEqual(worker.source_state.target_indices, (1, 0))
-        self.assertEqual(worker.source_state.current_global_cpu_index, 1)
-        self.assertEqual(worker.native_writer_target_index, 0)
-        self.assertEqual(worker.source_state.authored_target_indices, (0, -1))
-        self.assertEqual(worker.source_state.authored_cpu_count, 2)
-        self.assertEqual(worker.source_state.unmatched_identifiers, (b"FOREST",))
-        self.assertEqual(native2026_cpu_type(engine.native_metadata, 0), "312")
+            self.assertFalse(worker.mark_cid_reception_complete())
+        # A reached false34e10 still publishes its actual native footprints;
+        # it does not admit an execution selection from the unrelated global CID.
+        self.assertEqual(worker._judge_live_selection2026.targets, (-1,) * 4)
+        self.assertEqual(
+            worker._judge_live_selection2026.unmatched_ids, (b"M16C", b"FOREST")
+        )
+        self.assertEqual(worker._judge_live_selection2026.authored_count, 2)
+        self.assertIs(engine.native_metadata, original_metadata)
+        self.assertEqual(
+            worker.source_state.target_indices, original_state.target_indices
+        )
+        self.assertEqual(
+            worker.source_state.current_global_cpu_index,
+            original_state.current_global_cpu_index,
+        )
+        self.assertIsNone(worker._selections_by_file[worker._current_file_index])
+        self.assertIsNone(worker._judge_a48_match2026)
+        self.assertIsNone(worker._retained_clone_selection)
+        with self.assertRaisesRegex(ValueError, "no completed native CID selection"):
+            _ = worker.native_writer_target_index
 
     def test_control_state_keeps_fatal_failed_and_callback_fields_independent(self):
 
@@ -1418,6 +2857,21 @@ class ControlFileCapture2026Tests(unittest.TestCase):
             self.assertEqual(capture.native_order, (1, 0))
             self.assertEqual(capture.target_indices, (1, 0))
             self.assertEqual(capture.control_cpu_start, 1)
+            self.assertIsNone(capture.file_sources)
+            self.assertIsNone(capture.pointer_view)
+            self.assertIsNone(capture.flow_view)
+            self.assertEqual(capture.flow_file_index, 0)
+            self.assertIs(capture.configuration, self.engine.configuration)
+            self.assertEqual(len(capture.query_seed34), 34)
+            self.assertTrue(all(len(record) == 12 for record in capture.query_seed34))
+            self.assertEqual(
+                capture.configured_bits, tuple(self.worker._configured_bits_4e0_2026)
+            )
+            self.assertFalse(capture.sequence_changed_39c)
+            self.assertIsNone(capture.job_sequence)
+            self.assertIsNone(capture.phase_lease)
+            self.assertIsNone(capture.raw_session)
+            self.assertIsNone(capture.completion_record)
             first = capture.metadata_for_cpu(0)
             second = capture.metadata_for_cpu(1)
             self.assertEqual((first.cpu_index, second.cpu_index), (1, 0))
@@ -1426,6 +2880,23 @@ class ControlFileCapture2026Tests(unittest.TestCase):
             self.engine.select_target(1, 1, controller=self.controller)
             capture.validate(self.engine, self.controller)
             self.assertIsNot(capture.metadata, self.engine.native_metadata)
+
+    def test_pointer_admission_fallback_rejects_other_metadata(self):
+        engine = EngineWorker2026Tests().engine(calibration())
+        other_engine = EngineWorker2026Tests().engine(calibration(first_target="OTHER"))
+        self.addCleanup(engine.close)
+        self.addCleanup(other_engine.close)
+        issued = admit_file_sources_2026(
+            engine,
+            "input.json",
+            b'["file.cuw"]',
+            region=0,
+            source_files={"file.cuw": calibration(first_target="ISSUED")},
+        )
+        engine.bind_file_sources(issued)
+        worker = engine.bind_worker(make_controller(NativeRuntime2026(lambda *_: None)))
+        with self.assertRaisesRegex(ValueError, "differs from its issued view"):
+            worker._capture_pointer_view2026(other_engine.native_metadata)
 
     def test_capture_is_once_only_and_rejects_forged_copied_and_bad_indices(self):
         import copy
@@ -1515,8 +2986,14 @@ class ControlOutput2026Tests(unittest.TestCase):
         self.assertIs(self.worker._control_count_scratch2026, first)
         self.assertEqual(first, [5, 7])
         self.engine.dh_state._progress = (61, 67)
-        self.worker.close()
-        self.worker = self.engine.bind_worker(self.controller)
+        from scripts.cuw_engine_worker import (
+            _finalize_engine_worker_replacement,
+            _replace_engine_worker,
+        )
+
+        previous = self.worker
+        self.worker = _replace_engine_worker(self.engine, self.controller, previous)
+        _finalize_engine_worker_replacement(self.engine, previous, self.worker)
         self.assertEqual(self.worker._control_count_scratch2026, [0, 0])
         self.assertEqual(self.worker._control_percent_scratch2026, [61, 67])
 

@@ -497,9 +497,14 @@ class OnlineControllerTests(unittest.TestCase):
             with self.subTest(live=live):
                 fixture = ThreadOwnershipTests()
                 self.addCleanup(fixture.doCleanups)
-                engine, control, job, session = fixture.imported_prepare(
-                    operation="get_cid"
+                engine, control, job, root, _pair, _rows, _sdk, _sources = (
+                    fixture.authored_two_file_getter_job()
                 )
+                fixture.complete_two_file_getter_roots(engine, control, job, root)
+                session = root.next_session2026("get_cid", node=1, cpu_index=0)
+                session.bind_runtime2026(control.runtime)
+                session.bind_engine2026(engine)
+                session.bind_controller2026(control)
                 engine.set_vin(b"JT123456789012345")
                 old = engine.worker
                 obj = OnlineKeyController2026(old, configuration())

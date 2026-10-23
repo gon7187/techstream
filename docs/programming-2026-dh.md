@@ -178,3 +178,21 @@ applies the engine→CONTROL pair import and the CONTROL→engine return only wh
 `J2534InterfacePair2026` is bound, so the original acquisition-view cleanup survives;
 unpaired callers retain the supplied connected control channel. Opaque provider fixtures
 retain explicit setup.
+
+Classic DH CONTROL exports retain the FILE imported at CONTROL entry and its local
+CPU even after a real CUW mode2 transition selects another current FILE. The exact
+pooled selection, target, catalog/slot revision, helper export lease, controller,
+runtime and phase thread authenticate this view. PrepareRetry retains its outer
+flash export lease while calling the authenticated nested classic prepare module.
+Security selectors, location/image/flash-code geometry and next-CPU queries read
+the retained FILE; progress notifications use the ordered CONTROL CPU/scratch.
+Gateway enum, errors and notification fields remain on the same live engine state.
+The implementation never rewrites current FILE metadata to satisfy a binding.
+
+Standalone bindings keep metadata equality, and same-metadata getter/nonclassic
+bindings keep their existing ingress. Other DH families do not receive the classic
+mixed-FILE allowance. Expired/foreign contexts, rows, catalogs, helper exports,
+runtimes and threads fail validation before wire operations. Owned raw controls
+exercise CPU1 request-download geometry, acknowledged image bytes and partial
+progress before host/native provider faults; the separate G7 integration exercises
+the genuine retained PART1/live WHOLE transition.
