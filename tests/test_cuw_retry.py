@@ -878,6 +878,7 @@ class RetryControllerTests(unittest.TestCase):
         self.retry = self.engine.bind_retry_controller()
         self.addCleanup(self.engine.close)
         self.assertEqual(issued.delta_map_size, 0)
+        self.engine._cid_selection_initialized = True
         with self.engine.controller_execution(self.control, 0):
             self.engine._select_worker_metadata(
                 issued.files[0], controller=self.control, worker=self.worker
@@ -899,6 +900,7 @@ class RetryControllerTests(unittest.TestCase):
         try:
             self.retry.wait_for_query()
             self.assertEqual(self.engine.inform_result_of_query_retry(1, 255), 0)
+            self.assertTrue(self.engine._cid_selection_initialized)
         finally:
             thread.join(2)
         self.assertFalse(thread.is_alive())

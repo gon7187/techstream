@@ -33,6 +33,7 @@ from scripts.cuw_legacy_vendor import (
     prepare_emps,
     select_emps_session,
     techvim_needs_finalize,
+    techvim_progress_status,
 )
 from scripts.demo_calibration import table
 from scripts.j2534_2026 import NativeMessage
@@ -149,6 +150,56 @@ def authored_emps_context(
 
 
 class ExecutableVendorPrimitiveTests(unittest.TestCase):
+    def test_techvim_progress_status_preserves_native_retry_and_can_only_status4(self):
+        for build in (12, 18):
+            context = replace(
+                authored_emps_context(build=build), controller="CTechVimFlashWriter"
+            )
+            with patch(
+                "scripts.cuw_legacy_vendor.legacy_executable_bytes",
+                return_value=b"admitted source",
+            ) as admit:
+                self.assertEqual(techvim_progress_status(context, 0, 24, 0x800F0205), 0)
+                self.assertEqual(techvim_progress_status(context, 0, 24, 0x800F0204), 3)
+                self.assertEqual(techvim_progress_status(context, 0, 24, 0x800D0001), 2)
+                self.assertEqual(techvim_progress_status(context, 0, 24, 0x800F1234), 1)
+                self.assertEqual(techvim_progress_status(context, 0, 24, 0x800F0209), 4)
+                self.assertEqual(techvim_progress_status(context, 1, 24, 0x800F0204), 1)
+                self.assertEqual(techvim_progress_status(context, 0, 23, 0x800F0204), 1)
+                admit.assert_called_with(context)
+
+                sil_native = replace(
+                    context.native,
+                    base_metadata={
+                        **context.native.base_metadata,
+                        "contact_type": "SIL",
+                    },
+                )
+                sil_context = replace(context, native=sil_native, cpus=(sil_native,))
+                self.assertEqual(
+                    techvim_progress_status(sil_context, 0, 24, 0x800F0209), 1
+                )
+
+    def test_techvim_progress_status_rejects_wrong_scope_and_unadmitted_source(self):
+        context = authored_emps_context()
+        with patch("scripts.cuw_legacy_vendor.legacy_executable_bytes") as admit:
+            with self.assertRaises(ValueError):
+                techvim_progress_status(context, 0, 24, 0x800F0204)
+            admit.assert_not_called()
+
+            techvim = replace(context, controller="CTechVimFlashWriter")
+            admit.side_effect = ValueError("unadmitted original")
+            with self.assertRaisesRegex(ValueError, "unadmitted original"):
+                techvim_progress_status(techvim, 0, 24, 0x800F0204)
+
+        with patch(
+            "scripts.cuw_legacy_vendor.legacy_executable_bytes",
+            return_value=b"admitted source",
+        ):
+            techvim = replace(context, controller="CTechVimFlashWriter")
+            with self.assertRaises(ValueError):
+                techvim_progress_status(techvim, 0, 24, -1)
+
     def test_emps_session_and_common_helpers_share_authoritative_channel_ram(self):
         state = ChannelState(
             protocol=6, read_timeout=937, send_timeout=2468, padding=True

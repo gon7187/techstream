@@ -137,5 +137,4 @@ metadata groups; they do not certify transport wrappers or unreviewed tables.
 Regression bindings pin the reviewed test source file as well as the exact method.
 The validator checks source and proof identity; its returned test names feed the
 parent executable regression gate. Static validation alone does not run tests.
-The six selected-database claims remain OPEN while their shared source is extended;
-restoring them requires independent review of the final source and test changes.
+Independent review now approves six narrow selected-database claims covering 32 exact exports; their public disposition, target ordinals/RVAs, exact regressions and boundaries are in [native-selected-review.md](native-selected-review.md). The native inventory claims close only those targets and six named contracts; the DLL module audit and every other export remain OPEN. The three bound regression methods were executed and passed.

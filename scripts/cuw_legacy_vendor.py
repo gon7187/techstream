@@ -972,6 +972,43 @@ def emps_validate_response(operation: str, response: bytes, *, stage: int = 1) -
         raise LegacyVendorResponseError(code, response)
 
 
+def techvim_progress_status(
+    context: ExecutableContext, category: int, method: int, hresult: int
+) -> int:
+    """Translate a source-caught TechVim GetProgress HRESULT to native status.
+
+    CUW12 46c964-46cde0 and CUW18 4a369a/4a3f2f classify only category 0,
+    method 24 as GetProgress; other typed errors take status 1. Zero means the
+    native 0205 restart edge, not success. This reducer never executes SDK code.
+    """
+    if (
+        not isinstance(context, ExecutableContext)
+        or context.controller != "CTechVimFlashWriter"
+    ):
+        raise ValueError("Original TechVim executable context required")
+    if (
+        type(category) is not int
+        or not -128 <= category <= 127
+        or type(method) is not int
+        or not 0 <= method <= 0xFF
+        or type(hresult) is not int
+        or not 0 <= hresult <= 0xFFFFFFFF
+    ):
+        raise ValueError("Native TechVim exception fields required")
+    legacy_executable_bytes(context)
+    if category != 0 or method != 24:
+        return 1
+    if hresult == 0x800F0205:
+        return 0
+    if hresult == 0x800F0204:
+        return 3
+    if hresult == 0x800F0209 and context.native.base_metadata["contact_type"] == "CAN":
+        return 4
+    if hresult & 0x00FF0000 == 0x000D0000:
+        return 2
+    return 1
+
+
 def bind_techvim_finalize(context: ExecutableContext) -> bool:
     """Bind the original12/18 predicate to imported base metadata and PE strings.
 

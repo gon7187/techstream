@@ -931,6 +931,8 @@ class ProgrammingReplay:
     _module_files: Mapping[str, bytes] = field(default_factory=dict, repr=False)
     _control_target2026: Any = field(default=None, repr=False)
     _control_export2026: str | None = field(default=None, repr=False)
+    _phase6_getter_import2026: Any = field(default=None, repr=False)
+    _phase6_outer_session2026: Any = field(default=None, repr=False)
 
     @property
     def operation(self):
@@ -1604,6 +1606,14 @@ class ProgrammingReplay:
         ):
             raise ValueError("Issued CONTROL target and exact replay owners required")
         target.validate(self._engine2026, self._controller2026)
+        if export == "StartGetCID":
+            # Each alternate getter is a new native attempt. Only its result may
+            # accompany the final outer return, including when the prior P6 call
+            # returned an empty vector.
+            outer_session = self._phase6_outer_session2026 or self
+            if type(outer_session) is not ProgrammingReplay:
+                raise ValueError("Exact outer getter replay session required")
+            outer_session._phase6_getter_import2026 = None
         if self._engine2026._controller_export_target2026 is target:
             metadata = self._engine2026.family_metadata
         else:
@@ -1636,7 +1646,25 @@ class ProgrammingReplay:
             identifier.decode("latin1") for identifier in held_identifiers
         )
         host = dict(observations["host"])
-        host.pop("native2026", None)
+        native_values = host.pop("native2026", None)
+        if (
+            export == "StartGetCID"
+            and target.module_binding.module_name == "TCUWP6CanCIDGetter.dll"
+            and type(native_values) is dict
+        ):
+            # Carry only the controller observations required to bind the P6
+            # getter. Other replay overrides and native state are stage-local.
+            timing_keys = (
+                "programming_started_at",
+                "initial_delay_seconds",
+                "unresolved_retry_seconds",
+                "check_dtcs",
+            )
+            carried = {
+                key: native_values[key] for key in timing_keys if key in native_values
+            }
+            if carried:
+                host["native2026"] = carried
         host["cpu_index"] = target.entry_cpu_index
         observations["host"] = host
         context.update(
@@ -1662,6 +1690,7 @@ class ProgrammingReplay:
             _control_target2026=target,
             _control_export2026=export,
         )
+        following._phase6_outer_session2026 = self
         following._validate_control_stage2026()
         return following
 
@@ -2043,6 +2072,41 @@ class ProgrammingReplay:
                 else:
                     self.used = True
                     result = runner()
+                if isinstance(result, dict):
+                    p6_import = result.pop("_phase6_getter_import2026", None)
+                    if p6_import is not None:
+                        outer_session = self._phase6_outer_session2026
+                        if (
+                            self._control_export2026 != "StartGetCID"
+                            or p6_import.context.identity != module.native_identity
+                            or p6_import.context.selection != selection
+                            or p6_import.context.engine_state
+                            is not self._engine2026.dh_state
+                            or self._control_target2026 is None
+                            or type(outer_session) is not ProgrammingReplay
+                            or self._controller2026._parameter_session
+                            is not outer_session
+                        ):
+                            raise ValueError(
+                                "P6 getter import differs from the issued selected export"
+                            )
+                        pending = outer_session._phase6_getter_import2026
+                        if pending is not None:
+                            if pending.identifiers:
+                                raise ValueError(
+                                    "P6 getter import already has nonempty source results"
+                                )
+                            outer_session._phase6_getter_import2026 = None
+                        job = self._engine2026._thread_job
+                        control_context = (
+                            self._controller2026.native_control_context2026(
+                                self._engine2026
+                            )
+                        )
+                        p6_import.bind_outer_return(
+                            self, outer_session, control_context, job
+                        )
+                        outer_session._phase6_getter_import2026 = p6_import
                 if (
                     isinstance(result, dict)
                     and self._control_export2026 == "StartGetCID"

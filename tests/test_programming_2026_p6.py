@@ -31,14 +31,11 @@ def authored_metadata(metadata: bytes) -> bytes:
     return b"\n".join(rows)
 
 
-def authored_container(
+def authored_source(
     metadata: bytes, image: bytes | tuple[bytes, ...] = b"authored image"
-):
+) -> bytes:
     import struct
     import zlib
-
-    from scripts.calibration import CalibrationContainer
-    from scripts.calibration_2026 import parse_cuw_2026
 
     def record(header, data):
         return (
@@ -56,9 +53,16 @@ def authored_container(
         + b"".join(record(b"authored", item) for item in images)
     )
     raw = b"\0CALIBRATION\0\x09" + bytes(4) + struct.pack(">I", 22 + len(tail)) + tail
-    container = parse_cuw_2026(
-        raw[:14] + struct.pack(">I", zlib.crc32(raw[18:])) + raw[18:]
-    )
+    return raw[:14] + struct.pack(">I", zlib.crc32(raw[18:])) + raw[18:]
+
+
+def authored_container(
+    metadata: bytes, image: bytes | tuple[bytes, ...] = b"authored image"
+):
+    from scripts.calibration import CalibrationContainer
+    from scripts.calibration_2026 import parse_cuw_2026
+
+    container = parse_cuw_2026(authored_source(metadata, image))
     assert isinstance(container, CalibrationContainer)
     return container
 
@@ -493,6 +497,189 @@ class DCMTests(unittest.TestCase):
 
 
 class Phase6Tests(unittest.TestCase):
+    def test_getter_companion_counted_import_tracks_current_node_ranges(self):
+        from scripts.programming_2026_p6 import Phase6Node, phase6_getter_records
+
+        nodes = (
+            Phase6Node(b"\x12", 0, "NODE-A"),
+            Phase6Node(b"\x13", 0, "NODE-B"),
+            Phase6Node(b"\x14", 0, "NODE-C"),
+        )
+        identifiers = (b"A1", b"A2", b"B1", b"B2", b"B3", b"C1")
+        counts = (2, 0, 4)
+        old = tuple(
+            bytes([0x41 + index]) * 4 + b"stale\0\0" + bytes([0x70 + index])
+            for index in range(6)
+        )
+        result = phase6_getter_records(identifiers, nodes, counts, old)
+        self.assertEqual(len(result), len(identifiers))
+        self.assertEqual(result[0], b"\0" * 4 + b"NODE-A\0" + b"\x70")
+        self.assertEqual(result[1], b"\0" * 4 + b"NODE-A\0" + b"\x71")
+        self.assertEqual(
+            result[2:],
+            tuple(
+                b"\0" * 4 + b"NODE-C\0" + bytes([0x72 + index]) for index in range(4)
+            ),
+        )
+
+    def test_selected_source_getter_returns_deferred_counted_receipt(self):
+        import struct
+        from pathlib import Path
+        from threading import get_ident
+
+        from scripts.cuw_2026 import CUWEngine2026
+        from scripts.native_modules import identify_native_module
+        from scripts.programming_2026_common import (
+            NativeRuntime2026,
+            bind_native_parameter2026,
+        )
+        from scripts.programming_2026_p6 import bind_native_context, execute_context
+        from tests.private_evidence import read_private_bytes, require_private
+
+        metadata = (
+            b"[Format]\nVersion=101\n[Vehicle]\nKindOfECU=149\n"
+            b"ContactType=Phase6\nNumberOfNode=1\n[Node01]\n"
+            b"RequiredSpecReproVer=02\nNumberOfCalibration=1\n"
+            b"DiagID=12\nProtocol=02\nWakeUpTimeAfterReset=0\n"
+            b"[CPU11]\nCPUImageName=main\n"
+        )
+        source = authored_source(metadata, b"main")
+        container = authored_container(metadata, b"main")
+        source_root = Path("runtime/no-car-21/recovered")
+        require_private(source_root / "CUW.dll", source_root / "TCUWP6CanCIDGetter.dll")
+        cuw_bytes = read_private_bytes(source_root / "CUW.dll")
+        getter_bytes = read_private_bytes(source_root / "TCUWP6CanCIDGetter.dll")
+        identity = identify_native_module(
+            "8a1cea69f3c971fe8b148f062503fcfdc8135bb6a56aa3b16bca238313a0fae5",
+            "TCUWP6CanCIDGetter.dll",
+        )
+        key = "149Phase602"
+        parameter = (
+            "ParamFileKeySystemProtocolMicon,DLLFileNameForGetCID\r\n"
+            f"{key},TCUWP6CanCIDGetter.dll\r\n"
+        ).encode()
+        selection = bind_native_parameter2026(
+            container, {key + ".ini": parameter}, "get_cid", encoded=False
+        )
+        response = (
+            b"\x62\xf1\x88\x02\0"
+            + b"\x80CID-A".ljust(17, b"\0")
+            + b"\x80CID-B".ljust(17, b"\0")
+        )
+        now = [0.0]
+
+        def action(event, remaining):
+            operation = event["operation"]
+            if operation == "get_timeout":
+                return 1000
+            if operation == "start_flow_control_filter":
+                return 1
+            if operation == "write_messages":
+                return 1
+            if operation == "read_specified_can_message":
+                return b"\x18\xda\xe0\x12" + response
+            if operation == "wait":
+                now[0] += event["milliseconds"] / 1000
+            return None
+
+        with CUWEngine2026(cuw_bytes) as engine:
+            engine.configure(struct.pack("<IIddII", 4, 0, 0, 0, 0, 0))
+            engine.load_cuw(source)
+            engine._active = True
+            engine._phase_thread = get_ident()
+            observations = {
+                "stage": "get_cid",
+                "export": "StartGetCID",
+                "dh_state": engine.dh_state,
+                "programming_started_at": 0.0,
+                "initial_delay_seconds": 0,
+                "unresolved_retry_seconds": 0,
+                "check_dtcs": False,
+            }
+            with self.assertRaisesRegex(ValueError, "module digest/name"):
+                bind_native_context(
+                    container,
+                    1,
+                    (),
+                    selection,
+                    identity,
+                    {"selected_module": b"wrong getter source"},
+                    observations,
+                )
+            context = bind_native_context(
+                container,
+                1,
+                (),
+                selection,
+                identity,
+                {"selected_module": getter_bytes},
+                observations,
+            )
+            runtime = NativeRuntime2026(
+                action, clock=lambda: now[0], native_cancelled=lambda: False
+            )
+            result = execute_context(context, runtime)
+            self.assertEqual(result["identifiers"], (b"CID-A", b"CID-B"))
+            self.assertEqual(
+                [record[4:11] for record in result["identifier_records"]],
+                [b"12\0\0\0\0\0", b"12\0\0\0\0\0"],
+            )
+            self.assertEqual(engine.received_identifiers, ())
+            receipt = result["_phase6_getter_import2026"]
+            self.assertIsNone(receipt.job)
+            self.assertIsNone(receipt.outer_session)
+            with self.assertRaisesRegex(ValueError, "callback required"):
+                receipt.validate_consume(engine)
+            engine._validate_phase6_getter_result(
+                result["identifiers"], result["identifier_records"]
+            )
+            with self.assertRaisesRegex(ValueError, "counted P6 getter"):
+                engine._validate_phase6_getter_result(
+                    result["identifiers"], (b"invalid", b"records")
+                )
+            self.assertEqual(engine.received_identifiers, ())
+            self.assertEqual(engine.identifier_records, ())
+
+    def test_getter_import_exact_count_clear_and_missing_current_source(self):
+        from scripts.programming_2026_p6 import Phase6Node, phase6_getter_records
+
+        stale = (b"old!stale\0\0\x55", b"tailtail\0\0\0\x66")
+        one = phase6_getter_records(
+            (b"CID-A",), (Phase6Node(b"\x12", 0, "34"),), (1,), stale
+        )
+        self.assertEqual(one, (b"\0" * 4 + b"34\0le\0\0" + b"\x55",))
+        self.assertEqual(phase6_getter_records((), (), (), stale), ())
+        full = phase6_getter_records(
+            tuple(f"CID-{index}".encode() for index in range(34)),
+            (Phase6Node(b"\x12", 0, "CAP34"),),
+            (34,),
+            (),
+        )
+        self.assertEqual(len(full), 34)
+        self.assertEqual(full[0], b"\0" * 4 + b"CAP34\0\0\0")
+        self.assertEqual(full[-1], full[0])
+        with self.assertRaisesRegex(ValueError, "DiagID source"):
+            phase6_getter_records((b"CID-A",), (Phase6Node(b"\x12", 0),), (1,), stale)
+
+        from threading import get_ident
+
+        from scripts.cuw_2026 import CUWEngine2026
+
+        engine = object.__new__(CUWEngine2026)
+        engine._active = True
+        engine._phase_thread = get_ident()
+        engine._received_identifiers = (b"OLD",)
+        engine._identifier_records = stale[:1]
+        engine._working_identifier_records = stale[:1] + (bytes(12),) * 33
+        engine._import_phase6_getter_result((b"CID-A",), one)
+        self.assertEqual(engine.received_identifiers, (b"CID-A",))
+        self.assertEqual(engine.identifier_records, one)
+        self.assertEqual(engine._working_identifier_records[:1], one)
+        engine._import_phase6_getter_result((), ())
+        self.assertEqual(engine.received_identifiers, ())
+        self.assertEqual(engine.identifier_records, ())
+        self.assertEqual(engine._working_identifier_records, (bytes(12),) * 34)
+
     def test_getter_refreshes_question_and_filters_placeholder(self):
         from scripts.programming_2026_common import NativeRuntime2026
         from scripts.programming_2026_p6 import Phase6Node, get_phase6_cids
@@ -1423,7 +1610,8 @@ class Phase6MetadataTests(unittest.TestCase):
             "TCUWP6CanCIDGetter.dll",
         )
         self.assertEqual(
-            native_phase6_nodes(container, module), (Phase6Node(b"\x12", 500),)
+            native_phase6_nodes(container, module),
+            (Phase6Node(b"\x12", 500, "12"),),
         )
         bad = authored_container(text.replace(b"DiagID=12", b"DiagID=012"))
         with self.assertRaises(ValueError):

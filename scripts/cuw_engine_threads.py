@@ -666,7 +666,7 @@ class _NativeGetterNextEntryOrigin2026:
     decision: _NativeGetterDecision2026
     execute_record: _NativeGetterExecuteReturn2026
     context: NativeControlContext2026
-    output: NativeControlGetterOutput2026
+    output: NativeControlGetterOutput2026 | None
     observation: object
     lease: ThreadPhaseLease2026
     sequence: int
@@ -1806,6 +1806,11 @@ class EngineThreadJob2026:
         context = candidate.execute_record.context
         execute_record = candidate.execute_record
         output = candidate.output
+        phase6_import = self.worker._imported_phase6_getter_receipt2026(
+            context, self, decision.sequence
+        )
+        phase6_output = output is None and phase6_import is not None
+        capture = context._capture
         record = self._active_record
         lease = self._lease
         session = self._session
@@ -1815,7 +1820,14 @@ class EngineThreadJob2026:
         )
         if (
             variant not in ("named_next", "named_terminal", "no_table")
-            or type(output) is not NativeControlGetterOutput2026
+            or not (
+                (
+                    type(output) is NativeControlGetterOutput2026
+                    and output is not None
+                    and candidate.output is output
+                )
+                or phase6_output
+            )
             or type(lease) is not ThreadPhaseLease2026
             or lease is not decision.lease
             or lease.state != "adopted"
@@ -1827,11 +1839,11 @@ class EngineThreadJob2026:
             or session is not execute_record.context._capture.raw_session
             or execute_record is not self._getter_execute_return2026
             or execute_record.sequence != decision.sequence
-            or output.capture is not context._capture
-            or output.capture._thread_job is not self
-            or output.capture.phase_lease is not lease
-            or output.capture.completion_record is not record
-            or output.capture.job_sequence != decision.sequence
+            or (output is not None and output.capture is not capture)
+            or capture._thread_job is not self
+            or capture.phase_lease is not lease
+            or capture.completion_record is not record
+            or capture.job_sequence != decision.sequence
             or self._pending_getter_next_entry_3d120_2026 is not None
             or self._getter_decision_dispatched_sequence2026
             >= decision.decision_sequence
@@ -1845,7 +1857,7 @@ class EngineThreadJob2026:
             or observation.flow_file_index != self.worker._flow_file_index2026
             or observation.decision_sequence != decision.decision_sequence
             or observation.phase_sequence != decision.sequence
-            or observation.capture_epoch != output.capture._import_epoch
+            or observation.capture_epoch != capture._import_epoch
         ):
             raise ValueError("Exact live G success lineage required")
         if source_set is not self.worker._file_sources:
@@ -1875,7 +1887,7 @@ class EngineThreadJob2026:
             next_pointer_view,
             projected_metadata,
             self.worker._getter_reset_epoch2026,
-            output.capture._import_epoch,
+            capture._import_epoch,
             persistence,
             persistence.state,
             self.engine._native_outer_cfe0_2026,
@@ -1917,6 +1929,15 @@ class EngineThreadJob2026:
                 )
                 else current_view.metadata
             )
+            capture = origin.context._capture
+            phase6_import = self.worker._imported_phase6_getter_receipt2026(
+                origin.context, self, origin.sequence
+            )
+            phase6_output = (
+                origin.output is None
+                and origin.decision.candidate.output is None
+                and phase6_import is not None
+            )
             self.validate_owner(self.engine, self.controller)
             origin.decision.candidate.execute_record.context.validate(
                 self.engine, self.controller
@@ -1943,20 +1964,22 @@ class EngineThreadJob2026:
                 or origin.session is not self._session
                 or origin.execute_record is not self._getter_execute_return2026
                 or origin.execute_record.context is not origin.context
-                or origin.output.capture is not origin.execute_record.context._capture
-                or origin.output.capture._thread_job is not self
-                or origin.output.capture.phase_lease is not origin.lease
-                or origin.output.capture.completion_record is not origin.record
-                or origin.output.capture.job_sequence != origin.sequence
-                or origin.output.capture._import_epoch != origin.capture_epoch
+                or not (
+                    (origin.output is not None and origin.output.capture is capture)
+                    or phase6_output
+                )
+                or capture._thread_job is not self
+                or capture.phase_lease is not origin.lease
+                or capture.completion_record is not origin.record
+                or capture.job_sequence != origin.sequence
+                or capture._import_epoch != origin.capture_epoch
                 or type(origin.observation) is not _NativeGetterObservation2026
                 or origin.observation.file_sources is not origin.source_set
                 or origin.observation.phase_sequence != origin.sequence
                 or origin.observation.decision_sequence
                 != origin.decision.decision_sequence
                 or origin.observation.capture_epoch != origin.capture_epoch
-                or origin.observation.configuration
-                is not origin.output.capture.configuration
+                or origin.observation.configuration is not capture.configuration
                 or origin.variant not in ("named_next", "named_terminal", "no_table")
                 or origin.progress
                 not in {
@@ -1975,7 +1998,7 @@ class EngineThreadJob2026:
                     "complete",
                 }
                 or self.worker._file_sources is not origin.source_set
-                or self.engine.configuration is not origin.output.capture.configuration
+                or self.engine.configuration is not capture.configuration
                 or self.engine._persistence is not origin.persistence
                 or getattr(origin.persistence, "state", None)
                 is not origin.persistence_state
@@ -5248,7 +5271,11 @@ class EngineThreadJob2026:
 
     def dispatch_retry_callback(self) -> None:
         """58240 publishes the concrete retry callback to be74 and waits be6c."""
+        recovering = self.worker.control_state.recovery_mode
         self._dispatch_outer_callback("retry")
+        if recovering and not self.worker.control_state.recovery_mode:
+            # 3cb90 re-signals this worker after 3ffa0 consumes persisted recovery.
+            self._dispatch_outer_callback("retry")
 
     def dispatch_worker_tail(self) -> None:
         """5b1b0 publishes the source-issued native fatal input on the outer thread."""

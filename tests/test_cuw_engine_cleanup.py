@@ -353,14 +353,19 @@ class EngineCleanupTests(unittest.TestCase):
     def test_disconnect_host_fault_retains_identity_and_all_target_owners(self):
         error = OSError("authored host primitive failure")
         original = tuple(self.cleanup.state.targets)
+        self.engine._cid_selection_initialized = True
         self.device.connecting, self.device.channel_id = True, 7
         self.provider_fault = error
         with self.assertRaises(OSError) as caught:
             self.cleanup.run()
         self.assertIs(caught.exception, error)
+        self.assertTrue(self.engine._cid_selection_initialized)
         self.assertEqual(tuple(self.cleanup.state.targets), original)
         self.assertFalse(self.cleanup.state.completed)
         self.assertEqual(self.cleanup.state.trace, ["disconnect"])
+        self.provider_fault = None
+        self.cleanup.run()
+        self.assertFalse(self.engine._cid_selection_initialized)
 
     def test_device_clear_fault_keeps_prior_target_release_and_global_reset(self):
         error = InterruptedError("authored host cancellation during device clear")

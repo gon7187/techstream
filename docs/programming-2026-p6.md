@@ -191,9 +191,13 @@ the outer thread when present.
 
 The retained IG-cycle helper has current prepare/write controls: exact selected
 DLL and operation/phase are preserved, the literal void reset export emits one
-reset write, and no invented sleep changes the shared clock. Full mixed-CPU
-getter→selection→writer composition remains OPEN: P6's getter leaves incoming
-12-byte companion records unchanged, while native Phase6 matching requires their
-DiagID. Zero initial companions are a real unmatched result; metadata-derived
-companion fabrication is forbidden. The earlier discovery/caller producer must
-be recovered before that positive full-host path can be claimed.
+reset write, and no invented sleep changes the shared clock. The selected P6
+getter now writes source-derived 12-byte companion records for every CID
+appended by each node, using that node's `GetDiagID()` value. The existing
+outer getter callback imports the exact counted ID/record pair before the
+Phase6 G selection completes. The source mapping, callback edge and host
+contract are documented in
+[`programming-2026-p6-cid-transfer.md`](programming-2026-p6-cid-transfer.md).
+The mixed-CPU getter→matching→prepare/write composition remains OPEN; the
+callback positive uses authored host traffic and does not run the vendor
+binary or a physical ECU.

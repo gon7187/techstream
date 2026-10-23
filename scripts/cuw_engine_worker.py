@@ -3323,6 +3323,15 @@ class EngineWorker2026:
         from scripts.programming_replay import ProgrammingReplay
 
         job = self._engine.thread_job
+        p6_import = (
+            self._imported_phase6_getter_receipt2026(
+                decision.candidate.execute_record.context,
+                job,
+                decision.sequence,
+            )
+            if type(decision) is _NativeGetterDecision2026
+            else None
+        )
         if (
             type(decision) is not _NativeGetterDecision2026
             or type(job) is not EngineThreadJob2026
@@ -3333,13 +3342,22 @@ class EngineWorker2026:
             or decision.candidate.execute_return is not True
             or decision.candidate.stop_receipt is not None
             or decision.prepare_handshake_be8 == 2
-            or type(output) is not NativeControlGetterOutput2026
-            or decision.candidate.output is not output
+            or not (
+                (
+                    type(output) is NativeControlGetterOutput2026
+                    and decision.candidate.output is output
+                )
+                or (
+                    output is None
+                    and decision.candidate.output is None
+                    and p6_import is not None
+                )
+            )
         ):
             raise ValueError("Exact successful typed CanCID decision required")
         job._validate_getter_decision_2026(decision, route="success_3d120")
-        capture = output.capture
-        context = output.context
+        context = decision.candidate.execute_record.context
+        capture = output.capture if output is not None else context._capture
         if (
             capture is not context._capture
             or capture.file_sources is not self._file_sources
@@ -3411,9 +3429,8 @@ class EngineWorker2026:
             raise ValueError("Current getter configuration required")
         maximum = configuration.cpu_maximum
         if (
-            configuration is not output.configuration
-            or self._engine.common_definitions.num_cpu_maxnum != maximum
-        ):
+            output is not None and configuration is not output.configuration
+        ) or self._engine.common_definitions.num_cpu_maxnum != maximum:
             raise ValueError("Native getter configuration identity or M differs")
         self._query_seed34_2026()
         vectors = (
@@ -3519,7 +3536,11 @@ class EngineWorker2026:
             tuple(self._node_dword_bits_1b9c2026),
             self._name_1ba8_2026,
             self._name_1bc0_2026,
-            output.communication_addresses,
+            (
+                output.communication_addresses
+                if output is not None
+                else tuple(context._controller.address_history)
+            ),
         )
         return observation, job, persistence, persistence_state
 
@@ -5725,9 +5746,16 @@ class EngineWorker2026:
         candidate = decision.candidate
         context = candidate.execute_record.context
         output = self._imported_getter_output2026(context)
-        if (
-            type(output) is not NativeControlGetterOutput2026
-            or candidate.output is not output
+        p6_imported = (
+            self._imported_phase6_getter_receipt2026(context, job, candidate.sequence)
+            is not None
+        )
+        if not (
+            (
+                type(output) is NativeControlGetterOutput2026
+                and candidate.output is output
+            )
+            or (output is None and candidate.output is None and p6_imported)
         ):
             raise ValueError("Successful G requires complete imported CanCID output")
 
@@ -6031,7 +6059,7 @@ class EngineWorker2026:
             self._getter_reset_epoch2026,
             observation,
             decision.decision_sequence,
-            output.capture._import_epoch,
+            context._capture._import_epoch,
             post_tail_metadata,
             protocol_tail_value,
             persistence,
@@ -6869,7 +6897,7 @@ class EngineWorker2026:
                 raise ValueError("SBR producer must hold an actual native byte")
             self._control_ssm_byte2026 = utility.ssm
 
-    def record_control_return2026(self, context, snapshot) -> None:
+    def record_control_return2026(self, context, snapshot, p6_import=None) -> None:
         """Retain only the exact J2534 snapshot registered at raw 4be0 tail."""
         from scripts.j2534_2026 import J2534InterfacePair2026, NativeInterfaceData2026
         from scripts.programming_2026_common import _control_return_snapshot2026
@@ -6886,7 +6914,22 @@ class EngineWorker2026:
             pair.validate_views()
             if self._control_return_receipt2026 is not None:
                 raise ValueError("CONTROL raw return snapshot was already recorded")
-            self._control_return_receipt2026 = (context, pair, snapshot, False)
+            if p6_import is not None:
+                from scripts.programming_2026_p6 import _P6GetterImportReceipt2026
+
+                if (
+                    type(p6_import) is not _P6GetterImportReceipt2026
+                    or p6_import.control_context is not context
+                    or p6_import.job is not self._engine._thread_job
+                ):
+                    raise ValueError("Source-issued P6 getter import receipt required")
+            self._control_return_receipt2026 = (
+                context,
+                pair,
+                snapshot,
+                False,
+                p6_import,
+            )
             self._getter_ordinary_return_sequence2026 += 1
 
     def _prepare_getter_import2026(self, context, output, values):
@@ -7064,6 +7107,9 @@ class EngineWorker2026:
             ):
                 raise ValueError("Unconsumed ordinary CONTROL getter return required")
             pair, snapshot = receipt[1], receipt[2]
+            p6_import = receipt[4] if len(receipt) == 5 else None
+            if p6_import is not None:
+                p6_import.validate_consume(self._engine)
             values = _control_getter_return_values2026(context)
             if type(values) is not tuple:
                 raise ValueError("Ordinary CONTROL getter result vector is invalid")
@@ -7089,6 +7135,12 @@ class EngineWorker2026:
             self._engine.commit_received_identifiers(
                 values, controller=self._controller
             )
+            if p6_import is not None:
+                p6_import.consume(self._engine)
+                outer_session = p6_import.outer_session
+                if outer_session is None:
+                    raise ValueError("Consumed P6 receipt lost its root session")
+                outer_session._phase6_getter_import2026 = None
             if staged is not None:
                 (
                     strings,
@@ -7118,7 +7170,13 @@ class EngineWorker2026:
             self._imported_getter_output_ref2026 = (
                 weakref.ref(output) if output is not None else None
             )
-            self._control_return_receipt2026 = (context, pair, snapshot, True)
+            self._control_return_receipt2026 = (
+                context,
+                pair,
+                snapshot,
+                True,
+                p6_import,
+            )
 
     def _imported_getter_output2026(self, context):
         """Read only the typed output imported for this active old context."""
@@ -7141,6 +7199,32 @@ class EngineWorker2026:
             ):
                 raise ValueError("Imported getter output differs from its context")
             return output
+
+    def _imported_phase6_getter_receipt2026(self, context, job, sequence):
+        """Return only a consumed P6 receipt joined to this imported getter."""
+        from scripts.programming_2026_p6 import _P6GetterImportReceipt2026
+
+        with self._lock:
+            receipt = self._control_return_receipt2026
+            if (
+                type(receipt) is not tuple
+                or len(receipt) != 5
+                or receipt[0] is not context
+                or receipt[3] is not True
+            ):
+                return None
+            p6_import = receipt[4]
+            if (
+                type(p6_import) is not _P6GetterImportReceipt2026
+                or not p6_import._consumed
+                or p6_import.context.identity.module_name != "TCUWP6CanCIDGetter.dll"
+                or p6_import.control_context is not context
+                or p6_import.job is not job
+                or p6_import.sequence != sequence
+                or p6_import.identifiers != self._engine.received_identifiers
+            ):
+                return None
+            return p6_import
 
     def finish_classic_prepare(self) -> None:
         """8990 post-export phase transition; callback BOOL is not success."""

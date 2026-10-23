@@ -4636,6 +4636,11 @@ class ControlCommPhase2026:
                 self.alternate_cid_used = bool(values)
         engine._publish_control_alternate_cache2026(worker=engine.worker)
         state["identifiers"] = values
+        p6_import = getattr(session, "_phase6_getter_import2026", None)
+        if p6_import is not None and p6_import.identifiers != values:
+            if p6_import.identifiers:
+                raise ValueError("P6 import IDs differ from the final getter attempt")
+            session._phase6_getter_import2026 = None
         return state["getter_al"]
 
     def _control_classic_prepare2026(self, engine, session, entry, reports, _incoming):
@@ -6919,6 +6924,8 @@ def _record_control_return2026(engine, controller, pair_context):
     ):
         raise ValueError("Ordinary return is outside the raw CONTROL Execute driver")
     if pair_context is None:
+        if getattr(controller._parameter_session, "_phase6_getter_import2026", None):
+            raise ValueError("P6 getter outer import requires the issued J2534 pair")
         return None
     if (
         type(pair_context) is not tuple
@@ -6938,7 +6945,14 @@ def _record_control_return2026(engine, controller, pair_context):
     recorder = getattr(engine.worker, "record_control_return2026", None)
     if not callable(recorder):
         raise NotImplementedError("114 ordinary CONTROL return recorder is pending")
-    recorder(context, snapshot)
+    session = controller._parameter_session
+    p6_import = getattr(session, "_phase6_getter_import2026", None)
+    if (
+        p6_import is not None
+        and p6_import.identifiers != _control_getter_return_values2026(context)
+    ):
+        raise ValueError("P6 import IDs differ from the issued final getter vector")
+    recorder(context, snapshot, p6_import)
     return snapshot
 
 

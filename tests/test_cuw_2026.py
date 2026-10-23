@@ -64,6 +64,22 @@ def archive(rows):
 
 
 class ManagedServicesTests(unittest.TestCase):
+    def test_d2a1_starts_clear_and_suppresses_mode1_recovery_cleanup(self):
+        image = (
+            Path(__file__).resolve().parents[1] / "runtime/no-car-21/recovered/CUW.dll"
+        )
+        if not image.is_file():
+            self.skipTest("Authenticated static CUW2026 image is absent")
+        with CUWEngine2026(image.read_bytes()) as engine:
+            self.assertFalse(engine._cid_selection_initialized)
+            engine._persistence = MagicMock()
+            engine.begin_file_read(1, mode=1)
+            engine._persistence.delete_recovery.assert_called_once_with()
+
+            engine._cid_selection_initialized = True
+            engine.begin_file_read(1, mode=1)
+            engine._persistence.delete_recovery.assert_called_once_with()
+
     def test_cold_frontend_bind_keeps_historical_getter_capacity(self):
         from scripts.demo_calibration import table
         from scripts.programming_2026_common import NativeFrontendParameters2026

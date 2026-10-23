@@ -7026,6 +7026,7 @@ class CUWEngine2026:
         self._native_error_output = (0, 0)
         self._write_complete_output = False
         self._native_cycle_output = False
+        self._cid_selection_initialized = False
         self._continuation_backup = None
         self._logical_block_index = 0
 
@@ -7365,6 +7366,38 @@ class CUWEngine2026:
         finally:
             if not owned:
                 self._lock.release()
+
+    @staticmethod
+    def _validate_phase6_getter_result(
+        identifiers: tuple[bytes, ...], records: tuple[bytes, ...]
+    ) -> None:
+        if (
+            type(identifiers) is not tuple
+            or len(identifiers) > 34
+            or any(
+                type(value) is not bytes or len(value) > 33 or b"\0" in value
+                for value in identifiers
+            )
+            or type(records) is not tuple
+            or len(records) != len(identifiers)
+            or any(
+                type(record) is not bytes
+                or len(record) != 12
+                or b"\0" not in record[4:11]
+                for record in records
+            )
+        ):
+            raise ValueError("Exact counted P6 getter import vectors required")
+
+    def _import_phase6_getter_result(
+        self, identifiers: tuple[bytes, ...], records: tuple[bytes, ...]
+    ) -> None:
+        """Apply the reconstructed P6 5a050 counted-vector import to live state."""
+        self._require_owned_phase()
+        self._validate_phase6_getter_result(identifiers, records)
+        self._received_identifiers = identifiers
+        self._identifier_records = records
+        self._working_identifier_records = records + (bytes(12),) * (34 - len(records))
 
     def select_target(self, node: int, cpu_index: int, *, controller) -> None:
         """A concrete controller advances its native current target, preserving state."""

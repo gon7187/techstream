@@ -3241,11 +3241,19 @@ class EngineThreadRetryBridgeTests(unittest.TestCase):
         def __init__(self, error=None):
             self.calls = []
             self.error = error
+            self.recovery_modes = []
+            self.engine: Any = None
 
         def callback3(self):
             self.calls.append(threading.current_thread())
             if self.error is not None:
                 raise self.error
+            recovering = self.engine.worker.control_state.recovery_mode
+            self.recovery_modes.append(recovering)
+            if recovering:
+                self.engine.worker.control_state.recovery_mode = False
+            else:
+                self.engine.worker.ordinary_queries += 1
 
     class Cleanup:
         def __init__(self):
@@ -3258,6 +3266,8 @@ class EngineThreadRetryBridgeTests(unittest.TestCase):
         def __init__(self, error=None):
             self._retry_controller = None
             self.retry = EngineThreadRetryBridgeTests.Retry(error)
+            self.retry.engine = self
+            self.worker: Any = None
             self.cleanup = EngineThreadRetryBridgeTests.Cleanup()
             self.callback_threads = []
             self.released_leases = []
@@ -3300,6 +3310,8 @@ class EngineThreadRetryBridgeTests(unittest.TestCase):
     class Worker:
         def __init__(self, controller):
             self.controller = controller
+            self.control_state = type("ControlState", (), {"recovery_mode": False})()
+            self.ordinary_queries = 0
             self.tail = 0
             self.next = 0
             self.logical = []
@@ -3357,6 +3369,7 @@ class EngineThreadRetryBridgeTests(unittest.TestCase):
         job.controller = self.Controller()
         job.worker = self.Worker(job.controller)
         job.engine = self.Engine(error)
+        job.engine.worker = job.worker
         return job
 
     def _run(self, job):
@@ -3398,6 +3411,22 @@ class EngineThreadRetryBridgeTests(unittest.TestCase):
         self.assertEqual(job.engine.cleanup.released, [job.worker])
         self.assertIsNone(job._error)
         self.assertFalse(job._callback_requested.is_set())
+
+    def test_recovery_callback_resignals_same_outer_worker_for_ordinary_query(self):
+        job = self._job()
+        job.worker.control_state.recovery_mode = True
+        errors = self._run(job)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(job.engine.retry.recovery_modes, [True, False])
+        self.assertEqual(job.worker.ordinary_queries, 1)
+        self.assertEqual(len(job.engine.retry.calls), 2)
+        self.assertTrue(all(thread is job._outer for thread in job.engine.retry.calls))
+        self.assertEqual(len(job.engine.callback_threads), 2)
+        self.assertTrue(
+            all(thread is job._outer for thread in job.engine.callback_threads)
+        )
+        self.assertEqual(job.engine.cleanup.released, [job.worker])
 
     def test_retry_callback_failure_returns_to_the_child(self):
         failure = OSError("authored retry callback failure")

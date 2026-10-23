@@ -584,12 +584,75 @@ def native_dcmprl_plan(
 class Phase6Node:
     target: bytes
     wake_ms: int
+    diag_id: str | None = None
 
     def __post_init__(self):
         if not isinstance(self.target, bytes) or len(self.target) != 1:
             raise ValueError("Exact native one-byte Phase6 target required")
         if type(self.wake_ms) is not int or not 0 <= self.wake_ms <= 120000:
             raise ValueError("Native Phase6 wake time outside host bounds")
+        if self.diag_id is not None and (
+            type(self.diag_id) is not str or "\0" in self.diag_id
+        ):
+            raise ValueError("Exact current Phase6 node DiagID required")
+
+
+def phase6_getter_records(
+    identifiers: tuple[bytes, ...],
+    nodes: tuple[Phase6Node, ...],
+    node_identifier_counts: tuple[int, ...],
+    previous_records: tuple[bytes, ...],
+) -> tuple[bytes, ...]:
+    """Reconstruct per-node getter writes and the 5a050 counted import."""
+    count = len(identifiers) if type(identifiers) is tuple else -1
+    if (
+        type(identifiers) is not tuple
+        or len(identifiers) > 34
+        or any(
+            type(value) is not bytes or len(value) > 33 or b"\0" in value
+            for value in identifiers
+        )
+        or type(nodes) is not tuple
+        or len(nodes) > 9
+        or any(type(node) is not Phase6Node for node in nodes)
+        or type(node_identifier_counts) is not tuple
+        or len(node_identifier_counts) != len(nodes)
+        or any(type(value) is not int or value < 0 for value in node_identifier_counts)
+        or sum(node_identifier_counts) != count
+        or type(previous_records) is not tuple
+        or len(previous_records) > 34
+        or any(
+            type(record) is not bytes or len(record) != 12
+            for record in previous_records
+        )
+    ):
+        raise ValueError("Exact bounded native Phase6 getter vectors required")
+
+    raw = list(previous_records[:count])
+    raw.extend([bytes(12)] * (count - len(raw)))
+    slot = 0
+    for node, node_count in zip(nodes, node_identifier_counts, strict=True):
+        if node_count and node.diag_id is None:
+            raise ValueError("Current native node DiagID source is unavailable")
+        diag_id = node.diag_id
+        if node_count and diag_id is None:
+            raise ValueError("Current native node DiagID source is unavailable")
+        for _ in range(node_count):
+            if slot >= 34:
+                break
+            assert diag_id is not None
+            source = diag_id.encode("latin1")[:6]
+            prior = raw[slot]
+            string_field = bytearray(prior[4:11])
+            string_field[: len(source)] = source
+            string_field[len(source)] = 0
+            raw[slot] = bytes(4) + string_field + prior[11:12]
+            slot += 1
+        if slot >= 34:
+            break
+
+    # 1005a050 copies exactly returned-ID count; stale raw tail is ignored.
+    return tuple(raw)
 
 
 def process_before_ig_off_on_at_retry(
@@ -758,7 +821,7 @@ def native_phase6_nodes(
         text = metadata.node_values.get("diagid", "")
         if len(text) != 2 or any(c not in "0123456789abcdefABCDEF" for c in text):
             raise ValueError("Native Phase6 node diagnostic target malformed")
-        result.append(Phase6Node(bytes.fromhex(text), metadata.wakeup_ms))
+        result.append(Phase6Node(bytes.fromhex(text), metadata.wakeup_ms, text))
     return tuple(result)
 
 
@@ -2101,6 +2164,139 @@ _BOUND_CONTEXTS: weakref.WeakValueDictionary[int, P6ExecutionContext] = (
 )
 
 
+class _P6GetterImportReceipt2026:
+    """One issued raw getter return awaiting the source outer callback."""
+
+    __slots__ = (
+        "_consumed",
+        "active_record",
+        "context",
+        "control_context",
+        "identifiers",
+        "job",
+        "lease",
+        "outer_session",
+        "records",
+        "sequence",
+        "session",
+    )
+
+    def __init__(self, context, identifiers, records):
+        if (
+            type(context) is not P6ExecutionContext
+            or _BOUND_CONTEXTS.get(id(context)) is not context
+            or context.export != "StartGetCID"
+            or context.identity.module_name != "TCUWP6CanCIDGetter.dll"
+            or context.engine_state is None
+        ):
+            raise ValueError("Exact issued P6 getter Execute result required")
+        self.context = context
+        self.identifiers = identifiers
+        self.records = records
+        self.session = self.outer_session = self.control_context = self.job = None
+        self.lease = self.active_record = None
+        self.sequence = None
+        self._consumed = False
+
+    def bind_outer_return(self, session, outer_session, control_context, job) -> None:
+        from scripts.cuw_engine_threads import EngineThreadJob2026
+        from scripts.programming_2026_common import NativeControlContext2026
+        from scripts.programming_replay import ProgrammingReplay
+
+        state = self.context.engine_state
+        if state is None:
+            raise ValueError("Exact P6 getter engine state required")
+        engine = state.engine
+        lease = getattr(job, "_lease", None)
+        active_record = getattr(job, "_active_record", None)
+        sequence = getattr(job, "_sequence", None)
+        target = getattr(session, "_control_target2026", None)
+        if (
+            self._consumed
+            or self.session is not None
+            or type(session) is not ProgrammingReplay
+            or type(outer_session) is not ProgrammingReplay
+            or type(control_context) is not NativeControlContext2026
+            or type(job) is not EngineThreadJob2026
+            or getattr(session, "_engine2026", None) is not engine
+            or getattr(session, "_controller2026", None)
+            is not engine._controller_execution
+            or getattr(session, "_control_export2026", None) != "StartGetCID"
+            or getattr(session, "_executed_selection2026", None)
+            != self.context.selection
+            or target is None
+            or getattr(target, "_context", None) is not control_context
+            or getattr(job, "_session", None) is not outer_session
+            or getattr(session, "_phase6_outer_session2026", None) is not outer_session
+            or engine._thread_job is not job
+            or lease is None
+            or getattr(lease, "phase", None) != 0
+            or active_record is None
+            or type(sequence) is not int
+            or sequence <= 0
+        ):
+            raise ValueError("P6 getter result lacks its issued outer return join")
+        self.session = session
+        self.outer_session = outer_session
+        self.control_context = control_context
+        self.job = job
+        self.lease = lease
+        self.active_record = active_record
+        self.sequence = sequence
+
+    def validate_consume(self, engine) -> None:
+        from threading import get_ident
+
+        from scripts.programming_2026_common import (
+            NativeControlContext2026,
+            _control_getter_return_values2026,
+        )
+
+        state = self.context.engine_state
+        outer_session = self.outer_session
+        control_context = self.control_context
+        if state is None:
+            raise ValueError("Current source-issued P6 getter callback required")
+        if (
+            self._consumed
+            or state.engine is not engine
+            or engine.dh_state is not state
+            or not engine._active
+            or engine._phase_thread != get_ident()
+            or self.context.export != "StartGetCID"
+            or _BOUND_CONTEXTS.get(id(self.context)) is not self.context
+            or self.session is None
+            or self.job is None
+            or outer_session is None
+            or control_context is None
+            or engine._thread_job is not self.job
+            or self.job._session is not self.outer_session
+            or self.session._phase6_outer_session2026 is not self.outer_session
+            or outer_session._phase6_getter_import2026 is not self
+            or self.job._sequence != self.sequence
+            or self.job._lease is not self.lease
+            or self.job._active_record is not self.active_record
+            or self.session._engine2026 is not engine
+            or self.session._executed_selection2026 != self.context.selection
+            or self.session._control_target2026._context is not control_context
+            or engine._controller_execution is not self.session._controller2026
+            or self.session._controller2026.native_control_context2026(engine)
+            is not control_context
+        ):
+            raise ValueError("Current source-issued P6 getter callback required")
+        if (
+            type(control_context) is not NativeControlContext2026
+            or _control_getter_return_values2026(control_context) != self.identifiers
+        ):
+            raise ValueError("P6 import IDs differ from the final getter vector")
+        engine._validate_phase6_getter_result(self.identifiers, self.records)
+
+    def consume(self, engine) -> None:
+        self.validate_consume(engine)
+        engine._import_phase6_getter_result(self.identifiers, self.records)
+        self._consumed = True
+
+
 @dataclass(frozen=True)
 class P6ExecutionContext:
     identity: NativeModuleIdentity
@@ -2391,7 +2587,7 @@ def native_phase6_nodes_for_selected_metadata(metadata) -> tuple[Phase6Node, ...
     target = metadata.node_values.get("diagid", "")
     if len(target) != 2 or any(char not in "0123456789abcdefABCDEF" for char in target):
         raise ValueError("Native selected Phase6 diagnostic target malformed")
-    return (Phase6Node(bytes.fromhex(target), metadata.wakeup_ms),)
+    return (Phase6Node(bytes.fromhex(target), metadata.wakeup_ms, target),)
 
 
 def execute_context(context: P6ExecutionContext, runtime: NativeRuntime2026) -> dict:
@@ -2533,12 +2729,22 @@ def _execute_context(
         rows = get_phase6_cids(
             runtime, native, engine_state=context.engine_state, **context.observations
         )
+        identifiers = tuple(cid.encode("latin1") for row in rows for cid in row["cids"])
+        assert context.engine_state is not None
+        engine = context.engine_state.engine
+        records = phase6_getter_records(
+            identifiers,
+            native,
+            tuple(len(row["cids"]) for row in rows),
+            engine.identifier_records,
+        )
+        receipt = _P6GetterImportReceipt2026(context, identifiers, records)
         return {
+            "_phase6_getter_import2026": receipt,
             "state": "read_completed",
             "complete": True,
-            "identifiers": tuple(
-                cid.encode("latin1") for row in rows for cid in row["cids"]
-            ),
+            "identifiers": identifiers,
+            "identifier_records": records,
             "nodes": rows,
         }
     if isinstance(native, Phase6PrepareContext):

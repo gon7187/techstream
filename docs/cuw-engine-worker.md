@@ -185,6 +185,12 @@ output, then checks the complete M/32M raw shape before importing the pair or
 changing getter scratch. Unsupported typed families still import their actual
 raw identifier vector and J2534 snapshot, with no typed output exposed.
 
+The selected Phase6 getter carries its 12-byte CID companions on that same
+issued return receipt. The worker validates the receipt and its final raw ID
+vector before importing the pair, then imports IDs and companion records
+together at the existing outer callback. Phase6 does not publish live CUW
+vectors during `Execute`; standalone replay reports do not consume this receipt.
+
 Typed CanCID buffers convert within their fixed source widths. The raw cell
 type byte is MOVSX-expanded to 32 bits; CPU state protected by the previous
 retention mask remains in place; tails always import; and the configured mask
